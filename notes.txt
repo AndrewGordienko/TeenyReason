@@ -1,0 +1,36 @@
+have some sort of crawler that learns the physics
+    what is a latent representation
+
+    run short episodes with random actions
+    And from that you can directly extract coarse structure:
+
+    Turn that into a tiny “environment fingerprint”
+        z = [responsiveness, stability_margin, delay, oscillation, symmetry]
+
+
+rl doesnt need to spend time on the physics
+    policy(state, z) → action
+
+    split the policy into two parts
+        policy_z(z) configures policy_state(state)
+
+
+    looks more at what actions you do and dont want
+
+
+--- 
+
+The crawler runs short episodes with simple probing behavior. At first that can just be random actions, but slightly better than pure random is a small library of probes:
+hold one action, alternate actions, short bursts, long bursts, low-noise wandering. That gives better coverage than white-noise randomness.
+
+For every step, record tuples like:
+
+(s_t, a_t, s_{t+1}, done)
+
+and also short windows:
+
+(s_{t-k:t}, a_{t-k:t-1})
+
+because some environments only reveal physics over multiple steps, not one-step transitions.
+
+
