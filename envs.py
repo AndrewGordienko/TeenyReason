@@ -1,3 +1,5 @@
+"""Environment construction and probe-action discretization helpers."""
+
 import gymnasium as gym
 import numpy as np
 
@@ -66,9 +68,11 @@ def get_action_values(env, action_bins: int, env_name: str | None = None):
 
     action_dim = int(np.prod(action_space.shape))
     if action_dim == 1:
+        # Scalar continuous control can share a simple evenly spaced probe grid.
         return _build_scalar_action_values(action_space, action_bins)
 
     if env_name == CONTINUOUS_LUNAR_LANDER_NAME:
+        # Multi-axis environments use a hand-picked library of probe actions instead.
         return _build_lunar_lander_action_values()
 
     if env_name == BIPEDAL_WALKER_NAME:

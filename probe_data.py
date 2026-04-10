@@ -1,3 +1,5 @@
+"""Probe data collection for both one-step transitions and short history windows."""
+
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -27,6 +29,7 @@ PROBE_MODES = (
     "sticky_random",
 )
 
+# These names are mostly for readability when inspecting stored parameter arrays.
 CARTPOLE_PARAM_NAMES = (
     "gravity",
     "masscart",
@@ -323,6 +326,8 @@ class ProbePolicy:
         step_idx: int,
         rng: np.random.Generator,
     ) -> int:
+        # The probe library is intentionally simple and repeatable so the encoder
+        # can compare environments under a small set of consistent "questions."
         if mode == "random":
             return int(rng.integers(0, self.n))
 
@@ -401,6 +406,8 @@ class CartPoleCrawler:
             probe_profile = "bipedal"
         self.probe_policy = ProbePolicy(self.action_dim, profile=probe_profile)
 
+        # Keep both granular transitions and fixed-length windows because the
+        # encoder cares about short temporal patterns, not just one-step effects.
         self.transitions: list[Transition] = []
         self.windows: list[WindowRecord] = []
 
@@ -455,6 +462,7 @@ class CartPoleCrawler:
             state_window.append(next_state_np.copy())
 
             if len(action_window) == self.window_size and len(state_window) == self.window_size + 1:
+                # Each window becomes one training example for the world encoder.
                 self.windows.append(
                     WindowRecord(
                         episode_id=episode_id,
@@ -476,6 +484,7 @@ class CartPoleCrawler:
 
     def collect(self, episodes_per_mode: int = 20, max_steps: int = 200):
         episode_id = 0
+        # Sweep through the small probe library so every mode contributes data.
         for mode in PROBE_MODES:
             for _ in range(episodes_per_mode):
                 self.run_episode(

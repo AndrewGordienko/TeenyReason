@@ -1,3 +1,5 @@
+"""Latent aggregation, memory, and probe-belief update helpers."""
+
 import random
 from collections import deque
 
@@ -14,6 +16,7 @@ def normalize_latent(latent: np.ndarray) -> np.ndarray:
     norm = float(np.linalg.norm(latent_np))
     if norm <= 1e-6:
         return latent_np
+    # Most downstream comparisons treat latent direction as the meaningful signal.
     return (latent_np / norm).astype(np.float32)
 
 
@@ -98,6 +101,7 @@ class EliteTrajectoryBuffer:
 
 
 def build_belief_vector(latents: list[np.ndarray]) -> np.ndarray:
+    # A belief is represented as [mean latent direction, per-dimension spread].
     stacked = np.stack([normalize_latent(latent) for latent in latents], axis=0).astype(np.float32)
     mean_z = normalize_latent(np.mean(stacked, axis=0))
     spread_z = np.clip(np.std(stacked, axis=0), 0.0, 1.0)
@@ -123,6 +127,7 @@ def update_belief_with_latent(
     mean_z = normalize_latent(belief_mean_z(belief))
     spread_z = np.asarray(belief[len(mean_z):], dtype=np.float32)
     normalized_new_latent = normalize_latent(new_latent)
+    # Spread tracks how much new evidence disagrees with the current belief mean.
     deviation = np.abs(normalized_new_latent - mean_z)
     updated_mean = normalize_latent((1.0 - alpha) * mean_z + alpha * normalized_new_latent)
     updated_spread = np.clip((1.0 - alpha) * spread_z + alpha * deviation, 0.0, 1.0)
@@ -163,6 +168,7 @@ def collect_probe_window(
     probe_mode: str,
     max_probe_retries: int = 12,
 ):
+    # Retry until we get a full clean probe window rather than an early-terminated one.
     for _ in range(max_probe_retries):
         apply_env_params(env, episode_physics)
         state, _info = env.reset()
@@ -217,6 +223,7 @@ def maybe_update_online_belief(
     if episode_step % online_z_update_freq != 0:
         return belief
 
+    # During control, refresh the latent from the recent real trajectory.
     updated_latent = encode_window(
         encoder=encoder,
         device=device,

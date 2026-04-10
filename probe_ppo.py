@@ -1,3 +1,5 @@
+"""Training loops for plain PPO and probe-conditioned PPO."""
+
 from collections import deque
 
 import numpy as np
@@ -57,6 +59,7 @@ def compute_sil_loss(
     action_low: np.ndarray,
     action_high: np.ndarray,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # Self-imitation learning replays especially good trajectories alongside PPO.
     states, beliefs, actions, returns_to_go, sample_weight = elite_buffer.sample(batch_size)
     state_t = torch.tensor(states, dtype=torch.float32, device=device)
     belief_t = torch.tensor(beliefs, dtype=torch.float32, device=device)
@@ -253,6 +256,7 @@ def train_plain_ppo(
             or episode_return >= solved_return
         )
         if should_update:
+            # Batch together several recent episodes before each PPO update.
             merged_batch = concat_episode_batches(pending_batches)
             auxiliary_loss_fn = None
             if len(elite_buffer) >= sil_batch_size:
@@ -404,6 +408,7 @@ def train_probe_conditioned_ppo(
 
     for episode in range(1, num_episodes + 1):
         episode_physics = select_episode_physics(rng, randomize_physics, base_physics)
+        # Probe first, act second: each episode starts by asking the environment a few fixed questions.
         probe_modes = (
             "center_hold",
             "pulse_left",
@@ -465,6 +470,7 @@ def train_probe_conditioned_ppo(
                 probe_target_count += 1
             probe_idx += 1
 
+        # Freeze the initial probe belief for logging/memory, then optionally refine it online.
         belief = build_belief_vector(probe_latents)
         episode_belief = belief.copy()
         mean_z = belief_mean_z(belief)
@@ -640,6 +646,7 @@ def train_probe_conditioned_ppo(
             or episode_return >= solved_return
         )
         if should_update:
+            # Probe-conditioned PPO can also average its entropy/epoch settings across pending episodes.
             merged_batch = concat_episode_batches(pending_batches)
             merged_entropy_coef = float(np.mean(pending_entropy))
             merged_ppo_epochs = int(round(np.mean(pending_epochs)))

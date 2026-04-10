@@ -1,3 +1,5 @@
+"""Shared PPO models, rollout packing, and update logic."""
+
 from dataclasses import dataclass
 
 import gymnasium as gym
@@ -37,6 +39,7 @@ class RunningNormalizer:
         if values_np.shape[0] == 0:
             return
 
+        # Update running moments online so rollouts can be normalized incrementally.
         batch_mean = values_np.mean(axis=0)
         batch_var = values_np.var(axis=0)
         batch_count = float(values_np.shape[0])
@@ -180,6 +183,7 @@ def sample_continuous_action(
     action_low: np.ndarray,
     action_high: np.ndarray,
 ) -> tuple[np.ndarray, float]:
+    # Sample in unconstrained space, tanh-squash, then rescale into env action bounds.
     dist = build_tanh_normal(mean, log_std)
     raw_action = dist.rsample()
     squashed_action = torch.tanh(raw_action)
@@ -219,6 +223,7 @@ def compute_gae(
     next_advantage = 0.0
     next_value = bootstrap_value
 
+    # Standard reverse-time GAE pass.
     for idx in range(len(rewards) - 1, -1, -1):
         non_terminal = 1.0 - terminals[idx]
         delta = rewards[idx] + gamma * next_value * non_terminal - values[idx]
@@ -335,6 +340,7 @@ def update_ppo_policy(
             ratio = torch.exp(log_ratio)
             unclipped = ratio * batch_advantages
             clipped = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * batch_advantages
+            # PPO uses the clipped objective to keep each update close to the rollout policy.
             policy_loss = -torch.min(unclipped, clipped).mean()
             value_loss = nn.functional.mse_loss(value, batch_returns)
             loss = policy_loss + value_loss_weight * value_loss - entropy_coef * entropy.mean()

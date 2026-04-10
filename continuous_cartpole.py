@@ -14,6 +14,7 @@ from gymnasium.utils import seeding
 
 
 class ContinuousCartPoleEnv(gym.Env):
+    # This is the standard CartPole dynamics with a continuous scalar action in [-1, 1].
     metadata = {
         "render_modes": ["human", "rgb_array"],
         "render_fps": 50,
@@ -66,6 +67,7 @@ class ContinuousCartPoleEnv(gym.Env):
         return [seed]
 
     def stepPhysics(self, force):
+        # Keep the classic control update explicit so physics parameters can be mutated by probes.
         x, x_dot, theta, theta_dot = self.state
         costheta = math.cos(theta)
         sintheta = math.sin(theta)
@@ -115,6 +117,7 @@ Any further steps are undefined behavior.
         super().reset(seed=seed)
         if seed is not None:
             self.seed(seed)
+        # Match the standard small-random-state CartPole reset.
         self.state = self.np_random.uniform(low=-0.05, high=0.05, size=(4,))
         self.steps_beyond_done = None
         return np.array(self.state, dtype=np.float32), {}

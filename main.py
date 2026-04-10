@@ -1,3 +1,5 @@
+"""Benchmark entrypoint for encoder training plus baseline/probe PPO runs."""
+
 import random
 import statistics
 from pathlib import Path
@@ -86,6 +88,7 @@ def print_solve_summary(name: str, solves, solve_cap: int):
 def run_single_seed(seed: int, run_index: int = 1, total_runs: int = 1):
     set_seed(seed)
 
+    # This is the current "single source of truth" experiment config.
     env_name = BIPEDAL_WALKER_NAME
     window_size = 8
     z_dim = 16
@@ -133,6 +136,7 @@ def run_single_seed(seed: int, run_index: int = 1, total_runs: int = 1):
 
     print(f"\n=== Seed {seed} ===")
     print("Collecting probe data for BipedalWalker...")
+    # First collect short scripted probe rollouts that the encoder will learn from.
     crawler = ProbeCrawler(
         env_name=env_name,
         window_size=window_size,
@@ -150,6 +154,7 @@ def run_single_seed(seed: int, run_index: int = 1, total_runs: int = 1):
     print_array_shapes("Windows:", windows)
 
     print("\nTraining encoder + delta predictor...")
+    # Train the latent encoder before either PPO variant so both runs see the same probe model.
     encoder, _predictor, device = train_encoder_predictor(
         windows=windows,
         z_dim=z_dim,
@@ -166,6 +171,7 @@ def run_single_seed(seed: int, run_index: int = 1, total_runs: int = 1):
     crawler.close()
 
     print("\nTraining baseline PPO...")
+    # Baseline PPO gets only environment state.
     _baseline_policy, baseline_returns = train_plain_ppo(
         env_name=env_name,
         num_episodes=num_episodes,
@@ -195,6 +201,7 @@ def run_single_seed(seed: int, run_index: int = 1, total_runs: int = 1):
     baseline_solve = solve_episode(baseline_returns, solved_return=solved_return)
 
     print("\nTraining probe-conditioned PPO...")
+    # Probe-conditioned PPO gets both state and the probe-derived belief vector.
     _probe_policy, probe_returns = train_probe_conditioned_ppo(
         env_name=env_name,
         encoder=encoder,
@@ -273,6 +280,7 @@ def run_training_pipeline():
     results = []
 
     total_runs = len(seeds)
+    # Treat each seed as one benchmark run so the logs can report progress cleanly.
     for run_index, seed in enumerate(seeds, start=1):
         results.append(run_single_seed(seed, run_index=run_index, total_runs=total_runs))
 

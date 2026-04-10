@@ -1,3 +1,5 @@
+"""Latent encoder plus supervision targets used to make the latent useful."""
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -20,6 +22,7 @@ class WorldEncoder(nn.Module):
         self.action_emb = nn.Embedding(action_vocab_size, 4)
         input_dim = (window_size + 1) * state_dim + window_size * 4
 
+        # A small MLP is enough here because the probe windows are already short and fixed-size.
         self.net = nn.Sequential(
             nn.Linear(input_dim, 64),
             nn.ReLU(),
@@ -119,6 +122,7 @@ def key_action_indices(action_vocab_size: int) -> dict[str, int]:
 def build_program_action_indices(action_vocab_size: int, horizon: int) -> np.ndarray:
     action_idx = key_action_indices(action_vocab_size)
 
+    # These canned action programs are used to summarize what the local dynamics afford.
     programs = [
         np.full(horizon, action_idx["left"], dtype=np.int64),
         np.full(horizon, action_idx["right"], dtype=np.int64),
@@ -197,6 +201,7 @@ def simulate_affordance_program(
     action_indices: np.ndarray,
     action_controls: np.ndarray,
 ) -> np.ndarray:
+    # Roll out a short analytic program and summarize how controllable/stable it looks.
     state = np.asarray(initial_state, dtype=np.float32).copy()
     force_mag = float(env_params[4])
     initial_theta = abs(float(initial_state[2]))
@@ -350,6 +355,7 @@ def build_generic_affordance_targets(
     truncated: np.ndarray,
     action_vocab_size: int,
 ) -> np.ndarray:
+    # Generic targets are used when analytic physics-based affordances are not available or desired.
     initial_state = states[:, 0, :]
     current_state = states[:, -2, :]
     next_state = states[:, -1, :]
@@ -437,6 +443,7 @@ def build_training_tensors(
         )
     normalized_affordances = normalize_targets(target_affordances)
 
+    # The encoder sees the full probe window; the heads supervise what that window should reveal.
     return {
         "window_states": states.astype(np.float32),
         "window_actions": actions.astype(np.int64),
@@ -535,6 +542,8 @@ def train_encoder_predictor(
             batch_target_env_params = target_env_params[idx]
             batch_target_affordances = target_affordances[idx]
 
+            # The latent is shared across all prediction heads, which is what forces it to
+            # carry environment-level information rather than memorizing only one task.
             z = encoder(batch_window_states, batch_window_actions)
             pred_delta = predictor(batch_current_state, batch_current_action, z)
             pred_env_params = physics_predictor(z)
