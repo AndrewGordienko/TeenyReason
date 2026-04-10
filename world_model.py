@@ -1,4 +1,15 @@
-"""Latent encoder plus supervision targets used to make the latent useful."""
+"""World-model style latent training.
+
+This module answers the question: "what should the probe latent actually mean?"
+
+The encoder sees a short state/action window from a scripted probe episode and
+compresses it into a latent vector `z`. Several prediction heads then supervise
+that latent so it has to carry useful environment information:
+
+- one-step state delta prediction
+- environment parameter prediction
+- affordance / behavior-summary prediction
+"""
 
 import numpy as np
 import torch
@@ -11,6 +22,7 @@ THETA_THRESHOLD_RADIANS = 12 * 2 * np.pi / 360
 
 
 class WorldEncoder(nn.Module):
+    """Map a short probe window to a compact latent vector."""
     def __init__(
         self,
         state_dim: int = 4,
@@ -42,6 +54,7 @@ class WorldEncoder(nn.Module):
 
 
 class DeltaPredictor(nn.Module):
+    """Predict the next-state delta using the current state, action, and latent."""
     def __init__(
         self,
         state_dim: int = 4,
@@ -71,6 +84,7 @@ class DeltaPredictor(nn.Module):
 
 
 class PhysicsPredictor(nn.Module):
+    """Decode explicit environment parameters from the latent."""
     def __init__(self, z_dim: int, param_dim: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -84,6 +98,7 @@ class PhysicsPredictor(nn.Module):
 
 
 class AffordancePredictor(nn.Module):
+    """Decode higher-level behavior summaries from the latent."""
     def __init__(self, z_dim: int, affordance_dim: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -99,6 +114,7 @@ class AffordancePredictor(nn.Module):
 
 
 def build_action_controls(action_vocab_size: int) -> np.ndarray:
+    """Map action indices to scalar control strengths for analytic probes."""
     if action_vocab_size <= 1:
         return np.asarray([0.0], dtype=np.float32)
     if action_vocab_size == 2:
@@ -107,6 +123,7 @@ def build_action_controls(action_vocab_size: int) -> np.ndarray:
 
 
 def key_action_indices(action_vocab_size: int) -> dict[str, int]:
+    """Pick a few named action slots from the probe action vocabulary."""
     controls = build_action_controls(action_vocab_size)
     center_idx = int(np.argmin(np.abs(controls)))
     offset = max(1, (action_vocab_size - 1) // 4)
@@ -120,6 +137,7 @@ def key_action_indices(action_vocab_size: int) -> dict[str, int]:
 
 
 def build_program_action_indices(action_vocab_size: int, horizon: int) -> np.ndarray:
+    """Construct a small library of analytic intervention programs."""
     action_idx = key_action_indices(action_vocab_size)
 
     # These canned action programs are used to summarize what the local dynamics afford.
@@ -166,6 +184,7 @@ def build_program_action_indices(action_vocab_size: int, horizon: int) -> np.nda
 
 
 def step_cartpole_dynamics(state: np.ndarray, force: float, env_params: np.ndarray) -> np.ndarray:
+    """One explicit CartPole physics step for analytic affordance rollouts."""
     gravity, masscart, masspole, length, _force_mag = env_params
     x, x_dot, theta, theta_dot = state
     total_mass = masspole + masscart
@@ -190,6 +209,7 @@ def step_cartpole_dynamics(state: np.ndarray, force: float, env_params: np.ndarr
 
 
 def stability_margin(state: np.ndarray) -> float:
+    """Return how far the state is from violating the CartPole failure bounds."""
     x_margin = (X_THRESHOLD - abs(float(state[0]))) / X_THRESHOLD
     theta_margin = (THETA_THRESHOLD_RADIANS - abs(float(state[2]))) / THETA_THRESHOLD_RADIANS
     return float(min(x_margin, theta_margin))
@@ -201,6 +221,7 @@ def simulate_affordance_program(
     action_indices: np.ndarray,
     action_controls: np.ndarray,
 ) -> np.ndarray:
+    """Summarize what happens if we apply one short analytic action program."""
     # Roll out a short analytic program and summarize how controllable/stable it looks.
     state = np.asarray(initial_state, dtype=np.float32).copy()
     force_mag = float(env_params[4])
@@ -265,6 +286,7 @@ def summarize_hold_affordances(
     action_controls: np.ndarray,
     intervention_horizon: int,
 ) -> np.ndarray:
+    """Collapse the family of hold-action rollouts into a smaller behavior summary."""
     hold_features = np.stack(
         [
             simulate_affordance_program(
@@ -319,6 +341,7 @@ def build_affordance_targets(
     action_vocab_size: int,
     intervention_horizon: int,
 ) -> np.ndarray:
+    """Build analytic affordance targets from explicit CartPole-style dynamics."""
     action_controls = build_action_controls(action_vocab_size)
     programs = build_program_action_indices(action_vocab_size, intervention_horizon)
     summary_dim = 7
@@ -355,6 +378,7 @@ def build_generic_affordance_targets(
     truncated: np.ndarray,
     action_vocab_size: int,
 ) -> np.ndarray:
+    """Build generic behavior-summary targets directly from recorded windows."""
     # Generic targets are used when analytic physics-based affordances are not available or desired.
     initial_state = states[:, 0, :]
     current_state = states[:, -2, :]
@@ -403,6 +427,7 @@ def build_generic_affordance_targets(
 
 
 def normalize_targets(values: np.ndarray) -> np.ndarray:
+    """Standardize a target matrix columnwise for easier multi-head training."""
     value_mean = values.mean(axis=0, keepdims=True).astype(np.float32)
     value_std = values.std(axis=0, keepdims=True).astype(np.float32)
     value_std = np.where(value_std < 1e-6, 1.0, value_std)
@@ -415,6 +440,7 @@ def build_training_tensors(
     intervention_horizon: int,
     analytic_affordances: bool = True,
 ) -> dict[str, np.ndarray]:
+    """Convert recorded windows into the tensors consumed by encoder training."""
     states = windows["states"]
     actions = windows["actions"]
     env_params = windows["env_params"]
@@ -467,6 +493,7 @@ def train_encoder_predictor(
     intervention_horizon: int = 12,
     analytic_affordances: bool = True,
 ) -> tuple[WorldEncoder, DeltaPredictor, torch.device]:
+    """Train the latent encoder and its prediction heads jointly."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if action_vocab_size is None:
         action_vocab_size = int(np.max(windows["actions"])) + 1

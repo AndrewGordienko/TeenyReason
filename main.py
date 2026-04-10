@@ -1,4 +1,13 @@
-"""Benchmark entrypoint for encoder training plus baseline/probe PPO runs."""
+"""Top-level experiment driver.
+
+This file wires the whole benchmark together:
+
+1. collect scripted probe data from the environment
+2. train a latent encoder on those probe windows
+3. train a plain PPO baseline
+4. train a PPO agent conditioned on the learned probe belief
+5. compare how quickly each variant solves the task across seeds
+"""
 
 import random
 import statistics
@@ -14,12 +23,14 @@ from world_model import train_encoder_predictor
 
 
 def set_seed(seed: int):
+    """Keep Python, NumPy, and Torch aligned for repeatable runs."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
 
 def print_array_shapes(title: str, arrays: dict[str, np.ndarray]):
+    """Small helper for inspecting the collected dataset before training."""
     print(title)
     for key, value in arrays.items():
         if isinstance(value, np.ndarray):
@@ -27,6 +38,7 @@ def print_array_shapes(title: str, arrays: dict[str, np.ndarray]):
 
 
 def save_training_artifacts(encoder, baseline_returns, probe_returns, benchmark_tag: str):
+    """Persist the main outputs from one benchmark configuration."""
     output_dir = Path("artifacts")
     output_dir.mkdir(exist_ok=True)
 
@@ -44,6 +56,7 @@ def save_training_artifacts(encoder, baseline_returns, probe_returns, benchmark_
 
 
 def save_benchmark_results(benchmark_tag: str, seeds, baseline_solves, probe_solves, solve_cap: int):
+    """Save the cross-seed solve summary in one compact file."""
     output_dir = Path("artifacts")
     output_dir.mkdir(exist_ok=True)
 
@@ -59,6 +72,7 @@ def save_benchmark_results(benchmark_tag: str, seeds, baseline_solves, probe_sol
 
 
 def print_return_summary(name: str, returns):
+    """Report short-horizon and medium-horizon return averages."""
     print(
         f"{name}: "
         f"avg10={np.mean(returns[-10:]):.2f} | "
@@ -67,6 +81,7 @@ def print_return_summary(name: str, returns):
 
 
 def solve_episode(returns, solved_return: float):
+    """Return the first episode index whose return crosses the solve threshold."""
     for idx, value in enumerate(returns, start=1):
         if value >= solved_return:
             return idx
@@ -74,6 +89,7 @@ def solve_episode(returns, solved_return: float):
 
 
 def print_solve_summary(name: str, solves, solve_cap: int):
+    """Summarize solve speed while capping unsolved runs for benchmark stats."""
     success_count = sum(1 for value in solves if value > 0)
     capped_solves = [value if value > 0 else solve_cap for value in solves]
     print(
@@ -86,6 +102,7 @@ def print_solve_summary(name: str, solves, solve_cap: int):
 
 
 def run_single_seed(seed: int, run_index: int = 1, total_runs: int = 1):
+    """Run the full benchmark pipeline for one seed."""
     set_seed(seed)
 
     # This is the current "single source of truth" experiment config.
@@ -273,6 +290,7 @@ def run_single_seed(seed: int, run_index: int = 1, total_runs: int = 1):
 
 
 def run_training_pipeline():
+    """Benchmark the current setup across a small fixed seed set."""
     seeds = [0, 1, 2, 3, 4]
     benchmark_tag = "bipedal_walker_ppo"
     num_episodes = 2000

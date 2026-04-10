@@ -1,4 +1,13 @@
-"""Latent aggregation, memory, and probe-belief update helpers."""
+"""Latent belief helpers.
+
+The encoder produces a raw latent vector `z` from one probe window. This module
+defines what the control policy actually uses on top of that:
+
+- latent normalization and similarity
+- memory of which latent regions led to good returns
+- aggregation of several probe latents into one belief vector
+- optional online belief updates during the control episode
+"""
 
 import random
 from collections import deque
@@ -12,6 +21,7 @@ from world_model import WorldEncoder
 
 
 def normalize_latent(latent: np.ndarray) -> np.ndarray:
+    """Normalize a latent to unit length unless it is effectively zero."""
     latent_np = np.asarray(latent, dtype=np.float32)
     norm = float(np.linalg.norm(latent_np))
     if norm <= 1e-6:
@@ -21,6 +31,7 @@ def normalize_latent(latent: np.ndarray) -> np.ndarray:
 
 
 class LatentPerformanceMemory:
+    """Nearest-neighbor memory from latent regions to achieved episode return."""
     def __init__(self, capacity: int):
         self.capacity = capacity
         self.buffer = deque(maxlen=capacity)
@@ -32,6 +43,7 @@ class LatentPerformanceMemory:
         return len(self.buffer)
 
     def _similarities(self, z: np.ndarray):
+        """Return cosine-like similarities between `z` and stored latent codes."""
         if not self.buffer:
             return np.asarray([], dtype=np.float32), np.asarray([], dtype=np.float32)
 
@@ -42,12 +54,14 @@ class LatentPerformanceMemory:
         return similarities.astype(np.float32), returns
 
     def novelty(self, z: np.ndarray) -> float:
+        """High when the latent is far from everything seen before."""
         similarities, _returns = self._similarities(z)
         if similarities.size == 0:
             return 1.0
         return float(1.0 - np.max(similarities))
 
     def expected_return(self, z: np.ndarray, top_k: int = 8) -> float:
+        """Estimate likely return by averaging nearby latent memories."""
         similarities, returns = self._similarities(z)
         if similarities.size == 0:
             return 0.0
@@ -61,6 +75,7 @@ class LatentPerformanceMemory:
 
 
 class EliteTrajectoryBuffer:
+    """Replay buffer for unusually strong trajectories used by self-imitation."""
     def __init__(self, capacity: int):
         self.capacity = capacity
         self.buffer = deque(maxlen=capacity)
@@ -101,6 +116,7 @@ class EliteTrajectoryBuffer:
 
 
 def build_belief_vector(latents: list[np.ndarray]) -> np.ndarray:
+    """Aggregate several probe latents into one policy-conditioning vector."""
     # A belief is represented as [mean latent direction, per-dimension spread].
     stacked = np.stack([normalize_latent(latent) for latent in latents], axis=0).astype(np.float32)
     mean_z = normalize_latent(np.mean(stacked, axis=0))
@@ -109,11 +125,13 @@ def build_belief_vector(latents: list[np.ndarray]) -> np.ndarray:
 
 
 def belief_mean_z(belief: np.ndarray) -> np.ndarray:
+    """Extract the mean-latent half of a belief vector."""
     half = belief.shape[0] // 2
     return np.asarray(belief[:half], dtype=np.float32)
 
 
 def belief_uncertainty(belief: np.ndarray) -> float:
+    """Collapse the spread half of the belief into one scalar uncertainty."""
     half = belief.shape[0] // 2
     spread = np.asarray(belief[half:], dtype=np.float32)
     return float(np.mean(spread))
@@ -124,6 +142,7 @@ def update_belief_with_latent(
     new_latent: np.ndarray,
     alpha: float,
 ) -> np.ndarray:
+    """Blend a new latent observation into an existing belief."""
     mean_z = normalize_latent(belief_mean_z(belief))
     spread_z = np.asarray(belief[len(mean_z):], dtype=np.float32)
     normalized_new_latent = normalize_latent(new_latent)
@@ -139,6 +158,7 @@ def select_episode_physics(
     randomize_physics: bool,
     base_physics,
 ):
+    """Choose either a randomized physics instance or the shared base one."""
     if randomize_physics:
         return sample_env_params(rng, base_physics)
     return base_physics
@@ -150,6 +170,7 @@ def encode_window(
     window_states: np.ndarray,
     window_actions: np.ndarray,
 ) -> np.ndarray:
+    """Run one probe window through the frozen encoder and return its latent."""
     encoder.eval()
     with torch.no_grad():
         states = torch.tensor(window_states[None, ...], dtype=torch.float32, device=device)
@@ -168,6 +189,7 @@ def collect_probe_window(
     probe_mode: str,
     max_probe_retries: int = 12,
 ):
+    """Collect one full probe window, retrying if the environment ends too early."""
     # Retry until we get a full clean probe window rather than an early-terminated one.
     for _ in range(max_probe_retries):
         apply_env_params(env, episode_physics)
@@ -200,6 +222,7 @@ def collect_probe_window(
 
 
 def nearest_probe_action_idx(action: np.ndarray, action_values: np.ndarray) -> int:
+    """Map a continuous policy action back to the nearest discrete probe action."""
     action_np = np.asarray(action, dtype=np.float32).reshape(1, -1)
     prototypes = np.asarray(action_values, dtype=np.float32)
     if prototypes.ndim == 1:
@@ -218,6 +241,7 @@ def maybe_update_online_belief(
     online_z_update_freq: int,
     episode_step: int,
 ) -> np.ndarray:
+    """Refresh the belief online from the recent real trajectory when scheduled."""
     if len(recent_action_idx) < recent_action_idx.maxlen:
         return belief
     if episode_step % online_z_update_freq != 0:
@@ -245,6 +269,7 @@ def choose_probe_count(
     novelty_probe_threshold: float,
     low_return_probe_threshold: float,
 ) -> tuple[int, float, float]:
+    """Decide how many scripted probes to run before the control episode."""
     novelty = performance_memory.novelty(z)
     expected_return = performance_memory.expected_return(z)
     probe_count = base_probe_episodes
@@ -266,6 +291,7 @@ def choose_policy_epochs(
     exploit_return_threshold: float,
     uncertainty_focus_threshold: float,
 ) -> int:
+    """Give promising low-uncertainty episodes a little more PPO update budget."""
     epochs = base_ppo_epochs
     if expected_return >= exploit_return_threshold:
         epochs += 1
@@ -284,6 +310,7 @@ def adjust_entropy_coef(
     exploit_return_threshold: float,
     uncertainty_focus_threshold: float,
 ) -> float:
+    """Slightly retune exploration pressure from novelty/return/uncertainty."""
     entropy_coef = base_entropy_coef
     if novelty >= novelty_probe_threshold:
         entropy_coef *= 1.08
@@ -305,6 +332,7 @@ def should_promote_episode_to_elite(
     warmup_episodes: int,
     std_scale: float,
 ) -> tuple[bool, float]:
+    """Choose whether this episode should enter the self-imitation buffer."""
     if current_episode <= warmup_episodes:
         return False, min_elite_return
 

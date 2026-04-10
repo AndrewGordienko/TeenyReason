@@ -63,6 +63,7 @@ class ContinuousCartPoleEnv(gym.Env):
         self.steps_beyond_done = None
 
     def seed(self, seed=None):
+        """Match the older Gym-style explicit seed API used by this env copy."""
         self.np_random, seed = seeding.np_random(seed)
         return [seed]
 
@@ -82,6 +83,7 @@ class ContinuousCartPoleEnv(gym.Env):
         return (x, x_dot, theta, theta_dot)
 
     def step(self, action):
+        """Advance the continuous CartPole by one step."""
         assert self.action_space.contains(action), \
             "%r (%s) invalid" % (action, type(action))
         # Cast action to float to strip np trappings
@@ -123,6 +125,7 @@ Any further steps are undefined behavior.
         return np.array(self.state, dtype=np.float32), {}
 
     def render(self):
+        """Render using the classic-control viewer when available."""
         screen_width = 600
         screen_height = 400
 
@@ -170,5 +173,6 @@ Any further steps are undefined behavior.
         return self.viewer.render(return_rgb_array=False)
 
     def close(self):
+        """Dispose of the classic-control viewer."""
         if self.viewer:
             self.viewer.close()

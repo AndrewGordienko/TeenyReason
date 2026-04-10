@@ -1,4 +1,15 @@
-"""Probe data collection for both one-step transitions and short history windows."""
+"""Probe data collection.
+
+This module is responsible for asking the environment a fixed set of simple
+"questions" before policy learning begins. Those questions are implemented as
+short scripted probe trajectories such as "hold center", "pulse left", or
+"sticky random".
+
+The collected data is stored in two views:
+
+- individual transitions for easy inspection
+- fixed-length windows for the latent encoder
+"""
 
 from collections import deque
 from dataclasses import dataclass
@@ -56,6 +67,7 @@ BIPEDAL_WALKER_PARAM_NAMES = (
 
 @dataclass(frozen=True)
 class CartPolePhysics:
+    """Explicit snapshot of the CartPole parameters the probe code cares about."""
     gravity: float = 9.8
     masscart: float = 1.0
     masspole: float = 0.1
@@ -77,6 +89,7 @@ class CartPolePhysics:
 
 @dataclass(frozen=True)
 class LunarLanderPhysics:
+    """Environment parameters used as the LunarLander fingerprint target."""
     gravity: float = -10.0
     wind_power: float = 15.0
     turbulence_power: float = 1.5
@@ -96,6 +109,7 @@ class LunarLanderPhysics:
 
 @dataclass(frozen=True)
 class BipedalWalkerPhysics:
+    """Reference parameter bundle for BipedalWalker-style experiments."""
     motors_torque: float = 80.0
     speed_hip: float = 4.0
     speed_knee: float = 6.0
@@ -116,6 +130,7 @@ class BipedalWalkerPhysics:
 
 
 def default_cartpole_physics(env=None) -> CartPolePhysics:
+    """Read the environment's current CartPole parameters or use defaults."""
     if env is None:
         return CartPolePhysics()
 
@@ -130,6 +145,7 @@ def default_cartpole_physics(env=None) -> CartPolePhysics:
 
 
 def default_lunar_lander_physics(env=None) -> LunarLanderPhysics:
+    """Read the environment's current LunarLander parameters or use defaults."""
     if env is None:
         return LunarLanderPhysics()
 
@@ -143,6 +159,7 @@ def default_lunar_lander_physics(env=None) -> LunarLanderPhysics:
 
 
 def default_bipedal_walker_physics(env=None) -> BipedalWalkerPhysics:
+    """Return the reference BipedalWalker parameter bundle."""
     del env
     # Gymnasium's BipedalWalker uses module-level Box2D constants rather than
     # per-instance physics fields, so we track reference values here even
@@ -154,6 +171,7 @@ def sample_cartpole_physics(
     rng: np.random.Generator,
     base_physics: CartPolePhysics | None = None,
 ) -> CartPolePhysics:
+    """Randomize CartPole around a base parameter setting."""
     base = base_physics or CartPolePhysics()
     return CartPolePhysics(
         gravity=float(rng.uniform(0.75 * base.gravity, 1.25 * base.gravity)),
@@ -168,6 +186,7 @@ def sample_lunar_lander_physics(
     rng: np.random.Generator,
     base_physics: LunarLanderPhysics | None = None,
 ) -> LunarLanderPhysics:
+    """Randomize LunarLander around a base parameter setting."""
     base = base_physics or LunarLanderPhysics()
     gravity = float(np.clip(rng.uniform(base.gravity - 1.5, base.gravity + 1.5), -11.8, -2.0))
     wind_power = float(np.clip(rng.uniform(0.0, max(4.0, 1.5 * base.wind_power)), 0.0, 20.0))
@@ -187,11 +206,17 @@ def sample_bipedal_walker_physics(
     rng: np.random.Generator,
     base_physics: BipedalWalkerPhysics | None = None,
 ) -> BipedalWalkerPhysics:
+    """Return the current BipedalWalker reference parameters.
+
+    The current code path does not mutate Box2D walker physics online the same
+    way it does for CartPole/LunarLander, so this acts like a no-op sampler.
+    """
     del rng
     return base_physics or BipedalWalkerPhysics()
 
 
 def apply_cartpole_physics(env, physics: CartPolePhysics):
+    """Write a CartPole parameter bundle back into the live environment."""
     base_env = env.unwrapped
     base_env.gravity = physics.gravity
     base_env.masscart = physics.masscart
@@ -203,6 +228,7 @@ def apply_cartpole_physics(env, physics: CartPolePhysics):
 
 
 def apply_lunar_lander_physics(env, physics: LunarLanderPhysics):
+    """Write a LunarLander parameter bundle back into the live environment."""
     base_env = env.unwrapped
     base_env.gravity = physics.gravity
     base_env.wind_power = physics.wind_power
@@ -211,11 +237,17 @@ def apply_lunar_lander_physics(env, physics: LunarLanderPhysics):
 
 
 def apply_bipedal_walker_physics(env, physics: BipedalWalkerPhysics):
+    """Placeholder for walker physics mutation.
+
+    The benchmark still threads a parameter object through the system so the
+    rest of the code can stay environment-agnostic.
+    """
     del env
     del physics
 
 
 def default_env_params(env_name: str, env=None):
+    """Dispatch to the environment-specific default parameter reader."""
     if env_name == CONTINUOUS_CARTPOLE_NAME:
         return default_cartpole_physics(env)
     if env_name == CONTINUOUS_LUNAR_LANDER_NAME:
@@ -226,6 +258,7 @@ def default_env_params(env_name: str, env=None):
 
 
 def sample_env_params(rng: np.random.Generator, base_params):
+    """Dispatch to the environment-specific parameter sampler."""
     if isinstance(base_params, CartPolePhysics):
         return sample_cartpole_physics(rng, base_params)
     if isinstance(base_params, LunarLanderPhysics):
@@ -236,6 +269,7 @@ def sample_env_params(rng: np.random.Generator, base_params):
 
 
 def apply_env_params(env, env_params):
+    """Dispatch to the environment-specific parameter writer."""
     if isinstance(env_params, CartPolePhysics):
         apply_cartpole_physics(env, env_params)
         return
@@ -250,6 +284,7 @@ def apply_env_params(env, env_params):
 
 @dataclass
 class Transition:
+    """Single recorded interaction step from a probe episode."""
     episode_id: int
     step_idx: int
     probe_mode: str
@@ -264,6 +299,7 @@ class Transition:
 
 @dataclass
 class WindowRecord:
+    """Fixed-length temporal slice used to train the latent encoder."""
     episode_id: int
     end_step_idx: int
     probe_mode: str
@@ -276,6 +312,12 @@ class WindowRecord:
 
 
 class ProbePolicy:
+    """Small library of repeatable probe behaviors.
+
+    These probes are intentionally simple. The goal is not to solve the task,
+    but to produce consistent, diagnostic trajectories that reveal how the
+    environment responds.
+    """
     def __init__(self, action_space_n: int, profile: str = "scalar"):
         self.n = action_space_n
         self.profile = profile
@@ -326,6 +368,7 @@ class ProbePolicy:
         step_idx: int,
         rng: np.random.Generator,
     ) -> int:
+        """Return the next discrete probe action for a named scripted mode."""
         # The probe library is intentionally simple and repeatable so the encoder
         # can compare environments under a small set of consistent "questions."
         if mode == "random":
@@ -379,6 +422,11 @@ class ProbePolicy:
 
 
 class CartPoleCrawler:
+    """Collect probe trajectories and convert them into encoder-ready windows.
+
+    Despite the historical name, this crawler is used for the supported
+    environments in this repo, not just CartPole.
+    """
     def __init__(
         self,
         env_name: str = "CartPole-v1",
@@ -418,6 +466,7 @@ class CartPoleCrawler:
         max_steps: int = 200,
         reset_options: Optional[dict[str, Any]] = None,
     ):
+        """Run one scripted probe episode and record both steps and windows."""
         if self.randomize_physics:
             episode_physics = sample_env_params(self.rng, self.base_physics)
         else:
@@ -483,6 +532,7 @@ class CartPoleCrawler:
                 break
 
     def collect(self, episodes_per_mode: int = 20, max_steps: int = 200):
+        """Run the full probe library enough times to build a training dataset."""
         episode_id = 0
         # Sweep through the small probe library so every mode contributes data.
         for mode in PROBE_MODES:
@@ -495,6 +545,7 @@ class CartPoleCrawler:
                 episode_id += 1
 
     def get_transition_arrays(self) -> dict[str, np.ndarray]:
+        """Convert the recorded transition list into stacked NumPy arrays."""
         return {
             "episode_id": np.asarray([t.episode_id for t in self.transitions], dtype=np.int32),
             "step_idx": np.asarray([t.step_idx for t in self.transitions], dtype=np.int32),
@@ -509,6 +560,7 @@ class CartPoleCrawler:
         }
 
     def get_window_arrays(self) -> dict[str, np.ndarray]:
+        """Convert the recorded window list into stacked NumPy arrays."""
         return {
             "episode_id": np.asarray([w.episode_id for w in self.windows], dtype=np.int32),
             "end_step_idx": np.asarray([w.end_step_idx for w in self.windows], dtype=np.int32),
@@ -522,7 +574,9 @@ class CartPoleCrawler:
         }
 
     def close(self):
+        """Close the owned environment."""
         self.env.close()
 
 
+# Preserve the older name used elsewhere in the repo.
 ProbeCrawler = CartPoleCrawler

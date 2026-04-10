@@ -1,4 +1,13 @@
-"""Shared PPO models, rollout packing, and update logic."""
+"""Shared PPO models and optimization utilities.
+
+The training loops in `probe_ppo.py` collect episodes and then call into this
+module to:
+
+- normalize observations/rewards
+- pack episode data into one training batch
+- evaluate squashed Gaussian actions
+- run the PPO update itself
+"""
 
 from dataclasses import dataclass
 
@@ -11,6 +20,7 @@ from torch.distributions import Normal
 
 @dataclass
 class EpisodeBatch:
+    """Everything PPO needs from one or more collected episodes."""
     states: np.ndarray
     actions: np.ndarray
     old_log_probs: np.ndarray
@@ -20,12 +30,14 @@ class EpisodeBatch:
 
 
 def init_linear(layer: nn.Linear, gain: float, bias: float = 0.0) -> nn.Linear:
+    """Apply the repo's standard linear-layer initialization."""
     nn.init.orthogonal_(layer.weight, gain=gain)
     nn.init.constant_(layer.bias, bias)
     return layer
 
 
 class RunningNormalizer:
+    """Online mean/variance tracker for observations or rewards."""
     def __init__(self, shape, clip: float = 5.0, epsilon: float = 1e-4):
         self.mean = np.zeros(shape, dtype=np.float64)
         self.var = np.ones(shape, dtype=np.float64)
@@ -71,6 +83,7 @@ class RunningNormalizer:
 
 
 class PlainGaussianActorCritic(nn.Module):
+    """Standard state-only actor-critic used for the baseline PPO run."""
     def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 128):
         super().__init__()
         self.trunk = nn.Sequential(
@@ -91,6 +104,7 @@ class PlainGaussianActorCritic(nn.Module):
 
 
 class ProbeConditionedGaussianActorCritic(nn.Module):
+    """Actor-critic that receives both the environment state and probe belief."""
     def __init__(
         self,
         state_dim: int,
@@ -126,6 +140,7 @@ class ProbeConditionedGaussianActorCritic(nn.Module):
         self.log_std = nn.Parameter(torch.full((action_dim,), -1.5))
 
     def forward(self, state: torch.Tensor, belief: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict action mean and value under the current state/belief."""
         actor_features = self.actor_net(state)
         half = belief.shape[-1] // 2
         spread = belief[..., half:]
@@ -148,6 +163,7 @@ class ProbeConditionedGaussianActorCritic(nn.Module):
 
 
 def validate_continuous_env(env):
+    """Extract action bounds and ensure the environment is continuous-control."""
     action_space = env.action_space
     if not isinstance(action_space, gym.spaces.Box):
         raise ValueError("PPO path currently supports only Box action spaces")
@@ -157,6 +173,7 @@ def validate_continuous_env(env):
 
 
 def atanh(x: torch.Tensor) -> torch.Tensor:
+    """Numerically stable inverse tanh for squashed-action log-prob evaluation."""
     return 0.5 * (torch.log1p(x) - torch.log1p(-x))
 
 
@@ -165,6 +182,7 @@ def action_scale_bias(
     action_high: np.ndarray,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert env action bounds into affine scale/bias tensors."""
     low = torch.tensor(action_low, dtype=torch.float32, device=device)
     high = torch.tensor(action_high, dtype=torch.float32, device=device)
     scale = 0.5 * (high - low)
@@ -173,6 +191,7 @@ def action_scale_bias(
 
 
 def build_tanh_normal(mean: torch.Tensor, log_std: torch.Tensor) -> Normal:
+    """Build the unsquashed Gaussian used before tanh action squashing."""
     std = torch.exp(torch.clamp(log_std, -5.0, 1.0))
     return Normal(mean, std)
 
@@ -203,6 +222,7 @@ def evaluate_continuous_actions(
     action_low: np.ndarray,
     action_high: np.ndarray,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute log-prob and entropy for already-sampled bounded actions."""
     dist = build_tanh_normal(mean, log_std)
     scale, bias = action_scale_bias(action_low, action_high, mean.device)
     normalized_action = torch.clamp((actions - bias) / scale, -0.999, 0.999)
@@ -219,6 +239,7 @@ def compute_gae(
     gamma: float,
     gae_lambda: float,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Compute generalized advantage estimates and returns for one rollout."""
     advantages = np.zeros_like(rewards, dtype=np.float32)
     next_advantage = 0.0
     next_value = bootstrap_value
@@ -247,6 +268,7 @@ def build_episode_batch(
     gae_lambda: float,
     beliefs: list[np.ndarray] | None = None,
 ) -> EpisodeBatch:
+    """Pack one collected episode into the normalized PPO batch structure."""
     rewards_np = np.asarray(rewards, dtype=np.float32)
     values_np = np.asarray(values, dtype=np.float32)
     terminals_np = np.asarray(terminals, dtype=np.float32)
@@ -269,6 +291,7 @@ def build_episode_batch(
 
 
 def concat_episode_batches(batches: list[EpisodeBatch]) -> EpisodeBatch:
+    """Concatenate several episode batches before an optimizer step."""
     beliefs = None
     if batches[0].beliefs is not None:
         beliefs = np.concatenate([batch.beliefs for batch in batches], axis=0).astype(np.float32)
@@ -298,6 +321,7 @@ def update_ppo_policy(
     target_kl: float,
     auxiliary_loss_fn=None,
 ):
+    """Run one PPO optimization phase over a collected batch."""
     device = next(model.parameters()).device
     states = torch.tensor(batch.states, dtype=torch.float32, device=device)
     actions = torch.tensor(batch.actions, dtype=torch.float32, device=device)

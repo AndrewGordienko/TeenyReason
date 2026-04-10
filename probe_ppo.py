@@ -1,4 +1,11 @@
-"""Training loops for plain PPO and probe-conditioned PPO."""
+"""Policy training loops.
+
+This module contains the direct comparison the project cares about:
+
+- `train_plain_ppo`: standard PPO that only sees environment state
+- `train_probe_conditioned_ppo`: PPO that first runs scripted probes, builds a
+  latent belief, and conditions the policy/value function on that belief
+"""
 
 from collections import deque
 
@@ -40,12 +47,14 @@ from world_model import WorldEncoder
 
 
 def format_solve_status(solved_episode: int | None) -> str:
+    """Render a compact solved/not-solved status for the episode logs."""
     if solved_episode is None:
         return "no"
     return f"yes@{solved_episode:04d}"
 
 
 def format_peer_solve_status(peer_label: str, peer_solved_episode: int | None) -> str:
+    """Render the sibling run's solve status in the same log-friendly format."""
     if peer_solved_episode is None:
         return f"{peer_label}=pending"
     return f"{peer_label}={peer_solved_episode:04d}"
@@ -59,6 +68,7 @@ def compute_sil_loss(
     action_low: np.ndarray,
     action_high: np.ndarray,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute the self-imitation auxiliary loss from elite replay samples."""
     # Self-imitation learning replays especially good trajectories alongside PPO.
     states, beliefs, actions, returns_to_go, sample_weight = elite_buffer.sample(batch_size)
     state_t = torch.tensor(states, dtype=torch.float32, device=device)
@@ -114,6 +124,7 @@ def train_plain_ppo(
     peer_variant_label: str = "probe",
     peer_solved_episode: int | None = None,
 ):
+    """Train the plain PPO baseline with no probe conditioning."""
     env = make_env(env_name)
     action_low, action_high = validate_continuous_env(env)
     rng = np.random.default_rng(seed)
@@ -153,6 +164,7 @@ def train_plain_ppo(
         last_terminated = False
 
         while not done:
+            # Roll out one baseline policy step using only the normalized state.
             state_t = torch.tensor(state[None, :], dtype=torch.float32, device=device)
             with torch.no_grad():
                 mean, value = policy(state_t)
@@ -359,6 +371,7 @@ def train_probe_conditioned_ppo(
     peer_variant_label: str = "baseline",
     peer_solved_episode: int | None = None,
 ):
+    """Train PPO with an extra belief vector built from scripted environment probes."""
     train_env = make_env(env_name)
     probe_env = make_env(env_name)
     action_low, action_high = validate_continuous_env(train_env)
@@ -377,6 +390,7 @@ def train_probe_conditioned_ppo(
     state_dim = train_env.observation_space.shape[0]
 
     with torch.no_grad():
+        # Ask the encoder what latent size it produces so the policy can size its belief input.
         dummy_states = torch.zeros((1, window_size + 1, state_dim), dtype=torch.float32, device=device)
         dummy_actions = torch.zeros((1, window_size), dtype=torch.long, device=device)
         latent_dim = int(encoder(dummy_states, dummy_actions).shape[-1])
@@ -428,10 +442,13 @@ def train_probe_conditioned_ppo(
             probe_mode=probe_modes[0],
         )
         if probe_failed:
+            # Skip this episode entirely if we cannot get even the initial probe window.
             print(f"episode {episode:04d} | probe phase failed repeatedly, skipping")
             returns.append(0.0)
             continue
 
+        # Start with one probe latent, then optionally ask follow-up probes if the
+        # memory/uncertainty heuristics suggest the environment is still unclear.
         probe_latents = [encode_window(encoder, device, first_states, first_actions)]
         probe_target_count, novelty, expected_return = choose_probe_count(
             z=probe_latents[0],
@@ -517,6 +534,7 @@ def train_probe_conditioned_ppo(
         last_terminated = False
 
         while not done:
+            # The actor sees the current environment state plus the current belief.
             state_t = torch.tensor(state[None, :], dtype=torch.float32, device=device)
             belief_t = torch.tensor(belief[None, :], dtype=torch.float32, device=device)
             with torch.no_grad():
@@ -541,6 +559,8 @@ def train_probe_conditioned_ppo(
                     reward_normalizer.scale_only(np.asarray([raw_reward], dtype=np.float32))[0]
                 )
 
+            # Convert the continuous action back to the probe vocabulary so the
+            # encoder can digest the recent trajectory using the same action language.
             next_belief = maybe_update_online_belief(
                 encoder=encoder,
                 device=device,

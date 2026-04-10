@@ -1,4 +1,13 @@
-"""Environment construction and probe-action discretization helpers."""
+"""Environment helpers used by the rest of the repo.
+
+Two ideas live here:
+
+- how to build the environments the experiments train on
+- how to map a small discrete probe action index into a real environment action
+
+The latent/probe code wants a compact action vocabulary even for continuous
+control tasks, so this module defines a small library of representative actions.
+"""
 
 import gymnasium as gym
 import numpy as np
@@ -12,6 +21,7 @@ BIPEDAL_WALKER_NAME = "BipedalWalker-v3"
 
 
 def make_env(env_name: str, max_episode_steps: int = 500):
+    """Construct a Gymnasium environment, including the custom CartPole variant."""
     if env_name == CONTINUOUS_CARTPOLE_NAME:
         env = ContinuousCartPoleEnv()
         return gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
@@ -19,12 +29,14 @@ def make_env(env_name: str, max_episode_steps: int = 500):
 
 
 def _build_scalar_action_values(action_space, action_bins: int) -> np.ndarray:
+    """Evenly sample a 1-D continuous action range into a small probe grid."""
     low = float(action_space.low[0])
     high = float(action_space.high[0])
     return np.linspace(low, high, action_bins, dtype=np.float32).reshape(-1, 1)
 
 
 def _build_lunar_lander_action_values() -> np.ndarray:
+    """Hand-picked probe actions for LunarLander's 2-D thruster controls."""
     return np.asarray(
         [
             [-1.0, 0.0],   # idle
@@ -42,6 +54,7 @@ def _build_lunar_lander_action_values() -> np.ndarray:
 
 
 def _build_bipedal_walker_action_values() -> np.ndarray:
+    """Small library of recognizable gait-like actions for BipedalWalker probes."""
     return np.asarray(
         [
             [0.0, 0.0, 0.0, 0.0],      # neutral
@@ -59,6 +72,12 @@ def _build_bipedal_walker_action_values() -> np.ndarray:
 
 
 def get_action_values(env, action_bins: int, env_name: str | None = None):
+    """Return the probe action prototypes for the given environment.
+
+    Discrete environments return `None` because their native action indices are
+    already the probe vocabulary. Continuous environments instead return a small
+    table of prototype actions.
+    """
     action_space = env.action_space
     if hasattr(action_space, "n"):
         return None
@@ -84,6 +103,7 @@ def get_action_values(env, action_bins: int, env_name: str | None = None):
 
 
 def get_action_dim(env, action_bins: int, env_name: str | None = None) -> int:
+    """Number of discrete probe actions available in this environment."""
     action_values = get_action_values(env, action_bins, env_name=env_name)
     if action_values is None:
         return int(env.action_space.n)
@@ -91,6 +111,7 @@ def get_action_dim(env, action_bins: int, env_name: str | None = None) -> int:
 
 
 def action_index_to_env_action(action_idx: int, action_values):
+    """Convert a probe action index into the real action sent to the env."""
     if action_values is None:
         return int(action_idx)
     return np.asarray(action_values[action_idx], dtype=np.float32).reshape(-1)
