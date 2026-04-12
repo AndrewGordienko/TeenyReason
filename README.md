@@ -1,39 +1,59 @@
 # TeenyReason
 
-Small experiments around probe-conditioned reinforcement learning.
+Small research experiments around latent environment beliefs for reinforcement
+learning.
 
-The rough idea is:
+The core question is:
 
-- run short scripted probe episodes in an environment
-- train an encoder to turn those probe windows into a compact latent "environment fingerprint"
-- train a control policy that gets both the normal state and that latent belief
-- compare that against a plain PPO baseline
+How do we let an agent interact with an environment for a short time, build a
+compact belief about the hidden rules of that world, and then use that belief
+to learn or control much faster afterward?
 
-Right now the main pipeline is set up around `BipedalWalker` and benchmarks:
+This repo is no longer best thought of as just "probe-conditioned PPO." That is
+only one downstream testbed. The main object of study is the latent space.
 
-- a baseline PPO run
-- a probe-conditioned PPO run
-- multiple seeds
+## Research Framing
 
-## Files
+Read [docs/core_idea.md](docs/core_idea.md) first.
 
-- `main.py`: benchmark entrypoint
-- `probe_data.py`: probe crawler and scripted probe policies
-- `world_model.py`: latent encoder and prediction targets
-- `probe_latent.py`: latent aggregation, belief updates, novelty, uncertainty
-- `probe_ppo.py`: baseline PPO and probe-conditioned PPO training loops
-- `ppo_core.py`: shared PPO models and update code
+The latent in this repo is intended to be:
 
-## How it works
+- predictive
+- task-relevant
+- uncertainty-aware
+- reusable across downstream control
 
-1. Collect short probe trajectories with fixed action patterns.
-2. Build windowed training data from those trajectories.
-3. Train an encoder that maps probe windows to a latent vector.
-4. Use one or more probe latents to build a belief vector.
-5. Train PPO with that belief as extra conditioning input.
-6. Compare solve speed and returns against plain PPO.
+## Repo Layout
 
-## Run
+- `main.py`
+  Root benchmark entrypoint. Pick the environment and seeds here.
+- `serve_latent_dashboard.py`
+  Root wrapper for the local Flask dashboard.
+- `teenyreason/representation/`
+  Stable entrypoint for the current latent-belief system and latent snapshot
+  analysis helpers.
+- `teenyreason/probe/`
+  Probe data collection, active probing, belief aggregation, and online belief
+  updates.
+- `teenyreason/rl/`
+  PPO code that consumes the learned belief.
+- `teenyreason/viz/`
+  Local dashboard for latent snapshots and benchmark summaries.
+- `teenyreason/models/belief_world_model.py`
+  Current recurrent posterior encoder and structured latent supervision.
+- `teenyreason/models/world_model.py`
+  Older simpler prototype kept around as a reference point.
+
+## Current Flow
+
+1. Collect probe trajectories across a family of environments.
+2. Turn those into fixed-length windows.
+3. Train a latent encoder and structured prediction heads.
+4. Save a latent snapshot artifact for visualization.
+5. Train a baseline PPO agent and a probe-conditioned PPO agent.
+6. Compare not just return, but solve speed and environment-step cost.
+
+## Run Training
 
 From the repo root:
 
@@ -41,17 +61,55 @@ From the repo root:
 python3 main.py
 ```
 
-The script will:
+That will:
 
 - collect probe data
-- train the encoder
-- train baseline PPO
-- train probe-conditioned PPO
-- save returns and benchmark artifacts under `artifacts/`
+- train the current latent encoder
+- save checkpoint artifacts
+- save a latent snapshot under `artifacts/*_latent_snapshot.npz`
+- run the baseline/probe benchmark
+
+## Run Playback
+
+To render a saved probe-conditioned policy:
+
+```bash
+python3 play_probe_policy.py --checkpoint artifacts/continuous_cartpole_ppo_seed_0_probe_ppo_checkpoint.pt --episodes 3
+```
+
+Recent checkpoints can carry three policy snapshots:
+
+- final policy
+- best single-run snapshot
+- solve-verified snapshot
+
+Playback will prefer the solve-verified snapshot when available.
+
+## Run The Local Dashboard
+
+Start the localhost dashboard:
+
+```bash
+python3 serve_latent_dashboard.py
+```
+
+Then open:
+
+```text
+http://127.0.0.1:5050
+```
+
+The dashboard currently shows:
+
+- saved latent-space snapshots
+- a 2D PCA projection of latent means
+- reward / uncertainty coloring
+- probe-mode counts
+- benchmark summary tables
 
 ## Notes
 
-- The code currently uses local hardcoded experiment settings in `main.py`.
-- Recent logs include the benchmark run number, whether the trainer is `baseline` or `probe`, and a short solve-status summary under each episode line.
-- Generated artifacts and `__pycache__` are currently present in the repo.
-
+- `artifacts/` contains generated outputs from training and evaluation.
+- `.gitignore` now ignores future generated artifacts and bytecode files.
+- The representation package exists to make the repo easier to reason about
+  from the latent-belief angle without breaking the current training path.

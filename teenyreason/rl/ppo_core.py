@@ -113,52 +113,57 @@ class ProbeConditionedGaussianActorCritic(nn.Module):
         hidden_dim: int = 128,
     ):
         super().__init__()
-        self.actor_net = nn.Sequential(
-            init_linear(nn.Linear(state_dim, hidden_dim), gain=np.sqrt(2.0)),
-            nn.Tanh(),
-            init_linear(nn.Linear(hidden_dim, hidden_dim), gain=np.sqrt(2.0)),
+        self.actor_state_in = init_linear(nn.Linear(state_dim, hidden_dim), gain=np.sqrt(2.0))
+        self.actor_state_hidden = init_linear(nn.Linear(hidden_dim, hidden_dim), gain=np.sqrt(2.0))
+        self.actor_belief_proj = nn.Sequential(
+            init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5),
             nn.Tanh(),
         )
-        self.actor_mean = init_linear(nn.Linear(hidden_dim, action_dim), gain=0.01)
-        self.actor_belief_delta = init_linear(nn.Linear(belief_dim, action_dim), gain=0.01)
+        self.actor_gamma_1 = init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5)
+        self.actor_beta_1 = init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5)
+        self.actor_gamma_2 = init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5)
+        self.actor_beta_2 = init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5)
+        self.actor_mean = init_linear(nn.Linear(hidden_dim * 2, action_dim), gain=0.01)
 
-        self.value_state_net = nn.Sequential(
-            init_linear(nn.Linear(state_dim, hidden_dim), gain=np.sqrt(2.0)),
+        self.value_state_in = init_linear(nn.Linear(state_dim, hidden_dim), gain=np.sqrt(2.0))
+        self.value_state_hidden = init_linear(nn.Linear(hidden_dim, hidden_dim), gain=np.sqrt(2.0))
+        self.value_belief_proj = nn.Sequential(
+            init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5),
             nn.Tanh(),
         )
-        self.value_belief_to_gamma = init_linear(
-            nn.Linear(belief_dim, hidden_dim), gain=0.5
-        )
-        self.value_belief_to_beta = init_linear(
-            nn.Linear(belief_dim, hidden_dim), gain=0.5
-        )
-        self.value_head_net = nn.Sequential(
-            init_linear(nn.Linear(hidden_dim, hidden_dim), gain=np.sqrt(2.0)),
-            nn.Tanh(),
-        )
-        self.value_head = init_linear(nn.Linear(hidden_dim, 1), gain=1.0)
+        self.value_gamma_1 = init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5)
+        self.value_beta_1 = init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5)
+        self.value_gamma_2 = init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5)
+        self.value_beta_2 = init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5)
+        self.value_head = init_linear(nn.Linear(hidden_dim * 2, 1), gain=1.0)
         self.log_std = nn.Parameter(torch.full((action_dim,), -1.5))
+
+    def apply_film(
+        self,
+        features: torch.Tensor,
+        gamma_layer: nn.Linear,
+        beta_layer: nn.Linear,
+        belief: torch.Tensor,
+    ) -> torch.Tensor:
+        gamma = torch.tanh(gamma_layer(belief))
+        beta = torch.tanh(beta_layer(belief))
+        return torch.tanh(features * (1.0 + 0.75 * gamma) + 0.75 * beta)
 
     def forward(self, state: torch.Tensor, belief: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Predict action mean and value under the current state/belief."""
-        actor_features = self.actor_net(state)
-        half = belief.shape[-1] // 2
-        spread = belief[..., half:]
-        uncertainty = spread.mean(dim=-1, keepdim=True)
-        trust = torch.clamp(1.0 - 2.0 * uncertainty, 0.0, 1.0)
+        actor_features = torch.tanh(self.actor_state_in(state))
+        actor_features = self.apply_film(actor_features, self.actor_gamma_1, self.actor_beta_1, belief)
+        actor_features = torch.tanh(self.actor_state_hidden(actor_features))
+        actor_features = self.apply_film(actor_features, self.actor_gamma_2, self.actor_beta_2, belief)
+        actor_context = self.actor_belief_proj(belief)
+        mean = self.actor_mean(torch.cat([actor_features, actor_context], dim=-1))
 
-        # Let the policy stay primarily state-driven and use the probe belief
-        # only as a small residual nudge.
-        mean = self.actor_mean(actor_features)
-        actor_delta = 0.10 * trust * torch.tanh(self.actor_belief_delta(belief))
-        mean = mean + actor_delta
-
-        value_features = self.value_state_net(state)
-        gamma = trust * torch.tanh(self.value_belief_to_gamma(belief))
-        beta = trust * torch.tanh(self.value_belief_to_beta(belief))
-        value_features = value_features * (1.0 + 0.75 * gamma) + 0.75 * beta
-        value_features = self.value_head_net(value_features)
-        value = self.value_head(value_features).squeeze(-1)
+        value_features = torch.tanh(self.value_state_in(state))
+        value_features = self.apply_film(value_features, self.value_gamma_1, self.value_beta_1, belief)
+        value_features = torch.tanh(self.value_state_hidden(value_features))
+        value_features = self.apply_film(value_features, self.value_gamma_2, self.value_beta_2, belief)
+        value_context = self.value_belief_proj(belief)
+        value = self.value_head(torch.cat([value_features, value_context], dim=-1)).squeeze(-1)
         return mean, value
 
 
@@ -213,6 +218,18 @@ def sample_continuous_action(
         action.squeeze(0).detach().cpu().numpy().astype(np.float32),
         float(log_prob.sum(dim=-1).item()),
     )
+
+
+def mean_to_continuous_action(
+    mean: torch.Tensor,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
+) -> np.ndarray:
+    """Convert the policy mean into a deterministic bounded environment action."""
+    squashed_mean = torch.tanh(mean)
+    scale, bias = action_scale_bias(action_low, action_high, mean.device)
+    action = bias + scale * squashed_mean
+    return action.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
 
 def evaluate_continuous_actions(

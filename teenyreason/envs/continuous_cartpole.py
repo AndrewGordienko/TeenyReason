@@ -10,6 +10,7 @@ import math
 
 import gymnasium as gym
 from gymnasium import logger, spaces
+from gymnasium.error import DependencyNotInstalled
 from gymnasium.utils import seeding
 
 
@@ -20,7 +21,7 @@ class ContinuousCartPoleEnv(gym.Env):
         "render_fps": 50,
     }
 
-    def __init__(self):
+    def __init__(self, render_mode: str | None = None):
         self.gravity = 9.8
         self.masscart = 1.0
         self.masspole = 0.1
@@ -57,7 +58,12 @@ class ContinuousCartPoleEnv(gym.Env):
         self.observation_space = spaces.Box(-high, high, dtype=np.float32)
 
         self.seed()
-        self.viewer = None
+        self.render_mode = render_mode
+        self.screen_width = 600
+        self.screen_height = 400
+        self.screen = None
+        self.clock = None
+        self.isopen = True
         self.state = None
 
         self.steps_beyond_done = None
@@ -125,54 +131,106 @@ Any further steps are undefined behavior.
         return np.array(self.state, dtype=np.float32), {}
 
     def render(self):
-        """Render using the classic-control viewer when available."""
-        screen_width = 600
-        screen_height = 400
+        """Render with the current Gymnasium pygame-based classic-control path."""
+        if self.render_mode is None:
+            gym.logger.warn(
+                "You are calling render without specifying render_mode when the "
+                "environment was created."
+            )
+            return None
 
-        world_width = self.x_threshold * 2
-        scale = screen_width /world_width
-        carty = 100  # TOP OF CART
-        polewidth = 10.0
-        polelen = scale * 1.0
-        cartwidth = 50.0
-        cartheight = 30.0
+        try:
+            import pygame
+            from pygame import gfxdraw
+        except ImportError as exc:
+            raise DependencyNotInstalled(
+                'pygame is not installed, run `pip install pygame`'
+            ) from exc
 
-        if self.viewer is None:
-            from gymnasium.envs.classic_control import rendering
-            self.viewer = rendering.Viewer(screen_width, screen_height)
-            l, r, t, b = -cartwidth / 2, cartwidth / 2, cartheight / 2, -cartheight / 2
-            axleoffset = cartheight / 4.0
-            cart = rendering.FilledPolygon([(l, b), (l, t), (r, t), (r, b)])
-            self.carttrans = rendering.Transform()
-            cart.add_attr(self.carttrans)
-            self.viewer.add_geom(cart)
-            l, r, t, b = -polewidth / 2, polewidth / 2, polelen-polewidth / 2, -polewidth / 2
-            pole = rendering.FilledPolygon([(l, b), (l, t), (r, t), (r, b)])
-            pole.set_color(.8, .6, .4)
-            self.poletrans = rendering.Transform(translation=(0, axleoffset))
-            pole.add_attr(self.poletrans)
-            pole.add_attr(self.carttrans)
-            self.viewer.add_geom(pole)
-            self.axle = rendering.make_circle(polewidth / 2)
-            self.axle.add_attr(self.poletrans)
-            self.axle.add_attr(self.carttrans)
-            self.axle.set_color(.5, .5, .8)
-            self.viewer.add_geom(self.axle)
-            self.track = rendering.Line((0, carty), (screen_width, carty))
-            self.track.set_color(0, 0, 0)
-            self.viewer.add_geom(self.track)
+        if self.screen is None:
+            pygame.init()
+            if self.render_mode == "human":
+                pygame.display.init()
+                self.screen = pygame.display.set_mode(
+                    (self.screen_width, self.screen_height)
+                )
+            else:
+                self.screen = pygame.Surface((self.screen_width, self.screen_height))
+        if self.clock is None:
+            self.clock = pygame.time.Clock()
 
         if self.state is None:
             return None
 
-        x = self.state
-        cartx = x[0] * scale + screen_width / 2.0  # MIDDLE OF CART
-        self.carttrans.set_translation(cartx, carty)
-        self.poletrans.set_rotation(-x[2])
+        world_width = self.x_threshold * 2
+        scale = self.screen_width / world_width
+        polewidth = 10.0
+        polelen = scale * (2 * self.length)
+        cartwidth = 50.0
+        cartheight = 30.0
+        carty = 100
+        axleoffset = cartheight / 4.0
 
-        return self.viewer.render(return_rgb_array=False)
+        x = self.state
+        cartx = x[0] * scale + self.screen_width / 2.0
+
+        surface = pygame.Surface((self.screen_width, self.screen_height))
+        surface.fill((255, 255, 255))
+
+        l, r, t, b = -cartwidth / 2, cartwidth / 2, cartheight / 2, -cartheight / 2
+        cart_coords = [(l, b), (l, t), (r, t), (r, b)]
+        cart_coords = [(px + cartx, py + carty) for px, py in cart_coords]
+        gfxdraw.aapolygon(surface, cart_coords, (0, 0, 0))
+        gfxdraw.filled_polygon(surface, cart_coords, (0, 0, 0))
+
+        l, r, t, b = (
+            -polewidth / 2,
+            polewidth / 2,
+            polelen - polewidth / 2,
+            -polewidth / 2,
+        )
+        pole_coords = []
+        for coord in [(l, b), (l, t), (r, t), (r, b)]:
+            rotated = pygame.math.Vector2(coord).rotate_rad(-x[2])
+            pole_coords.append((rotated[0] + cartx, rotated[1] + carty + axleoffset))
+        gfxdraw.aapolygon(surface, pole_coords, (202, 152, 101))
+        gfxdraw.filled_polygon(surface, pole_coords, (202, 152, 101))
+
+        gfxdraw.aacircle(
+            surface,
+            int(cartx),
+            int(carty + axleoffset),
+            int(polewidth / 2),
+            (129, 132, 203),
+        )
+        gfxdraw.filled_circle(
+            surface,
+            int(cartx),
+            int(carty + axleoffset),
+            int(polewidth / 2),
+            (129, 132, 203),
+        )
+        gfxdraw.hline(surface, 0, self.screen_width, carty, (0, 0, 0))
+
+        surface = pygame.transform.flip(surface, False, True)
+        self.screen.blit(surface, (0, 0))
+
+        if self.render_mode == "human":
+            pygame.event.pump()
+            self.clock.tick(self.metadata["render_fps"])
+            pygame.display.flip()
+            return None
+
+        return np.transpose(
+            np.array(pygame.surfarray.pixels3d(self.screen)),
+            axes=(1, 0, 2),
+        )
 
     def close(self):
-        """Dispose of the classic-control viewer."""
-        if self.viewer:
-            self.viewer.close()
+        """Dispose of the pygame renderer when the env is closed."""
+        if self.screen is not None:
+            import pygame
+
+            pygame.display.quit()
+            pygame.quit()
+            self.isopen = False

@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from envs import (
+from ..envs import (
     BIPEDAL_WALKER_NAME,
     CONTINUOUS_CARTPOLE_NAME,
     CONTINUOUS_LUNAR_LANDER_NAME,
@@ -38,6 +38,9 @@ PROBE_MODES = (
     "reverse",
     "sweep",
     "sticky_random",
+    "burst_random",
+    "anti_repeat",
+    "phase_random",
 )
 
 # These names are mostly for readability when inspecting stored parameter arrays.
@@ -322,6 +325,7 @@ class ProbePolicy:
         self.n = action_space_n
         self.profile = profile
         self._sticky = 0
+        self._burst_len = 2
 
     def _center_action(self) -> int:
         if self.profile == "lunar_lander":
@@ -417,6 +421,28 @@ class ProbePolicy:
             if step_idx % burst_len == 0:
                 self._sticky = int(rng.integers(0, self.n))
             return self._sticky
+
+        if mode == "burst_random":
+            if step_idx == 0 or step_idx % self._burst_len == 0:
+                self._burst_len = int(rng.integers(1, 5))
+                self._sticky = int(rng.integers(0, self.n))
+            return self._sticky
+
+        if mode == "anti_repeat":
+            if step_idx == 0:
+                self._sticky = int(rng.integers(0, self.n))
+                return self._sticky
+            choices = np.delete(np.arange(self.n), self._sticky)
+            self._sticky = int(rng.choice(choices))
+            return self._sticky
+
+        if mode == "phase_random":
+            center = self._center_action()
+            if step_idx < 2:
+                candidates = np.asarray([center, self._small_left_action(), self._small_right_action()])
+            else:
+                candidates = np.arange(self.n)
+            return int(rng.choice(candidates))
 
         raise ValueError(f"Unknown probe mode: {mode}")
 

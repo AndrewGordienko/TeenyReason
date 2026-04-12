@@ -12,7 +12,7 @@ control tasks, so this module defines a small library of representative actions.
 import gymnasium as gym
 import numpy as np
 
-from continuous_cartpole import ContinuousCartPoleEnv
+from .continuous_cartpole import ContinuousCartPoleEnv
 
 
 CONTINUOUS_CARTPOLE_NAME = "ContinuousCartPole-v0"
@@ -20,12 +20,18 @@ CONTINUOUS_LUNAR_LANDER_NAME = "LunarLanderContinuous-v3"
 BIPEDAL_WALKER_NAME = "BipedalWalker-v3"
 
 
-def make_env(env_name: str, max_episode_steps: int = 500):
+def make_env(
+    env_name: str,
+    max_episode_steps: int = 500,
+    render_mode: str | None = None,
+):
     """Construct a Gymnasium environment, including the custom CartPole variant."""
     if env_name == CONTINUOUS_CARTPOLE_NAME:
-        env = ContinuousCartPoleEnv()
+        env = ContinuousCartPoleEnv(render_mode=render_mode)
         return gym.wrappers.TimeLimit(env, max_episode_steps=max_episode_steps)
-    return gym.make(env_name)
+    if render_mode is None:
+        return gym.make(env_name)
+    return gym.make(env_name, render_mode=render_mode)
 
 
 def _build_scalar_action_values(action_space, action_bins: int) -> np.ndarray:

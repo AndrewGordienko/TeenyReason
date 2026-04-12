@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TeenyReason Dashboard</title>
+  <style>
+    :root {
+      --bg: #f6f1e8;
+      --panel: #fffdf8;
+      --ink: #1f1d1a;
+      --muted: #6a655d;
+      --line: #d8cdbd;
+      --accent: #b8572f;
+      --accent-soft: #f2dfd7;
+      --good: #23684c;
+      --warn: #8a5d13;
+    }
+    body {
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      background: radial-gradient(circle at top left, #fff8ee 0, var(--bg) 55%, #efe3d1 100%);
+      color: var(--ink);
+    }
+    .page {
+      max-width: 1300px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    .hero {
+      margin-bottom: 20px;
+      padding: 20px 24px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: linear-gradient(135deg, rgba(184,87,47,0.08), rgba(255,255,255,0.92));
+    }
+    h1, h2, h3 {
+      margin: 0 0 10px;
+      font-weight: 600;
+    }
+    p {
+      margin: 0;
+      line-height: 1.5;
+    }
+    .grid {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: 1.2fr 0.8fr;
+    }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--panel);
+      padding: 18px;
+      box-shadow: 0 10px 30px rgba(57, 44, 28, 0.05);
+    }
+    .controls {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    label {
+      display: grid;
+      gap: 6px;
+      font-size: 14px;
+      color: var(--muted);
+    }
+    select {
+      min-width: 220px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: white;
+      color: var(--ink);
+      font-family: inherit;
+      font-size: 14px;
+    }
+    .stats {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      margin-top: 8px;
+    }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+      background: #fff;
+    }
+    .card strong {
+      display: block;
+      font-size: 22px;
+      margin-top: 4px;
+      color: var(--accent);
+    }
+    .muted {
+      color: var(--muted);
+      font-size: 14px;
+    }
+    svg {
+      width: 100%;
+      height: auto;
+      display: block;
+      border-radius: 14px;
+      background: #fff;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    th, td {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .legend {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 10px 0 0;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      display: inline-block;
+    }
+    .split {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: 1fr 1fr;
+    }
+    .empty {
+      padding: 28px;
+      text-align: center;
+      color: var(--muted);
+      border: 1px dashed var(--line);
+      border-radius: 14px;
+      background: rgba(255,255,255,0.6);
+    }
+    @media (max-width: 960px) {
+      .grid, .split {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="hero">
+      <h1>TeenyReason Latent Environment Belief Dashboard</h1>
+      <p>
+        This view is for inspecting what the representation means, not just whether a PPO run got lucky.
+        It loads saved latent snapshots and benchmark summaries from the local <code>artifacts/</code> directory.
+      </p>
+    </section>
+
+    <div class="grid">
+      <section class="panel">
+        <h2>Latent Snapshot</h2>
+        <div class="controls">
+          <label>
+            Snapshot
+            <select id="latentSelect"></select>
+          </label>
+          <label>
+            Color By
+            <select id="colorSelect">
+              <option value="reward_sum">Reward Sum</option>
+              <option value="uncertainty">Uncertainty</option>
+              <option value="probe_mode">Probe Mode</option>
+            </select>
+          </label>
+        </div>
+        <div id="latentSummary" class="stats"></div>
+        <div id="latentPlotWrap"></div>
+        <div id="latentLegend" class="legend"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Probe Modes</h2>
+        <div id="modeTableWrap"></div>
+      </section>
+    </div>
+
+    <section class="panel" style="margin-top: 16px;">
+      <h2>Benchmark Summary</h2>
+      <div class="controls">
+        <label>
+          Benchmark
+          <select id="benchmarkSelect"></select>
+        </label>
+      </div>
+      <div id="benchmarkSummary" class="stats"></div>
+      <div class="split" style="margin-top: 12px;">
+        <div>
+          <h3>Seed Rows</h3>
+          <div id="benchmarkRows"></div>
+        </div>
+        <div>
+          <h3>Aggregate Solve Stats</h3>
+          <div id="benchmarkCards"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const modePalette = ["#b8572f", "#23684c", "#3b5b92", "#9a6c19", "#7b4ea3", "#008b8b", "#d65f5f", "#6b705c"];
+
+    function el(id) {
+      return document.getElementById(id);
+    }
+
+    function setSelectOptions(selectEl, values) {
+      selectEl.innerHTML = "";
+      for (const value of values) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = value;
+        selectEl.appendChild(option);
+      }
+    }
+
+    function card(label, value, note = "") {
+      return `
+        <div class="card">
+          <div class="muted">${label}</div>
+          <strong>${value}</strong>
+          ${note ? `<div class="muted">${note}</div>` : ""}
+        </div>
+      `;
+    }
+
+    function colorForMetric(point, metric, modeColorMap) {
+      if (metric === "probe_mode") {
+        return modeColorMap[point.probe_mode] || "#666";
+      }
+      const value = metric === "uncertainty" ? point.uncertainty : point.reward_sum;
+      const clamped = Math.max(0, Math.min(1, value));
+      if (metric === "reward_sum") {
+        const red = Math.round(230 - 110 * clamped);
+        const green = Math.round(205 - 40 * clamped);
+        const blue = Math.round(184 - 120 * clamped);
+        return `rgb(${red}, ${green}, ${blue})`;
+      }
+      const red = Math.round(80 + 175 * clamped);
+      const green = Math.round(140 - 80 * clamped);
+      const blue = Math.round(195 - 90 * clamped);
+      return `rgb(${red}, ${green}, ${blue})`;
+    }
+
+    function normalizeMetric(points, metric) {
+      if (metric === "probe_mode") {
+        return points.map((point) => ({...point}));
+      }
+      const values = points.map((point) => metric === "uncertainty" ? point.uncertainty : point.reward_sum);
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const span = Math.max(max - min, 1e-6);
+      return points.map((point) => {
+        const raw = metric === "uncertainty" ? point.uncertainty : point.reward_sum;
+        return {...point, [metric]: (raw - min) / span};
+      });
+    }
+
+    function renderLatent(payload) {
+      const summary = payload.summary;
+      el("latentSummary").innerHTML = [
+        card("Windows", summary.num_windows),
+        card("Latent Dim", summary.latent_dim),
+        card("Reward Mean", summary.reward_mean.toFixed(2)),
+        card("Uncertainty Mean", summary.uncertainty_mean.toFixed(3)),
+        card("Terminated Rate", `${(100 * summary.terminated_rate).toFixed(1)}%`),
+        card("PCA Explained", summary.pca_explained.map((value) => value.toFixed(2)).join(" / "))
+      ].join("");
+
+      const metric = el("colorSelect").value;
+      const points = normalizeMetric(payload.points, metric);
+      if (!points.length) {
+        el("latentPlotWrap").innerHTML = `<div class="empty">No latent points found.</div>`;
+        return;
+      }
+
+      const xs = points.map((point) => point.x);
+      const ys = points.map((point) => point.y);
+      const minX = Math.min(...xs);
+      const maxX = Math.max(...xs);
+      const minY = Math.min(...ys);
+      const maxY = Math.max(...ys);
+      const width = 760;
+      const height = 430;
+      const pad = 36;
+      const xScale = (value) => pad + ((value - minX) / Math.max(maxX - minX, 1e-6)) * (width - 2 * pad);
+      const yScale = (value) => height - pad - ((value - minY) / Math.max(maxY - minY, 1e-6)) * (height - 2 * pad);
+
+      const uniqueModes = [...new Set(points.map((point) => point.probe_mode))].sort();
+      const modeColorMap = {};
+      uniqueModes.forEach((mode, idx) => {
+        modeColorMap[mode] = modePalette[idx % modePalette.length];
+      });
+
+      const circles = points.map((point) => {
+        const color = colorForMetric(point, metric, modeColorMap);
+        return `
+          <circle cx="${xScale(point.x).toFixed(2)}" cy="${yScale(point.y).toFixed(2)}" r="4.3" fill="${color}" fill-opacity="0.82">
+            <title>mode=${point.probe_mode} | reward=${point.reward_sum.toFixed(2)} | uncert=${point.uncertainty.toFixed(3)} | episode=${point.episode_id}</title>
+          </circle>
+        `;
+      }).join("");
+
+      el("latentPlotWrap").innerHTML = `
+        <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Latent PCA scatter">
+          <rect x="0" y="0" width="${width}" height="${height}" fill="#fffaf3"></rect>
+          <line x1="${pad}" y1="${height - pad}" x2="${width - pad}" y2="${height - pad}" stroke="#d8cdbd"></line>
+          <line x1="${pad}" y1="${pad}" x2="${pad}" y2="${height - pad}" stroke="#d8cdbd"></line>
+          ${circles}
+        </svg>
+      `;
+
+      if (metric === "probe_mode") {
+        el("latentLegend").innerHTML = uniqueModes.map((mode) => {
+          return `<span><i class="swatch" style="background:${modeColorMap[mode]}"></i>${mode}</span>`;
+        }).join("");
+      } else {
+        el("latentLegend").innerHTML = `<span>${metric === "reward_sum" ? "Darker points = larger reward sum" : "Brighter points = larger posterior uncertainty"}</span>`;
+      }
+
+      el("modeTableWrap").innerHTML = `
+        <table>
+          <thead>
+            <tr><th>Probe Mode</th><th>Window Count</th></tr>
+          </thead>
+          <tbody>
+            ${payload.mode_counts.map((row) => `<tr><td>${row.probe_mode}</td><td>${row.count}</td></tr>`).join("")}
+          </tbody>
+        </table>
+      `;
+    }
+
+    function renderBenchmark(payload) {
+      const summaries = payload.summaries;
+      el("benchmarkSummary").innerHTML = [
+        card("Baseline Episode Median", summaries.baseline_episode.median.toFixed(1)),
+        card("Probe Episode Median", summaries.probe_episode.median.toFixed(1)),
+        card("Baseline Step Median", summaries.baseline_steps.median.toFixed(1)),
+        card("Probe Step Median", summaries.probe_steps.median.toFixed(1))
+      ].join("");
+
+      el("benchmarkRows").innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>Seed</th>
+              <th>Baseline Ep</th>
+              <th>Probe Ep</th>
+              <th>Baseline Steps</th>
+              <th>Probe Steps</th>
+              <th>Probe Encoder Steps</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${payload.rows.map((row) => `
+              <tr>
+                <td>${row.seed}</td>
+                <td>${row.baseline_episode_solve}</td>
+                <td>${row.probe_episode_solve}</td>
+                <td>${row.baseline_step_solve}</td>
+                <td>${row.probe_step_solve}</td>
+                <td>${row.probe_encoder_steps}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      `;
+
+      const entries = [
+        ["Baseline Solve Episodes", summaries.baseline_episode],
+        ["Probe Solve Episodes", summaries.probe_episode],
+        ["Baseline Solve Env Steps", summaries.baseline_steps],
+        ["Probe Solve Env Steps", summaries.probe_steps],
+      ];
+      el("benchmarkCards").innerHTML = entries.map(([label, summary]) => {
+        return `
+          <div class="card" style="margin-bottom:10px;">
+            <div class="muted">${label}</div>
+            <strong>${summary.success_rate}/${summary.count}</strong>
+            <div class="muted">median=${summary.median.toFixed(1)} | mean=${summary.mean.toFixed(1)}</div>
+            <div class="muted">values=${summary.values.join(", ")}</div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function loadLatent() {
+      const name = el("latentSelect").value;
+      if (!name) {
+        el("latentPlotWrap").innerHTML = `<div class="empty">Run training first so the repo can save a latent snapshot.</div>`;
+        return;
+      }
+      const response = await fetch(`/api/latent/${encodeURIComponent(name)}`);
+      renderLatent(await response.json());
+    }
+
+    async function loadBenchmark() {
+      const name = el("benchmarkSelect").value;
+      if (!name) {
+        el("benchmarkRows").innerHTML = `<div class="empty">Run a benchmark first so the repo can save a summary artifact.</div>`;
+        el("benchmarkCards").innerHTML = "";
+        return;
+      }
+      const response = await fetch(`/api/benchmark/${encodeURIComponent(name)}`);
+      renderBenchmark(await response.json());
+    }
+
+    async function boot() {
+      const response = await fetch("/api/index");
+      const payload = await response.json();
+      setSelectOptions(el("latentSelect"), payload.latent_snapshots);
+      setSelectOptions(el("benchmarkSelect"), payload.benchmark_summaries);
+      el("latentSelect").addEventListener("change", loadLatent);
+      el("benchmarkSelect").addEventListener("change", loadBenchmark);
+      el("colorSelect").addEventListener("change", loadLatent);
+      await loadLatent();
+      await loadBenchmark();
+    }
+
+    boot();
+  </script>
+</body>
+</html>

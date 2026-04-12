@@ -1,4 +1,4 @@
-"""World-model style latent training.
+"""Legacy world-model style latent training.
 
 This module answers the question: "what should the probe latent actually mean?"
 
@@ -9,6 +9,9 @@ that latent so it has to carry useful environment information:
 - one-step state delta prediction
 - environment parameter prediction
 - affordance / behavior-summary prediction
+
+The current benchmark path uses `belief_world_model.py` instead, but this file
+is still useful as a smaller reference implementation.
 """
 
 import numpy as np

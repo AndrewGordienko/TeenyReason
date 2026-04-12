@@ -8,26 +8,28 @@ This module contains the direct comparison the project cares about:
 """
 
 from collections import deque
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from envs import BIPEDAL_WALKER_NAME, get_action_values, make_env
-from ppo_core import (
+from ..envs import get_action_values, make_env
+from .ppo_core import (
     PlainGaussianActorCritic,
     ProbeConditionedGaussianActorCritic,
     RunningNormalizer,
     build_episode_batch,
     concat_episode_batches,
     evaluate_continuous_actions,
+    mean_to_continuous_action,
     sample_continuous_action,
     update_ppo_policy,
     validate_continuous_env,
 )
-from probe_data import ProbePolicy, apply_env_params, default_env_params
-from probe_latent import (
+from ..probe.probe_data import apply_env_params, default_env_params
+from ..probe.probe_latent import (
     EliteTrajectoryBuffer,
     LatentPerformanceMemory,
     adjust_entropy_coef,
@@ -36,14 +38,52 @@ from probe_latent import (
     build_belief_vector,
     choose_policy_epochs,
     choose_probe_count,
-    collect_probe_window,
+    collect_adaptive_probe_window,
     encode_window,
+    encode_window_posterior,
     maybe_update_online_belief,
     nearest_probe_action_idx,
     select_episode_physics,
     should_promote_episode_to_elite,
 )
-from world_model import WorldEncoder
+from ..representation import DeltaPredictorEnsemble, WorldEncoder
+
+
+@dataclass
+class TrainingRunResult:
+    """Everything the benchmark/save path needs from one PPO training run."""
+    policy: nn.Module
+    returns: list[float]
+    state_normalizer: RunningNormalizer
+    solved_episode: int | None
+    solved_env_steps: int | None
+    total_env_steps: int
+    best_policy_state_dict: dict[str, torch.Tensor]
+    best_state_normalizer_state: dict[str, np.ndarray | float]
+    best_return: float
+    best_episode: int | None
+    solve_policy_state_dict: dict[str, torch.Tensor] | None
+    solve_state_normalizer_state: dict[str, np.ndarray | float] | None
+    solve_eval_returns: list[float] | None
+    solve_probe_count: int | None
+
+
+def snapshot_policy_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Clone a policy state dict so later PPO updates do not overwrite it."""
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+    }
+
+
+def snapshot_normalizer_state(normalizer: RunningNormalizer) -> dict[str, np.ndarray | float]:
+    """Clone the running-normalizer state for later checkpoint saving."""
+    return {
+        "mean": np.asarray(normalizer.mean, dtype=np.float64).copy(),
+        "var": np.asarray(normalizer.var, dtype=np.float64).copy(),
+        "count": float(normalizer.count),
+        "clip": float(normalizer.clip),
+    }
 
 
 def format_solve_status(solved_episode: int | None) -> str:
@@ -58,6 +98,167 @@ def format_peer_solve_status(peer_label: str, peer_solved_episode: int | None) -
     if peer_solved_episode is None:
         return f"{peer_label}=pending"
     return f"{peer_label}={peer_solved_episode:04d}"
+
+
+def format_solve_steps_status(solved_env_steps: int | None) -> str:
+    """Render solve-via-env-steps in the same compact style as solve episodes."""
+    if solved_env_steps is None:
+        return "pending"
+    return str(solved_env_steps)
+
+
+def evaluate_plain_policy(
+    policy: PlainGaussianActorCritic,
+    state_normalizer: RunningNormalizer,
+    env_name: str,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
+    randomize_physics: bool,
+    base_physics,
+    eval_episodes: int,
+    seed: int,
+) -> tuple[list[float], int]:
+    """Run short deterministic eval episodes before declaring the baseline solved."""
+    env = make_env(env_name)
+    rng = np.random.default_rng(seed)
+    returns: list[float] = []
+    total_steps = 0
+    device = next(policy.parameters()).device
+
+    for eval_episode in range(eval_episodes):
+        episode_physics = select_episode_physics(rng, randomize_physics, base_physics)
+        apply_env_params(env, episode_physics)
+        raw_state, _info = env.reset(seed=seed + eval_episode)
+        raw_state = np.asarray(raw_state, dtype=np.float32)
+        done = False
+        episode_return = 0.0
+
+        while not done:
+            state = state_normalizer.normalize(raw_state)
+            state_t = torch.tensor(state[None, :], dtype=torch.float32, device=device)
+            with torch.no_grad():
+                mean, _value = policy(state_t)
+            action = mean_to_continuous_action(mean, action_low, action_high)
+            next_raw_state, reward, terminated, truncated, _info = env.step(action)
+            total_steps += 1
+            raw_state = np.asarray(next_raw_state, dtype=np.float32)
+            episode_return += float(reward)
+            done = bool(terminated or truncated)
+
+        returns.append(episode_return)
+
+    env.close()
+    return returns, total_steps
+
+
+def evaluate_probe_policy(
+    policy: ProbeConditionedGaussianActorCritic,
+    encoder: WorldEncoder,
+    predictor: DeltaPredictorEnsemble | None,
+    state_normalizer: RunningNormalizer,
+    env_name: str,
+    action_values: np.ndarray,
+    window_size: int,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
+    randomize_physics: bool,
+    base_physics,
+    probe_count: int,
+    online_z_update_alpha: float,
+    online_z_update_freq: int,
+    eval_episodes: int,
+    seed: int,
+    device: torch.device,
+) -> tuple[list[float], int]:
+    """Run deterministic probe-conditioned eval episodes before declaring solved."""
+    env = make_env(env_name)
+    probe_env = make_env(env_name)
+    rng = np.random.default_rng(seed)
+    returns: list[float] = []
+    total_steps = 0
+
+    for eval_episode in range(eval_episodes):
+        episode_physics = select_episode_physics(rng, randomize_physics, base_physics)
+        probe_posteriors = []
+        belief = None
+
+        for _ in range(probe_count):
+            window_states, window_actions, window_rewards, probe_failed, probe_steps_used = collect_adaptive_probe_window(
+                env=probe_env,
+                encoder=encoder,
+                predictor=predictor,
+                device=device,
+                rng=rng,
+                window_size=window_size,
+                episode_physics=episode_physics,
+                action_values=action_values,
+                prior_belief=belief,
+            )
+            total_steps += probe_steps_used
+            if probe_failed:
+                probe_posteriors = []
+                break
+
+            probe_posteriors.append(
+                encode_window_posterior(
+                    encoder=encoder,
+                    device=device,
+                    window_states=window_states,
+                    window_actions=window_actions,
+                    window_rewards=window_rewards,
+                )
+            )
+            belief = build_belief_vector(probe_posteriors)
+
+        if not probe_posteriors:
+            returns.append(0.0)
+            continue
+
+        apply_env_params(env, episode_physics)
+        raw_state, _info = env.reset(seed=seed + eval_episode)
+        raw_state = np.asarray(raw_state, dtype=np.float32)
+        recent_states = deque([raw_state.copy()], maxlen=window_size + 1)
+        recent_action_idx = deque(maxlen=window_size)
+        recent_rewards = deque(maxlen=window_size)
+        done = False
+        episode_return = 0.0
+        episode_step = 0
+
+        while not done:
+            state = state_normalizer.normalize(raw_state)
+            state_t = torch.tensor(state[None, :], dtype=torch.float32, device=device)
+            belief_t = torch.tensor(belief[None, :], dtype=torch.float32, device=device)
+            with torch.no_grad():
+                mean, _value = policy(state_t, belief_t)
+            action = mean_to_continuous_action(mean, action_low, action_high)
+
+            next_raw_state, reward, terminated, truncated, _info = env.step(action)
+            total_steps += 1
+            next_raw_state = np.asarray(next_raw_state, dtype=np.float32)
+            recent_states.append(next_raw_state.copy())
+            recent_action_idx.append(nearest_probe_action_idx(action, action_values))
+            recent_rewards.append(float(reward))
+            episode_step += 1
+            belief = maybe_update_online_belief(
+                encoder=encoder,
+                device=device,
+                recent_states=recent_states,
+                recent_action_idx=recent_action_idx,
+                recent_rewards=recent_rewards,
+                belief=belief,
+                online_z_update_alpha=online_z_update_alpha,
+                online_z_update_freq=online_z_update_freq,
+                episode_step=episode_step,
+            )
+            raw_state = next_raw_state
+            episode_return += float(reward)
+            done = bool(terminated or truncated)
+
+        returns.append(episode_return)
+
+    env.close()
+    probe_env.close()
+    return returns, total_steps
 
 
 def compute_sil_loss(
@@ -118,12 +319,13 @@ def train_plain_ppo(
     seed: int = 0,
     randomize_physics: bool = False,
     solved_return: float = 500.0,
+    solve_eval_episodes: int = 3,
     run_index: int = 1,
     total_runs: int = 1,
     variant_label: str = "baseline",
     peer_variant_label: str = "probe",
     peer_solved_episode: int | None = None,
-):
+) -> TrainingRunResult:
     """Train the plain PPO baseline with no probe conditioning."""
     env = make_env(env_name)
     action_low, action_high = validate_continuous_env(env)
@@ -140,9 +342,17 @@ def train_plain_ppo(
     elite_buffer = EliteTrajectoryBuffer(elite_capacity)
     returns = []
     best_return_so_far = 0.0
+    best_policy_state_dict = snapshot_policy_state_dict(policy)
+    best_state_normalizer_state = snapshot_normalizer_state(state_normalizer)
+    best_episode = None
     pending_batches = []
     pending_steps = 0
     solved_episode = None
+    solved_env_steps = None
+    solve_policy_state_dict = None
+    solve_state_normalizer_state = None
+    solve_eval_returns = None
+    total_env_steps = 0
 
     for episode in range(1, num_episodes + 1):
         episode_physics = select_episode_physics(rng, randomize_physics, base_physics)
@@ -175,6 +385,7 @@ def train_plain_ppo(
                 action_high=action_high,
             )
             next_raw_state, reward, terminated, truncated, _info = env.step(action)
+            total_env_steps += 1
             next_raw_state = np.asarray(next_raw_state, dtype=np.float32)
             state_normalizer.update(next_raw_state)
             next_state = state_normalizer.normalize(next_raw_state)
@@ -238,12 +449,17 @@ def train_plain_ppo(
             )
 
         returns.append(episode_return)
+        if episode_return >= best_return_so_far:
+            best_policy_state_dict = snapshot_policy_state_dict(policy)
+            best_state_normalizer_state = snapshot_normalizer_state(state_normalizer)
+            best_episode = episode
         best_return_so_far = max(best_return_so_far, episode_return)
         pending_batches.append(batch)
         pending_steps += len(batch.states)
         avg_10 = np.mean(returns[-10:])
         avg_50 = np.mean(returns[-50:])
-        current_solved_episode = episode if episode_return >= solved_return else solved_episode
+        current_solved_episode = solved_episode
+        current_solved_env_steps = solved_env_steps
         elite_tag = " | elite=yes" if is_elite_episode else ""
         print(
             f"[run {run_index}/{total_runs} | seed {seed} | {variant_label}] "
@@ -257,6 +473,8 @@ def train_plain_ppo(
         print(
             "  summary | "
             f"solved={format_solve_status(current_solved_episode)} | "
+            f"solve_steps={format_solve_steps_status(current_solved_env_steps)} | "
+            f"env_steps={total_env_steps:6d} | "
             f"target={solved_return:7.2f} | "
             f"best={best_return_so_far:7.2f} | "
             f"{format_peer_solve_status(peer_variant_label, peer_solved_episode)}"
@@ -314,20 +532,60 @@ def train_plain_ppo(
             pending_steps = 0
 
         if episode_return >= solved_return:
-            solved_episode = episode
+            eval_returns, eval_steps = evaluate_plain_policy(
+                policy=policy,
+                state_normalizer=state_normalizer,
+                env_name=env_name,
+                action_low=action_low,
+                action_high=action_high,
+                randomize_physics=randomize_physics,
+                base_physics=base_physics,
+                eval_episodes=solve_eval_episodes,
+                seed=seed * 1000 + episode,
+            )
+            total_env_steps += eval_steps
+            eval_avg = float(np.mean(eval_returns))
             print(
                 f"[run {run_index}/{total_runs} | seed {seed} | {variant_label}] "
-                f"Solved environment at episode {episode:04d} with return {episode_return:.2f}"
+                f"solve-check | eval_returns={np.round(eval_returns, 2).tolist()} | "
+                f"eval_avg={eval_avg:.2f}"
             )
-            break
+            if eval_avg >= solved_return:
+                solved_episode = episode
+                solved_env_steps = total_env_steps
+                solve_policy_state_dict = snapshot_policy_state_dict(policy)
+                solve_state_normalizer_state = snapshot_normalizer_state(state_normalizer)
+                solve_eval_returns = list(eval_returns)
+                print(
+                    f"[run {run_index}/{total_runs} | seed {seed} | {variant_label}] "
+                    f"Solved environment at episode {episode:04d} "
+                    f"after {total_env_steps} env steps with deterministic eval avg {eval_avg:.2f}"
+                )
+                break
 
     env.close()
-    return policy, returns
+    return TrainingRunResult(
+        policy=policy,
+        returns=returns,
+        state_normalizer=state_normalizer,
+        solved_episode=solved_episode,
+        solved_env_steps=solved_env_steps,
+        total_env_steps=total_env_steps,
+        best_policy_state_dict=best_policy_state_dict,
+        best_state_normalizer_state=best_state_normalizer_state,
+        best_return=best_return_so_far,
+        best_episode=best_episode,
+        solve_policy_state_dict=solve_policy_state_dict,
+        solve_state_normalizer_state=solve_state_normalizer_state,
+        solve_eval_returns=solve_eval_returns,
+        solve_probe_count=None,
+    )
 
 
 def train_probe_conditioned_ppo(
     env_name: str,
     encoder: WorldEncoder,
+    predictor: DeltaPredictorEnsemble | None,
     device: torch.device,
     num_episodes: int = 300,
     window_size: int = 8,
@@ -365,13 +623,14 @@ def train_probe_conditioned_ppo(
     elite_warmup_episodes: int = 25,
     elite_threshold_std_scale: float = 1.5,
     solved_return: float = 500.0,
+    solve_eval_episodes: int = 3,
     run_index: int = 1,
     total_runs: int = 1,
     variant_label: str = "probe",
     peer_variant_label: str = "baseline",
     peer_solved_episode: int | None = None,
-):
-    """Train PPO with an extra belief vector built from scripted environment probes."""
+) -> TrainingRunResult:
+    """Train PPO with an extra belief vector built from active probe trajectories."""
     train_env = make_env(env_name)
     probe_env = make_env(env_name)
     action_low, action_high = validate_continuous_env(train_env)
@@ -381,20 +640,15 @@ def train_probe_conditioned_ppo(
 
     rng = np.random.default_rng(seed)
     base_physics = default_env_params(env_name, train_env)
-    probe_profile = "scalar"
-    if env_name == "LunarLanderContinuous-v3":
-        probe_profile = "lunar_lander"
-    if env_name == BIPEDAL_WALKER_NAME:
-        probe_profile = "bipedal"
-    probe_policy = ProbePolicy(len(action_values), profile=probe_profile)
     state_dim = train_env.observation_space.shape[0]
 
     with torch.no_grad():
         # Ask the encoder what latent size it produces so the policy can size its belief input.
         dummy_states = torch.zeros((1, window_size + 1, state_dim), dtype=torch.float32, device=device)
         dummy_actions = torch.zeros((1, window_size), dtype=torch.long, device=device)
-        latent_dim = int(encoder(dummy_states, dummy_actions).shape[-1])
-        belief_dim = latent_dim * 2
+        dummy_rewards = torch.zeros((1, window_size), dtype=torch.float32, device=device)
+        latent_dim = int(encoder(dummy_states, dummy_actions, rewards=dummy_rewards).shape[-1])
+        belief_dim = latent_dim * 3
 
     policy = ProbeConditionedGaussianActorCritic(
         state_dim=state_dim,
@@ -414,42 +668,65 @@ def train_probe_conditioned_ppo(
 
     returns = []
     best_return_so_far = 0.0
+    best_policy_state_dict = snapshot_policy_state_dict(policy)
+    best_state_normalizer_state = snapshot_normalizer_state(state_normalizer)
+    best_episode = None
     pending_batches = []
     pending_entropy = []
     pending_epochs = []
     pending_steps = 0
     solved_episode = None
+    solved_env_steps = None
+    solve_policy_state_dict = None
+    solve_state_normalizer_state = None
+    solve_eval_returns = None
+    solve_probe_count = None
+    total_env_steps = 0
 
     for episode in range(1, num_episodes + 1):
+        episode_probe_steps = 0
         episode_physics = select_episode_physics(rng, randomize_physics, base_physics)
-        # Probe first, act second: each episode starts by asking the environment a few fixed questions.
-        probe_modes = (
-            "center_hold",
-            "pulse_left",
-            "pulse_right",
-            "reverse",
-            "sweep",
-            "sticky_random",
-        )
-
-        first_states, first_actions, probe_failed = collect_probe_window(
+        # Probe first, act second: each episode starts by actively querying the env.
+        first_states, first_actions, first_rewards, probe_failed, probe_steps_used = collect_adaptive_probe_window(
             env=probe_env,
-            probe_policy=probe_policy,
+            encoder=encoder,
+            predictor=predictor,
+            device=device,
             rng=rng,
             window_size=window_size,
             episode_physics=episode_physics,
             action_values=action_values,
-            probe_mode=probe_modes[0],
         )
+        total_env_steps += probe_steps_used
+        episode_probe_steps += probe_steps_used
         if probe_failed:
             # Skip this episode entirely if we cannot get even the initial probe window.
-            print(f"episode {episode:04d} | probe phase failed repeatedly, skipping")
+            print(
+                f"episode {episode:04d} | probe phase failed repeatedly, skipping "
+                f"| probe_steps={episode_probe_steps}"
+            )
             returns.append(0.0)
             continue
 
         # Start with one probe latent, then optionally ask follow-up probes if the
         # memory/uncertainty heuristics suggest the environment is still unclear.
-        probe_latents = [encode_window(encoder, device, first_states, first_actions)]
+        first_posterior = encode_window_posterior(
+            encoder=encoder,
+            device=device,
+            window_states=first_states,
+            window_actions=first_actions,
+            window_rewards=first_rewards,
+        )
+        probe_posteriors = [first_posterior]
+        probe_latents = [
+            encode_window(
+                encoder=encoder,
+                device=device,
+                window_states=first_states,
+                window_actions=first_actions,
+                window_rewards=first_rewards,
+            )
+        ]
         probe_target_count, novelty, expected_return = choose_probe_count(
             z=probe_latents[0],
             performance_memory=performance_memory,
@@ -461,21 +738,43 @@ def train_probe_conditioned_ppo(
 
         probe_idx = 1
         while probe_idx < probe_target_count:
-            extra_states, extra_actions, extra_failed = collect_probe_window(
+            belief = build_belief_vector(probe_posteriors)
+            extra_states, extra_actions, extra_rewards, extra_failed, probe_steps_used = collect_adaptive_probe_window(
                 env=probe_env,
-                probe_policy=probe_policy,
+                encoder=encoder,
+                predictor=predictor,
+                device=device,
                 rng=rng,
                 window_size=window_size,
                 episode_physics=episode_physics,
                 action_values=action_values,
-                probe_mode=probe_modes[probe_idx % len(probe_modes)],
+                prior_belief=belief,
             )
+            total_env_steps += probe_steps_used
+            episode_probe_steps += probe_steps_used
             if extra_failed:
                 probe_idx += 1
                 continue
 
-            probe_latents.append(encode_window(encoder, device, extra_states, extra_actions))
-            belief = build_belief_vector(probe_latents)
+            probe_latents.append(
+                encode_window(
+                    encoder=encoder,
+                    device=device,
+                    window_states=extra_states,
+                    window_actions=extra_actions,
+                    window_rewards=extra_rewards,
+                )
+            )
+            probe_posteriors.append(
+                encode_window_posterior(
+                    encoder=encoder,
+                    device=device,
+                    window_states=extra_states,
+                    window_actions=extra_actions,
+                    window_rewards=extra_rewards,
+                )
+            )
+            belief = build_belief_vector(probe_posteriors)
             if (
                 belief_uncertainty(belief) >= uncertainty_probe_threshold
                 and probe_target_count < max_probe_episodes
@@ -488,7 +787,7 @@ def train_probe_conditioned_ppo(
             probe_idx += 1
 
         # Freeze the initial probe belief for logging/memory, then optionally refine it online.
-        belief = build_belief_vector(probe_latents)
+        belief = build_belief_vector(probe_posteriors)
         episode_belief = belief.copy()
         mean_z = belief_mean_z(belief)
         uncertainty = belief_uncertainty(belief)
@@ -519,6 +818,7 @@ def train_probe_conditioned_ppo(
         state = state_normalizer.normalize(raw_state)
         recent_states = deque([raw_state.copy()], maxlen=window_size + 1)
         recent_action_idx = deque(maxlen=window_size)
+        recent_rewards = deque(maxlen=window_size)
 
         states = []
         beliefs = []
@@ -547,11 +847,13 @@ def train_probe_conditioned_ppo(
             )
 
             next_raw_state, reward, terminated, truncated, _info = train_env.step(action)
+            total_env_steps += 1
             next_raw_state = np.asarray(next_raw_state, dtype=np.float32)
             recent_states.append(next_raw_state.copy())
             recent_action_idx.append(nearest_probe_action_idx(action, action_values))
             episode_step += 1
             raw_reward = float(reward)
+            recent_rewards.append(raw_reward)
             train_reward = raw_reward
             if reward_normalizer is not None:
                 reward_normalizer.update(np.asarray([[raw_reward]], dtype=np.float32))
@@ -566,6 +868,7 @@ def train_probe_conditioned_ppo(
                 device=device,
                 recent_states=recent_states,
                 recent_action_idx=recent_action_idx,
+                recent_rewards=recent_rewards,
                 belief=belief,
                 online_z_update_alpha=online_z_update_alpha,
                 online_z_update_freq=online_z_update_freq,
@@ -630,6 +933,10 @@ def train_probe_conditioned_ppo(
             )
 
         returns.append(episode_return)
+        if episode_return >= best_return_so_far:
+            best_policy_state_dict = snapshot_policy_state_dict(policy)
+            best_state_normalizer_state = snapshot_normalizer_state(state_normalizer)
+            best_episode = episode
         best_return_so_far = max(best_return_so_far, episode_return)
         performance_memory.push(belief_mean_z(episode_belief), episode_return)
         pending_batches.append(batch)
@@ -638,7 +945,8 @@ def train_probe_conditioned_ppo(
         pending_epochs.append(episode_ppo_epochs)
         avg_10 = np.mean(returns[-10:])
         avg_50 = np.mean(returns[-50:])
-        current_solved_episode = episode if episode_return >= solved_return else solved_episode
+        current_solved_episode = solved_episode
+        current_solved_env_steps = solved_env_steps
         elite_tag = " | elite=yes" if is_elite_episode else ""
         print(
             f"[run {run_index}/{total_runs} | seed {seed} | {variant_label}] "
@@ -646,6 +954,7 @@ def train_probe_conditioned_ppo(
             f"return={episode_return:7.2f} | "
             f"avg10={avg_10:7.2f} | "
             f"avg50={avg_50:7.2f} | "
+            f"probe_steps={episode_probe_steps:3d} | "
             f"probes={probe_target_count:2d} | "
             f"uncert={belief_uncertainty(episode_belief):5.3f} | "
             f"epochs={episode_ppo_epochs:2d} | "
@@ -655,6 +964,8 @@ def train_probe_conditioned_ppo(
         print(
             "  summary | "
             f"solved={format_solve_status(current_solved_episode)} | "
+            f"solve_steps={format_solve_steps_status(current_solved_env_steps)} | "
+            f"env_steps={total_env_steps:6d} | "
             f"target={solved_return:7.2f} | "
             f"best={best_return_so_far:7.2f} | "
             f"{format_peer_solve_status(peer_variant_label, peer_solved_episode)}"
@@ -707,13 +1018,61 @@ def train_probe_conditioned_ppo(
             pending_steps = 0
 
         if episode_return >= solved_return:
-            solved_episode = episode
+            eval_returns, eval_steps = evaluate_probe_policy(
+                policy=policy,
+                encoder=encoder,
+                predictor=predictor,
+                state_normalizer=state_normalizer,
+                env_name=env_name,
+                action_values=action_values,
+                window_size=window_size,
+                action_low=action_low,
+                action_high=action_high,
+                randomize_physics=randomize_physics,
+                base_physics=base_physics,
+                probe_count=max_probe_episodes,
+                online_z_update_alpha=online_z_update_alpha,
+                online_z_update_freq=online_z_update_freq,
+                eval_episodes=solve_eval_episodes,
+                seed=seed * 1000 + episode,
+                device=device,
+            )
+            total_env_steps += eval_steps
+            eval_avg = float(np.mean(eval_returns))
             print(
                 f"[run {run_index}/{total_runs} | seed {seed} | {variant_label}] "
-                f"Solved environment at episode {episode:04d} with return {episode_return:.2f}"
+                f"solve-check | eval_returns={np.round(eval_returns, 2).tolist()} | "
+                f"eval_avg={eval_avg:.2f} | eval_probes={max_probe_episodes}"
             )
-            break
+            if eval_avg >= solved_return:
+                solved_episode = episode
+                solved_env_steps = total_env_steps
+                solve_policy_state_dict = snapshot_policy_state_dict(policy)
+                solve_state_normalizer_state = snapshot_normalizer_state(state_normalizer)
+                solve_eval_returns = list(eval_returns)
+                solve_probe_count = max_probe_episodes
+                print(
+                    f"[run {run_index}/{total_runs} | seed {seed} | {variant_label}] "
+                    f"Solved environment at episode {episode:04d} "
+                    f"after {total_env_steps} env steps with deterministic eval avg {eval_avg:.2f}"
+                )
+                break
 
     train_env.close()
     probe_env.close()
-    return policy, returns
+    return TrainingRunResult(
+        policy=policy,
+        returns=returns,
+        state_normalizer=state_normalizer,
+        solved_episode=solved_episode,
+        solved_env_steps=solved_env_steps,
+        total_env_steps=total_env_steps,
+        best_policy_state_dict=best_policy_state_dict,
+        best_state_normalizer_state=best_state_normalizer_state,
+        best_return=best_return_so_far,
+        best_episode=best_episode,
+        solve_policy_state_dict=solve_policy_state_dict,
+        solve_state_normalizer_state=solve_state_normalizer_state,
+        solve_eval_returns=solve_eval_returns,
+        solve_probe_count=solve_probe_count,
+    )
