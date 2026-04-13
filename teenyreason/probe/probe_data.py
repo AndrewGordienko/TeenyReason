@@ -68,6 +68,23 @@ BIPEDAL_WALKER_PARAM_NAMES = (
 )
 
 
+def get_env_param_names(env_name: str | None, param_dim: int) -> tuple[str, ...]:
+    """Return readable env-parameter names for dashboard diagnostics."""
+    if env_name == CONTINUOUS_CARTPOLE_NAME:
+        names = CARTPOLE_PARAM_NAMES
+    elif env_name == CONTINUOUS_LUNAR_LANDER_NAME:
+        names = LUNAR_LANDER_PARAM_NAMES
+    elif env_name == BIPEDAL_WALKER_NAME:
+        names = BIPEDAL_WALKER_PARAM_NAMES
+    else:
+        names = tuple(f"param_{idx + 1}" for idx in range(param_dim))
+
+    if len(names) >= param_dim:
+        return tuple(names[:param_dim])
+    suffix = tuple(f"param_{idx + 1}" for idx in range(len(names), param_dim))
+    return tuple(names) + suffix
+
+
 @dataclass(frozen=True)
 class CartPolePhysics:
     """Explicit snapshot of the CartPole parameters the probe code cares about."""
@@ -288,6 +305,7 @@ def apply_env_params(env, env_params):
 @dataclass
 class Transition:
     """Single recorded interaction step from a probe episode."""
+    env_instance_id: int
     episode_id: int
     step_idx: int
     probe_mode: str
@@ -303,6 +321,7 @@ class Transition:
 @dataclass
 class WindowRecord:
     """Fixed-length temporal slice used to train the latent encoder."""
+    env_instance_id: int
     episode_id: int
     end_step_idx: int
     probe_mode: str
@@ -324,6 +343,11 @@ class ProbePolicy:
     def __init__(self, action_space_n: int, profile: str = "scalar"):
         self.n = action_space_n
         self.profile = profile
+        self._sticky = 0
+        self._burst_len = 2
+
+    def reset_episode(self):
+        """Clear mode-local state so each probe episode starts from a clean slate."""
         self._sticky = 0
         self._burst_len = 2
 
@@ -487,19 +511,23 @@ class CartPoleCrawler:
 
     def run_episode(
         self,
+        env_instance_id: int,
         episode_id: int,
         probe_mode: str,
         max_steps: int = 200,
+        episode_physics=None,
         reset_options: Optional[dict[str, Any]] = None,
     ):
         """Run one scripted probe episode and record both steps and windows."""
-        if self.randomize_physics:
-            episode_physics = sample_env_params(self.rng, self.base_physics)
-        else:
-            episode_physics = self.base_physics
+        if episode_physics is None:
+            if self.randomize_physics:
+                episode_physics = sample_env_params(self.rng, self.base_physics)
+            else:
+                episode_physics = self.base_physics
 
         apply_env_params(self.env, episode_physics)
         env_params = episode_physics.as_array()
+        self.probe_policy.reset_episode()
 
         state, _info = self.env.reset(options=reset_options)
 
@@ -519,6 +547,7 @@ class CartPoleCrawler:
 
             self.transitions.append(
                 Transition(
+                    env_instance_id=env_instance_id,
                     episode_id=episode_id,
                     step_idx=step_idx,
                     probe_mode=probe_mode,
@@ -540,6 +569,7 @@ class CartPoleCrawler:
                 # Each window becomes one training example for the world encoder.
                 self.windows.append(
                     WindowRecord(
+                        env_instance_id=env_instance_id,
                         episode_id=episode_id,
                         end_step_idx=step_idx,
                         probe_mode=probe_mode,
@@ -560,19 +590,27 @@ class CartPoleCrawler:
     def collect(self, episodes_per_mode: int = 20, max_steps: int = 200):
         """Run the full probe library enough times to build a training dataset."""
         episode_id = 0
-        # Sweep through the small probe library so every mode contributes data.
-        for mode in PROBE_MODES:
-            for _ in range(episodes_per_mode):
+        # Sample one hidden environment instance, then view it through every
+        # probe mode. This creates "same world, different probe" supervision.
+        for env_instance_id in range(episodes_per_mode):
+            if self.randomize_physics:
+                episode_physics = sample_env_params(self.rng, self.base_physics)
+            else:
+                episode_physics = self.base_physics
+            for mode in PROBE_MODES:
                 self.run_episode(
+                    env_instance_id=env_instance_id,
                     episode_id=episode_id,
                     probe_mode=mode,
                     max_steps=max_steps,
+                    episode_physics=episode_physics,
                 )
                 episode_id += 1
 
     def get_transition_arrays(self) -> dict[str, np.ndarray]:
         """Convert the recorded transition list into stacked NumPy arrays."""
         return {
+            "env_instance_id": np.asarray([t.env_instance_id for t in self.transitions], dtype=np.int32),
             "episode_id": np.asarray([t.episode_id for t in self.transitions], dtype=np.int32),
             "step_idx": np.asarray([t.step_idx for t in self.transitions], dtype=np.int32),
             "probe_mode": np.asarray([t.probe_mode for t in self.transitions], dtype=object),
@@ -588,6 +626,7 @@ class CartPoleCrawler:
     def get_window_arrays(self) -> dict[str, np.ndarray]:
         """Convert the recorded window list into stacked NumPy arrays."""
         return {
+            "env_instance_id": np.asarray([w.env_instance_id for w in self.windows], dtype=np.int32),
             "episode_id": np.asarray([w.episode_id for w in self.windows], dtype=np.int32),
             "end_step_idx": np.asarray([w.end_step_idx for w in self.windows], dtype=np.int32),
             "probe_mode": np.asarray([w.probe_mode for w in self.windows], dtype=object),

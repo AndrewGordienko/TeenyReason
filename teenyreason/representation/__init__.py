@@ -10,6 +10,12 @@ from ..models.belief_world_model import (
     WorldEncoder,
     train_encoder_predictor,
 )
+from ..models.env_belief import (
+    EnvBeliefAggregator,
+    EnvParamPredictorEnsemble,
+    aggregate_env_posteriors,
+    build_env_group_tensors,
+)
 from .analysis import (
     build_latent_snapshot,
     list_latent_snapshot_paths,
@@ -19,8 +25,12 @@ from .analysis import (
 
 __all__ = [
     "DeltaPredictorEnsemble",
+    "EnvBeliefAggregator",
+    "EnvParamPredictorEnsemble",
     "WorldEncoder",
+    "aggregate_env_posteriors",
     "build_latent_snapshot",
+    "build_env_group_tensors",
     "list_latent_snapshot_paths",
     "load_latent_snapshot",
     "save_latent_snapshot",

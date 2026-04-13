@@ -17,6 +17,11 @@ import torch
 
 from ..envs import action_index_to_env_action
 from .probe_data import ProbePolicy, apply_env_params, sample_env_params
+from ..models.env_belief import (
+    EnvBeliefAggregator,
+    EnvParamPredictorEnsemble,
+    aggregate_env_posteriors,
+)
 from ..representation import DeltaPredictorEnsemble, WorldEncoder
 
 
@@ -128,8 +133,7 @@ def build_belief_vector(latents: list[np.ndarray]) -> np.ndarray:
         combined_var = 1.0 / np.clip(np.sum(precisions, axis=0), 1e-6, None)
         combined_mean = combined_var * np.sum(means * precisions, axis=0)
         combined_std = np.sqrt(np.clip(combined_var, 1e-6, None))
-        epistemic = np.std(means, axis=0)
-        return np.concatenate([combined_mean, combined_std, epistemic], axis=0).astype(np.float32)
+        return np.concatenate([combined_mean, combined_std], axis=0).astype(np.float32)
 
     # Legacy path: if callers still pass raw latents, treat them like a point estimate.
     stacked = np.stack([normalize_latent(latent) for latent in latents], axis=0).astype(np.float32)
@@ -138,22 +142,36 @@ def build_belief_vector(latents: list[np.ndarray]) -> np.ndarray:
     return np.concatenate([mean_z, spread_z], axis=0).astype(np.float32)
 
 
+def aggregate_env_belief(
+    belief_aggregator: EnvBeliefAggregator,
+    env_param_predictor: EnvParamPredictorEnsemble | None,
+    device: torch.device,
+    posterior_views: list[tuple[np.ndarray, np.ndarray]],
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Aggregate several window posteriors into one env-level belief vector."""
+    if not posterior_views:
+        raise ValueError("Cannot aggregate an env belief without any window posteriors")
+
+    window_means = np.stack([np.asarray(item[0], dtype=np.float32) for item in posterior_views], axis=0)
+    window_logvars = np.stack([np.asarray(item[1], dtype=np.float32) for item in posterior_views], axis=0)
+    payload = aggregate_env_posteriors(
+        aggregator=belief_aggregator,
+        env_param_predictor=env_param_predictor,
+        device=device,
+        window_means=window_means,
+        window_logvars=window_logvars,
+    )
+    return payload["belief"], payload
+
+
 def belief_mean_z(belief: np.ndarray) -> np.ndarray:
     """Extract the mean-latent half of a belief vector."""
-    if belief.shape[0] % 3 == 0:
-        third = belief.shape[0] // 3
-        return np.asarray(belief[:third], dtype=np.float32)
     half = belief.shape[0] // 2
     return np.asarray(belief[:half], dtype=np.float32)
 
 
 def belief_uncertainty(belief: np.ndarray) -> float:
     """Collapse the spread half of the belief into one scalar uncertainty."""
-    if belief.shape[0] % 3 == 0:
-        third = belief.shape[0] // 3
-        posterior_std = np.asarray(belief[third:2 * third], dtype=np.float32)
-        epistemic = np.asarray(belief[2 * third:], dtype=np.float32)
-        return float(np.mean(posterior_std) + np.mean(epistemic))
     half = belief.shape[0] // 2
     spread = np.asarray(belief[half:], dtype=np.float32)
     return float(np.mean(spread))
@@ -161,19 +179,13 @@ def belief_uncertainty(belief: np.ndarray) -> float:
 
 def belief_posterior_std(belief: np.ndarray) -> np.ndarray:
     """Extract the posterior-std portion of a posterior-style belief vector."""
-    if belief.shape[0] % 3 != 0:
-        half = belief.shape[0] // 2
-        return np.asarray(belief[half:], dtype=np.float32)
-    third = belief.shape[0] // 3
-    return np.asarray(belief[third:2 * third], dtype=np.float32)
+    half = belief.shape[0] // 2
+    return np.asarray(belief[half:], dtype=np.float32)
 
 
 def belief_epistemic_std(belief: np.ndarray) -> np.ndarray:
     """Extract the epistemic-disagreement portion of a posterior-style belief."""
-    if belief.shape[0] % 3 != 0:
-        return np.zeros_like(belief_mean_z(belief))
-    third = belief.shape[0] // 3
-    return np.asarray(belief[2 * third:], dtype=np.float32)
+    return np.zeros_like(belief_mean_z(belief))
 
 
 def update_belief_with_latent(
@@ -199,12 +211,8 @@ def update_belief_with_posterior(
     alpha: float,
 ) -> np.ndarray:
     """Blend a new Gaussian posterior into the existing belief."""
-    if belief.shape[0] % 3 != 0:
-        return update_belief_with_latent(belief, new_mean, alpha)
-
     old_mean = belief_mean_z(belief)
     old_std = np.clip(belief_posterior_std(belief), 1e-3, None)
-    old_epistemic = belief_epistemic_std(belief)
     new_mean = np.asarray(new_mean, dtype=np.float32)
     new_var = np.exp(np.asarray(new_logvar, dtype=np.float32))
     old_var = np.square(old_std)
@@ -214,12 +222,91 @@ def update_belief_with_posterior(
         (1.0 - alpha) * old_mean / old_var + alpha * new_mean / np.clip(new_var, 1e-6, None)
     )
     updated_std = np.sqrt(np.clip(updated_var, 1e-6, None))
-    updated_epistemic = np.clip(
-        (1.0 - alpha) * old_epistemic + alpha * np.abs(new_mean - updated_mean),
-        0.0,
-        3.0,
-    )
-    return np.concatenate([updated_mean, updated_std, updated_epistemic], axis=0).astype(np.float32)
+    return np.concatenate([updated_mean, updated_std], axis=0).astype(np.float32)
+
+
+def init_recurrent_belief_hidden(
+    encoder: WorldEncoder,
+    device: torch.device,
+) -> torch.Tensor:
+    """Create an empty recurrent belief state used for online context updates."""
+    return encoder.init_hidden(batch_size=1, device=device)
+
+
+def update_recurrent_belief_from_transition(
+    encoder: WorldEncoder,
+    device: torch.device,
+    belief_hidden: torch.Tensor,
+    prev_state: np.ndarray,
+    action_idx: int,
+    reward: float,
+    next_state: np.ndarray,
+    prior_belief: np.ndarray | None = None,
+    alpha: float = 0.5,
+) -> tuple[np.ndarray, torch.Tensor, tuple[np.ndarray, np.ndarray]]:
+    """Update the recurrent belief with one observed transition."""
+    encoder.eval()
+    with torch.no_grad():
+        prev_state_t = torch.tensor(prev_state[None, :], dtype=torch.float32, device=device)
+        next_state_t = torch.tensor(next_state[None, :], dtype=torch.float32, device=device)
+        action_t = torch.tensor([action_idx], dtype=torch.long, device=device)
+        reward_t = torch.tensor([reward], dtype=torch.float32, device=device)
+        belief_hidden, mean_t, logvar_t = encoder.update_belief(
+            prev_state=prev_state_t,
+            next_state=next_state_t,
+            action=action_t,
+            reward=reward_t,
+            hidden=belief_hidden,
+        )
+
+    mean = mean_t.squeeze(0).cpu().numpy().astype(np.float32)
+    logvar = logvar_t.squeeze(0).cpu().numpy().astype(np.float32)
+    if prior_belief is None:
+        belief = build_belief_vector([(mean, logvar)])
+    else:
+        belief = update_belief_with_posterior(
+            belief=prior_belief,
+            new_mean=mean,
+            new_logvar=logvar,
+            alpha=alpha,
+        )
+    return belief, belief_hidden, (mean, logvar)
+
+
+def update_recurrent_belief_from_window(
+    encoder: WorldEncoder,
+    device: torch.device,
+    belief_hidden: torch.Tensor,
+    window_states: np.ndarray,
+    window_actions: np.ndarray,
+    window_rewards: np.ndarray | None,
+    prior_belief: np.ndarray | None = None,
+    alpha: float = 0.5,
+) -> tuple[np.ndarray, torch.Tensor, tuple[np.ndarray, np.ndarray]]:
+    """Roll the recurrent belief through an entire probe window."""
+    belief = prior_belief
+    posterior = None
+    rewards = None
+    if window_rewards is not None:
+        rewards = np.asarray(window_rewards, dtype=np.float32)
+
+    for step_idx, action_idx in enumerate(np.asarray(window_actions, dtype=np.int64)):
+        reward = 0.0 if rewards is None else float(rewards[step_idx])
+        belief, belief_hidden, posterior = update_recurrent_belief_from_transition(
+            encoder=encoder,
+            device=device,
+            belief_hidden=belief_hidden,
+            prev_state=np.asarray(window_states[step_idx], dtype=np.float32),
+            action_idx=int(action_idx),
+            reward=reward,
+            next_state=np.asarray(window_states[step_idx + 1], dtype=np.float32),
+            prior_belief=belief,
+            alpha=alpha,
+        )
+
+    if posterior is None:
+        raise ValueError("Cannot update recurrent belief from an empty window")
+    return belief, belief_hidden, posterior
 
 
 def select_episode_physics(
@@ -317,16 +404,18 @@ def collect_probe_window(
 
 
 def score_probe_actions(
+    encoder: WorldEncoder,
     predictor: DeltaPredictorEnsemble | None,
     device: torch.device,
     current_state: np.ndarray,
     belief: np.ndarray | None,
+    belief_hidden: torch.Tensor | None,
     action_vocab_size: int,
     recent_actions: list[int],
 ) -> np.ndarray:
-    """Score candidate probe actions by model disagreement plus action diversity."""
+    """Score candidate probe actions by disagreement, novelty, and posterior shrinkage."""
     base_scores = np.zeros(action_vocab_size, dtype=np.float32)
-    if predictor is not None and belief is not None:
+    if predictor is not None and belief is not None and belief_hidden is not None:
         repeated_states = np.repeat(np.asarray(current_state, dtype=np.float32)[None, :], action_vocab_size, axis=0)
         repeated_latent = np.repeat(belief_mean_z(belief)[None, :], action_vocab_size, axis=0)
         state_t = torch.tensor(repeated_states, dtype=torch.float32, device=device)
@@ -334,33 +423,121 @@ def score_probe_actions(
         latent_t = torch.tensor(repeated_latent, dtype=torch.float32, device=device)
         with torch.no_grad():
             delta_preds = predictor.predict_all(state_t, action_t, latent_t)
+            predicted_delta = delta_preds.mean(dim=0)
+            predicted_next_state = state_t + predicted_delta
+            repeated_hidden = belief_hidden.repeat(1, action_vocab_size, 1)
+            zero_reward = torch.zeros(action_vocab_size, dtype=torch.float32, device=device)
+            next_hidden, next_mean, next_logvar = encoder.update_belief(
+                prev_state=state_t,
+                next_state=predicted_next_state,
+                action=action_t,
+                reward=zero_reward,
+                hidden=repeated_hidden,
+            )
         disagreement = delta_preds.std(dim=0).mean(dim=1).cpu().numpy().astype(np.float32)
-        transition_energy = delta_preds.mean(dim=0).abs().mean(dim=1).cpu().numpy().astype(np.float32)
-        base_scores = disagreement + 0.15 * transition_energy
+        transition_energy = predicted_delta.abs().mean(dim=1).cpu().numpy().astype(np.float32)
+        current_std = float(np.mean(belief_posterior_std(belief)))
+        predicted_std = torch.exp(0.5 * next_logvar).mean(dim=1).cpu().numpy().astype(np.float32)
+        posterior_shrinkage = np.clip(current_std - predicted_std, 0.0, None)
+        latent_shift = torch.norm(next_mean - latent_t, dim=1).cpu().numpy().astype(np.float32)
+        base_scores = (
+            disagreement
+            + 0.15 * transition_energy
+            + 0.35 * posterior_shrinkage
+            + 0.10 * latent_shift
+        )
+        base_scores += 0.20 * _score_second_probe_step(
+            encoder=encoder,
+            predictor=predictor,
+            device=device,
+            predicted_next_state=predicted_next_state,
+            predicted_next_hidden=next_hidden,
+            predicted_next_mean=next_mean,
+            predicted_next_logvar=next_logvar,
+            action_vocab_size=action_vocab_size,
+        )
 
     counts = np.bincount(recent_actions, minlength=action_vocab_size).astype(np.float32)
     novelty_bonus = 1.0 / (1.0 + counts)
     return base_scores + 0.10 * novelty_bonus
 
 
+def _score_second_probe_step(
+    encoder: WorldEncoder,
+    predictor: DeltaPredictorEnsemble,
+    device: torch.device,
+    predicted_next_state: torch.Tensor,
+    predicted_next_hidden: torch.Tensor,
+    predicted_next_mean: torch.Tensor,
+    predicted_next_logvar: torch.Tensor,
+    action_vocab_size: int,
+) -> np.ndarray:
+    """Estimate how much extra identification value remains after one more probe step."""
+    future_scores = np.zeros(action_vocab_size, dtype=np.float32)
+    candidate_actions = torch.arange(action_vocab_size, dtype=torch.long, device=device)
+    zero_reward = torch.zeros(action_vocab_size, dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        for first_action_idx in range(action_vocab_size):
+            state_t = predicted_next_state[first_action_idx].unsqueeze(0).repeat(action_vocab_size, 1)
+            latent_t = predicted_next_mean[first_action_idx].unsqueeze(0).repeat(action_vocab_size, 1)
+            hidden_t = predicted_next_hidden[:, first_action_idx:first_action_idx + 1, :].repeat(
+                1,
+                action_vocab_size,
+                1,
+            )
+            current_std = float(
+                torch.exp(0.5 * predicted_next_logvar[first_action_idx]).mean().item()
+            )
+            delta_preds = predictor.predict_all(state_t, candidate_actions, latent_t)
+            predicted_delta = delta_preds.mean(dim=0)
+            predicted_next_state_2 = state_t + predicted_delta
+            _hidden_2, next_mean_2, next_logvar_2 = encoder.update_belief(
+                prev_state=state_t,
+                next_state=predicted_next_state_2,
+                action=candidate_actions,
+                reward=zero_reward,
+                hidden=hidden_t,
+            )
+            disagreement = (
+                delta_preds.std(dim=0).mean(dim=1).detach().cpu().numpy().astype(np.float32)
+            )
+            posterior_std = (
+                torch.exp(0.5 * next_logvar_2).mean(dim=1).detach().cpu().numpy().astype(np.float32)
+            )
+            posterior_shrinkage = np.clip(current_std - posterior_std, 0.0, None)
+            latent_shift = (
+                torch.norm(next_mean_2 - latent_t, dim=1).detach().cpu().numpy().astype(np.float32)
+            )
+            future_scores[first_action_idx] = float(
+                np.max(disagreement + 0.35 * posterior_shrinkage + 0.10 * latent_shift)
+            )
+
+    return future_scores
+
+
 def choose_active_probe_action(
+    encoder: WorldEncoder,
     predictor: DeltaPredictorEnsemble | None,
     device: torch.device,
     rng: np.random.Generator,
     current_state: np.ndarray,
     belief: np.ndarray | None,
+    belief_hidden: torch.Tensor | None,
     action_vocab_size: int,
     recent_actions: list[int],
 ) -> int:
     """Choose an exploratory action using disagreement and a little randomness."""
-    if belief is None or len(recent_actions) < 2 or predictor is None:
+    if belief is None or len(recent_actions) < 2 or predictor is None or belief_hidden is None:
         return int(rng.integers(0, action_vocab_size))
 
     scores = score_probe_actions(
+        encoder=encoder,
         predictor=predictor,
         device=device,
         current_state=current_state,
         belief=belief,
+        belief_hidden=belief_hidden,
         action_vocab_size=action_vocab_size,
         recent_actions=recent_actions,
     )
@@ -384,6 +561,7 @@ def collect_adaptive_probe_window(
     max_probe_retries: int = 12,
 ):
     """Collect one probe window using disagreement-driven active actions."""
+    del prior_belief
     action_vocab_size = int(len(action_values))
     steps_used = 0
     for _ in range(max_probe_retries):
@@ -392,17 +570,20 @@ def collect_adaptive_probe_window(
         states = [np.asarray(state, dtype=np.float32)]
         actions: list[int] = []
         rewards: list[float] = []
-        current_belief = None if prior_belief is None else np.asarray(prior_belief, dtype=np.float32)
+        current_belief = None
+        current_hidden = init_recurrent_belief_hidden(encoder=encoder, device=device)
         done = False
 
         for step_idx in range(window_size):
             del step_idx
             action_idx = choose_active_probe_action(
+                encoder=encoder,
                 predictor=predictor,
                 device=device,
                 rng=rng,
                 current_state=states[-1],
                 belief=current_belief,
+                belief_hidden=current_hidden,
                 action_vocab_size=action_vocab_size,
                 recent_actions=actions,
             )
@@ -416,23 +597,17 @@ def collect_adaptive_probe_window(
             if done:
                 break
 
-            if len(actions) >= 2:
-                posterior = encode_window_posterior(
-                    encoder=encoder,
-                    device=device,
-                    window_states=np.stack(states, axis=0).astype(np.float32),
-                    window_actions=np.asarray(actions, dtype=np.int64),
-                    window_rewards=np.asarray(rewards, dtype=np.float32),
-                )
-                if prior_belief is None:
-                    current_belief = build_belief_vector([posterior])
-                else:
-                    current_belief = update_belief_with_posterior(
-                        belief=current_belief,
-                        new_mean=posterior[0],
-                        new_logvar=posterior[1],
-                        alpha=0.5,
-                    )
+            current_belief, current_hidden, _posterior = update_recurrent_belief_from_transition(
+                encoder=encoder,
+                device=device,
+                belief_hidden=current_hidden,
+                prev_state=np.asarray(states[-2], dtype=np.float32),
+                action_idx=int(action_idx),
+                reward=float(reward),
+                next_state=np.asarray(states[-1], dtype=np.float32),
+                prior_belief=current_belief,
+                alpha=0.5,
+            )
 
         if done:
             continue
@@ -461,39 +636,53 @@ def nearest_probe_action_idx(action: np.ndarray, action_values: np.ndarray) -> i
 
 def maybe_update_online_belief(
     encoder: WorldEncoder,
+    belief_aggregator: EnvBeliefAggregator,
+    env_param_predictor: EnvParamPredictorEnsemble | None,
     device: torch.device,
-    recent_states: deque,
-    recent_action_idx: deque,
-    recent_rewards: deque | None,
+    belief_hidden: torch.Tensor,
+    belief_posteriors: list[tuple[np.ndarray, np.ndarray]],
+    prev_state: np.ndarray,
+    action_idx: int,
+    reward: float,
+    next_state: np.ndarray,
     belief: np.ndarray,
     online_z_update_alpha: float,
     online_z_update_freq: int,
     episode_step: int,
-) -> np.ndarray:
+) -> tuple[np.ndarray, torch.Tensor, list[tuple[np.ndarray, np.ndarray]]]:
     """Refresh the belief online from the recent real trajectory when scheduled."""
-    if len(recent_action_idx) < recent_action_idx.maxlen:
-        return belief
-    if episode_step % online_z_update_freq != 0:
-        return belief
-
-    # During control, refresh the latent from the recent real trajectory.
-    reward_array = None
-    if recent_rewards is not None and len(recent_rewards) == recent_action_idx.maxlen:
-        reward_array = np.asarray(recent_rewards, dtype=np.float32)
-
-    updated_mean, updated_logvar = encode_window_posterior(
+    # Always keep the recurrent hidden belief state current, but only refresh the
+    # exposed policy-conditioning vector on the configured schedule.
+    _, next_hidden, posterior = update_recurrent_belief_from_transition(
         encoder=encoder,
         device=device,
-        window_states=np.stack(recent_states, axis=0),
-        window_actions=np.asarray(recent_action_idx, dtype=np.int64),
-        window_rewards=reward_array,
+        belief_hidden=belief_hidden,
+        prev_state=prev_state,
+        action_idx=action_idx,
+        reward=reward,
+        next_state=next_state,
+        prior_belief=None,
+        alpha=1.0,
     )
-    return update_belief_with_posterior(
-        belief=belief,
-        new_mean=updated_mean,
-        new_logvar=updated_logvar,
-        alpha=online_z_update_alpha,
+    if episode_step % online_z_update_freq != 0:
+        return belief, next_hidden, belief_posteriors
+
+    updated_posteriors = list(belief_posteriors)
+    updated_posteriors.append((posterior[0], posterior[1]))
+    if len(updated_posteriors) > 6:
+        updated_posteriors = updated_posteriors[-6:]
+
+    aggregated_belief, _payload = aggregate_env_belief(
+        belief_aggregator=belief_aggregator,
+        env_param_predictor=env_param_predictor,
+        device=device,
+        posterior_views=updated_posteriors,
     )
+    blended_belief = (
+        (1.0 - online_z_update_alpha) * np.asarray(belief, dtype=np.float32)
+        + online_z_update_alpha * aggregated_belief
+    ).astype(np.float32)
+    return blended_belief, next_hidden, updated_posteriors
 
 
 def choose_probe_count(

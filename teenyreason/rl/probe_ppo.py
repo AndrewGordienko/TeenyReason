@@ -7,7 +7,6 @@ This module contains the direct comparison the project cares about:
   latent belief, and conditions the policy/value function on that belief
 """
 
-from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -16,6 +15,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from ..envs import get_action_values, make_env
+from ..models.env_belief import EnvBeliefAggregator, EnvParamPredictorEnsemble
 from .ppo_core import (
     PlainGaussianActorCritic,
     ProbeConditionedGaussianActorCritic,
@@ -35,16 +35,17 @@ from ..probe.probe_latent import (
     adjust_entropy_coef,
     belief_mean_z,
     belief_uncertainty,
-    build_belief_vector,
     choose_policy_epochs,
     choose_probe_count,
     collect_adaptive_probe_window,
-    encode_window,
     encode_window_posterior,
+    aggregate_env_belief,
+    init_recurrent_belief_hidden,
     maybe_update_online_belief,
     nearest_probe_action_idx,
     select_episode_physics,
     should_promote_episode_to_elite,
+    update_recurrent_belief_from_window,
 )
 from ..representation import DeltaPredictorEnsemble, WorldEncoder
 
@@ -154,6 +155,8 @@ def evaluate_plain_policy(
 def evaluate_probe_policy(
     policy: ProbeConditionedGaussianActorCritic,
     encoder: WorldEncoder,
+    belief_aggregator: EnvBeliefAggregator,
+    env_param_predictor: EnvParamPredictorEnsemble | None,
     predictor: DeltaPredictorEnsemble | None,
     state_normalizer: RunningNormalizer,
     env_name: str,
@@ -179,8 +182,9 @@ def evaluate_probe_policy(
 
     for eval_episode in range(eval_episodes):
         episode_physics = select_episode_physics(rng, randomize_physics, base_physics)
-        probe_posteriors = []
         belief = None
+        belief_hidden = init_recurrent_belief_hidden(encoder=encoder, device=device)
+        belief_posteriors: list[tuple[np.ndarray, np.ndarray]] = []
 
         for _ in range(probe_count):
             window_states, window_actions, window_rewards, probe_failed, probe_steps_used = collect_adaptive_probe_window(
@@ -196,30 +200,41 @@ def evaluate_probe_policy(
             )
             total_steps += probe_steps_used
             if probe_failed:
-                probe_posteriors = []
+                belief = None
                 break
 
-            probe_posteriors.append(
-                encode_window_posterior(
-                    encoder=encoder,
-                    device=device,
-                    window_states=window_states,
-                    window_actions=window_actions,
-                    window_rewards=window_rewards,
-                )
+            window_posterior = encode_window_posterior(
+                encoder=encoder,
+                device=device,
+                window_states=window_states,
+                window_actions=window_actions,
+                window_rewards=window_rewards,
             )
-            belief = build_belief_vector(probe_posteriors)
+            _window_belief, belief_hidden, _posterior = update_recurrent_belief_from_window(
+                encoder=encoder,
+                device=device,
+                belief_hidden=belief_hidden,
+                window_states=window_states,
+                window_actions=window_actions,
+                window_rewards=window_rewards,
+                prior_belief=None,
+                alpha=1.0,
+            )
+            belief_posteriors.append(window_posterior)
+            belief, _payload = aggregate_env_belief(
+                belief_aggregator=belief_aggregator,
+                env_param_predictor=env_param_predictor,
+                device=device,
+                posterior_views=belief_posteriors,
+            )
 
-        if not probe_posteriors:
+        if belief is None:
             returns.append(0.0)
             continue
 
         apply_env_params(env, episode_physics)
         raw_state, _info = env.reset(seed=seed + eval_episode)
         raw_state = np.asarray(raw_state, dtype=np.float32)
-        recent_states = deque([raw_state.copy()], maxlen=window_size + 1)
-        recent_action_idx = deque(maxlen=window_size)
-        recent_rewards = deque(maxlen=window_size)
         done = False
         episode_return = 0.0
         episode_step = 0
@@ -232,19 +247,22 @@ def evaluate_probe_policy(
                 mean, _value = policy(state_t, belief_t)
             action = mean_to_continuous_action(mean, action_low, action_high)
 
+            prev_raw_state = raw_state.copy()
             next_raw_state, reward, terminated, truncated, _info = env.step(action)
             total_steps += 1
             next_raw_state = np.asarray(next_raw_state, dtype=np.float32)
-            recent_states.append(next_raw_state.copy())
-            recent_action_idx.append(nearest_probe_action_idx(action, action_values))
-            recent_rewards.append(float(reward))
             episode_step += 1
-            belief = maybe_update_online_belief(
+            belief, belief_hidden, belief_posteriors = maybe_update_online_belief(
                 encoder=encoder,
+                belief_aggregator=belief_aggregator,
+                env_param_predictor=env_param_predictor,
                 device=device,
-                recent_states=recent_states,
-                recent_action_idx=recent_action_idx,
-                recent_rewards=recent_rewards,
+                belief_hidden=belief_hidden,
+                belief_posteriors=belief_posteriors,
+                prev_state=prev_raw_state,
+                action_idx=nearest_probe_action_idx(action, action_values),
+                reward=float(reward),
+                next_state=next_raw_state,
                 belief=belief,
                 online_z_update_alpha=online_z_update_alpha,
                 online_z_update_freq=online_z_update_freq,
@@ -585,6 +603,8 @@ def train_plain_ppo(
 def train_probe_conditioned_ppo(
     env_name: str,
     encoder: WorldEncoder,
+    belief_aggregator: EnvBeliefAggregator,
+    env_param_predictor: EnvParamPredictorEnsemble | None,
     predictor: DeltaPredictorEnsemble | None,
     device: torch.device,
     num_episodes: int = 300,
@@ -648,7 +668,7 @@ def train_probe_conditioned_ppo(
         dummy_actions = torch.zeros((1, window_size), dtype=torch.long, device=device)
         dummy_rewards = torch.zeros((1, window_size), dtype=torch.float32, device=device)
         latent_dim = int(encoder(dummy_states, dummy_actions, rewards=dummy_rewards).shape[-1])
-        belief_dim = latent_dim * 3
+        belief_dim = latent_dim * 2
 
     policy = ProbeConditionedGaussianActorCritic(
         state_dim=state_dim,
@@ -665,6 +685,9 @@ def train_probe_conditioned_ppo(
     encoder.eval()
     for param in encoder.parameters():
         param.requires_grad = False
+    belief_aggregator.eval()
+    if env_param_predictor is not None:
+        env_param_predictor.eval()
 
     returns = []
     best_return_so_far = 0.0
@@ -686,6 +709,7 @@ def train_probe_conditioned_ppo(
     for episode in range(1, num_episodes + 1):
         episode_probe_steps = 0
         episode_physics = select_episode_physics(rng, randomize_physics, base_physics)
+        belief_posteriors: list[tuple[np.ndarray, np.ndarray]] = []
         # Probe first, act second: each episode starts by actively querying the env.
         first_states, first_actions, first_rewards, probe_failed, probe_steps_used = collect_adaptive_probe_window(
             env=probe_env,
@@ -708,8 +732,7 @@ def train_probe_conditioned_ppo(
             returns.append(0.0)
             continue
 
-        # Start with one probe latent, then optionally ask follow-up probes if the
-        # memory/uncertainty heuristics suggest the environment is still unclear.
+        belief_hidden = init_recurrent_belief_hidden(encoder=encoder, device=device)
         first_posterior = encode_window_posterior(
             encoder=encoder,
             device=device,
@@ -717,18 +740,25 @@ def train_probe_conditioned_ppo(
             window_actions=first_actions,
             window_rewards=first_rewards,
         )
-        probe_posteriors = [first_posterior]
-        probe_latents = [
-            encode_window(
-                encoder=encoder,
-                device=device,
-                window_states=first_states,
-                window_actions=first_actions,
-                window_rewards=first_rewards,
-            )
-        ]
+        _window_belief, belief_hidden, _posterior = update_recurrent_belief_from_window(
+            encoder=encoder,
+            device=device,
+            belief_hidden=belief_hidden,
+            window_states=first_states,
+            window_actions=first_actions,
+            window_rewards=first_rewards,
+            prior_belief=None,
+            alpha=1.0,
+        )
+        belief_posteriors.append(first_posterior)
+        belief, _payload = aggregate_env_belief(
+            belief_aggregator=belief_aggregator,
+            env_param_predictor=env_param_predictor,
+            device=device,
+            posterior_views=belief_posteriors,
+        )
         probe_target_count, novelty, expected_return = choose_probe_count(
-            z=probe_latents[0],
+            z=belief_mean_z(belief),
             performance_memory=performance_memory,
             base_probe_episodes=base_probe_episodes,
             max_probe_episodes=max_probe_episodes,
@@ -738,7 +768,6 @@ def train_probe_conditioned_ppo(
 
         probe_idx = 1
         while probe_idx < probe_target_count:
-            belief = build_belief_vector(probe_posteriors)
             extra_states, extra_actions, extra_rewards, extra_failed, probe_steps_used = collect_adaptive_probe_window(
                 env=probe_env,
                 encoder=encoder,
@@ -756,25 +785,30 @@ def train_probe_conditioned_ppo(
                 probe_idx += 1
                 continue
 
-            probe_latents.append(
-                encode_window(
-                    encoder=encoder,
-                    device=device,
-                    window_states=extra_states,
-                    window_actions=extra_actions,
-                    window_rewards=extra_rewards,
-                )
+            extra_posterior = encode_window_posterior(
+                encoder=encoder,
+                device=device,
+                window_states=extra_states,
+                window_actions=extra_actions,
+                window_rewards=extra_rewards,
             )
-            probe_posteriors.append(
-                encode_window_posterior(
-                    encoder=encoder,
-                    device=device,
-                    window_states=extra_states,
-                    window_actions=extra_actions,
-                    window_rewards=extra_rewards,
-                )
+            _window_belief, belief_hidden, _posterior = update_recurrent_belief_from_window(
+                encoder=encoder,
+                device=device,
+                belief_hidden=belief_hidden,
+                window_states=extra_states,
+                window_actions=extra_actions,
+                window_rewards=extra_rewards,
+                prior_belief=None,
+                alpha=1.0,
             )
-            belief = build_belief_vector(probe_posteriors)
+            belief_posteriors.append(extra_posterior)
+            belief, _payload = aggregate_env_belief(
+                belief_aggregator=belief_aggregator,
+                env_param_predictor=env_param_predictor,
+                device=device,
+                posterior_views=belief_posteriors,
+            )
             if (
                 belief_uncertainty(belief) >= uncertainty_probe_threshold
                 and probe_target_count < max_probe_episodes
@@ -787,7 +821,6 @@ def train_probe_conditioned_ppo(
             probe_idx += 1
 
         # Freeze the initial probe belief for logging/memory, then optionally refine it online.
-        belief = build_belief_vector(probe_posteriors)
         episode_belief = belief.copy()
         mean_z = belief_mean_z(belief)
         uncertainty = belief_uncertainty(belief)
@@ -816,9 +849,6 @@ def train_probe_conditioned_ppo(
         raw_state = np.asarray(raw_state, dtype=np.float32)
         state_normalizer.update(raw_state)
         state = state_normalizer.normalize(raw_state)
-        recent_states = deque([raw_state.copy()], maxlen=window_size + 1)
-        recent_action_idx = deque(maxlen=window_size)
-        recent_rewards = deque(maxlen=window_size)
 
         states = []
         beliefs = []
@@ -846,14 +876,12 @@ def train_probe_conditioned_ppo(
                 action_high=action_high,
             )
 
+            prev_raw_state = raw_state.copy()
             next_raw_state, reward, terminated, truncated, _info = train_env.step(action)
             total_env_steps += 1
             next_raw_state = np.asarray(next_raw_state, dtype=np.float32)
-            recent_states.append(next_raw_state.copy())
-            recent_action_idx.append(nearest_probe_action_idx(action, action_values))
             episode_step += 1
             raw_reward = float(reward)
-            recent_rewards.append(raw_reward)
             train_reward = raw_reward
             if reward_normalizer is not None:
                 reward_normalizer.update(np.asarray([[raw_reward]], dtype=np.float32))
@@ -863,12 +891,17 @@ def train_probe_conditioned_ppo(
 
             # Convert the continuous action back to the probe vocabulary so the
             # encoder can digest the recent trajectory using the same action language.
-            next_belief = maybe_update_online_belief(
+            next_belief, belief_hidden, belief_posteriors = maybe_update_online_belief(
                 encoder=encoder,
+                belief_aggregator=belief_aggregator,
+                env_param_predictor=env_param_predictor,
                 device=device,
-                recent_states=recent_states,
-                recent_action_idx=recent_action_idx,
-                recent_rewards=recent_rewards,
+                belief_hidden=belief_hidden,
+                belief_posteriors=belief_posteriors,
+                prev_state=prev_raw_state,
+                action_idx=nearest_probe_action_idx(action, action_values),
+                reward=raw_reward,
+                next_state=next_raw_state,
                 belief=belief,
                 online_z_update_alpha=online_z_update_alpha,
                 online_z_update_freq=online_z_update_freq,
@@ -1021,6 +1054,8 @@ def train_probe_conditioned_ppo(
             eval_returns, eval_steps = evaluate_probe_policy(
                 policy=policy,
                 encoder=encoder,
+                belief_aggregator=belief_aggregator,
+                env_param_predictor=env_param_predictor,
                 predictor=predictor,
                 state_normalizer=state_normalizer,
                 env_name=env_name,

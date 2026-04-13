@@ -1,7 +1,7 @@
 """Latent-space analysis helpers.
 
-These functions turn the trained encoder plus probe windows into compact
-artifacts that are easy to inspect later in a dashboard.
+These helpers save env-level belief artifacts for the dashboard while keeping
+the raw window coverage around for probe-distribution diagnostics.
 """
 
 from pathlib import Path
@@ -10,6 +10,13 @@ import numpy as np
 import torch
 
 from ..models.belief_world_model import WorldEncoder
+from ..models.env_belief import (
+    EnvBeliefAggregator,
+    EnvParamPredictorEnsemble,
+    build_env_group_tensors,
+    sample_env_belief_subsets,
+)
+from ..probe.probe_data import get_env_param_names
 
 
 def encode_window_dataset(
@@ -52,34 +59,115 @@ def project_latents_2d(latent_means: np.ndarray) -> tuple[np.ndarray, np.ndarray
     return projection.astype(np.float32), components, explained.astype(np.float32)
 
 
-def build_latent_snapshot(
-    encoder: WorldEncoder,
+def build_env_belief_dataset(
+    belief_aggregator: EnvBeliefAggregator,
+    env_param_predictor: EnvParamPredictorEnsemble,
     device: torch.device,
+    window_mean: np.ndarray,
+    window_logvar: np.ndarray,
     windows: dict[str, np.ndarray],
 ) -> dict[str, np.ndarray]:
-    """Build one dashboard-friendly latent snapshot from recorded probe windows."""
-    latent_mean, latent_logvar = encode_window_dataset(encoder=encoder, device=device, windows=windows)
-    projection, pca_components, pca_explained = project_latents_2d(latent_mean)
-    reward_sum = np.sum(windows["rewards"], axis=1, dtype=np.float32)
-    posterior_std = np.exp(0.5 * latent_logvar).astype(np.float32)
-    uncertainty = posterior_std.mean(axis=1).astype(np.float32)
+    """Aggregate window posteriors into one env-level belief per sampled world."""
+    grouped = build_env_group_tensors(
+        window_mean=window_mean,
+        window_logvar=window_logvar,
+        env_instance_id=windows["env_instance_id"],
+        env_params=windows["env_params"],
+    )
+
+    belief_aggregator.eval()
+    env_param_predictor.eval()
+    with torch.no_grad():
+        mean_t = torch.tensor(grouped["window_mean"], dtype=torch.float32, device=device)
+        logvar_t = torch.tensor(grouped["window_logvar"], dtype=torch.float32, device=device)
+        mask_t = torch.tensor(grouped["mask"], dtype=torch.float32, device=device)
+        env_mean_t, env_logvar_t, env_view_spread_t = belief_aggregator(mean_t, logvar_t, mask_t)
+        env_param_preds_t = env_param_predictor.predict_all(env_mean_t)
+        subset_payload = sample_env_belief_subsets(
+            aggregator=belief_aggregator,
+            grouped_mean=mean_t,
+            grouped_logvar=logvar_t,
+            grouped_mask=mask_t,
+            env_param_predictor=env_param_predictor,
+            subset_count=8,
+            subset_size=6,
+        )
+
+    env_mean = env_mean_t.cpu().numpy().astype(np.float32)
+    env_logvar = env_logvar_t.cpu().numpy().astype(np.float32)
+    env_view_spread = env_view_spread_t.cpu().numpy().astype(np.float32)
+    env_param_prediction = env_param_preds_t.mean(dim=0).cpu().numpy().astype(np.float32)
+    env_param_std = env_param_preds_t.std(dim=0).cpu().numpy().astype(np.float32)
+    env_subset_mean = subset_payload["env_mean"].cpu().numpy().astype(np.float32)
+    env_subset_param_mean = subset_payload["env_param_mean"].cpu().numpy().astype(np.float32)
+    env_subset_latent_std = env_subset_mean.std(axis=1).astype(np.float32)
+    env_subset_param_std = env_subset_param_mean.std(axis=1).astype(np.float32)
+    env_uncertainty = (
+        env_subset_param_std.mean(axis=1) + 0.25 * env_subset_latent_std.mean(axis=1)
+    ).astype(np.float32)
+    projection, pca_components, pca_explained = project_latents_2d(env_mean)
 
     return {
-        "episode_id": windows["episode_id"].astype(np.int32),
-        "end_step_idx": windows["end_step_idx"].astype(np.int32),
-        "probe_mode": windows["probe_mode"].astype("U"),
-        "env_params": windows["env_params"].astype(np.float32),
-        "reward_sum": reward_sum.astype(np.float32),
-        "terminated": windows["terminated"].astype(np.int8),
-        "truncated": windows["truncated"].astype(np.int8),
-        "latent_mean": latent_mean.astype(np.float32),
-        "latent_logvar": latent_logvar.astype(np.float32),
-        "posterior_std": posterior_std.astype(np.float32),
-        "uncertainty": uncertainty.astype(np.float32),
+        "env_instance_id": grouped["env_instance_id"].astype(np.int32),
+        "env_window_count": grouped["window_count"].astype(np.int32),
+        "env_params": grouped["env_params"].astype(np.float32),
+        "env_belief_mean": env_mean.astype(np.float32),
+        "env_belief_logvar": env_logvar.astype(np.float32),
+        "env_view_spread": env_view_spread.astype(np.float32),
+        "env_subset_mean": env_subset_mean.astype(np.float32),
+        "env_subset_latent_std": env_subset_latent_std.astype(np.float32),
+        "env_subset_param_std": env_subset_param_std.astype(np.float32),
+        "env_param_prediction": env_param_prediction.astype(np.float32),
+        "env_param_std": env_param_std.astype(np.float32),
+        "env_uncertainty": env_uncertainty.astype(np.float32),
         "projection_2d": projection.astype(np.float32),
         "pca_components": pca_components.astype(np.float32),
         "pca_explained": pca_explained.astype(np.float32),
     }
+
+
+def build_latent_snapshot(
+    encoder: WorldEncoder,
+    belief_aggregator: EnvBeliefAggregator,
+    env_param_predictor: EnvParamPredictorEnsemble,
+    device: torch.device,
+    windows: dict[str, np.ndarray],
+    env_name: str | None = None,
+    benchmark_tag: str | None = None,
+) -> dict[str, np.ndarray]:
+    """Build one dashboard-friendly env-belief snapshot from recorded probe windows."""
+    window_mean, window_logvar = encode_window_dataset(encoder=encoder, device=device, windows=windows)
+    env_dataset = build_env_belief_dataset(
+        belief_aggregator=belief_aggregator,
+        env_param_predictor=env_param_predictor,
+        device=device,
+        window_mean=window_mean,
+        window_logvar=window_logvar,
+        windows=windows,
+    )
+    reward_sum = np.sum(windows["rewards"], axis=1, dtype=np.float32)
+
+    snapshot = {
+        "window_env_instance_id": windows["env_instance_id"].astype(np.int32),
+        "window_episode_id": windows["episode_id"].astype(np.int32),
+        "window_end_step_idx": windows["end_step_idx"].astype(np.int32),
+        "window_probe_mode": windows["probe_mode"].astype("U"),
+        "window_reward_sum": reward_sum.astype(np.float32),
+        "window_terminated": windows["terminated"].astype(np.int8),
+        "window_truncated": windows["truncated"].astype(np.int8),
+        "window_latent_mean": window_mean.astype(np.float32),
+        "window_latent_logvar": window_logvar.astype(np.float32),
+        "env_param_names": np.asarray(
+            get_env_param_names(env_name, env_dataset["env_params"].shape[1]),
+            dtype="U",
+        ),
+        **env_dataset,
+    }
+    if env_name is not None:
+        snapshot["env_name"] = np.asarray(env_name)
+    if benchmark_tag is not None:
+        snapshot["benchmark_tag"] = np.asarray(benchmark_tag)
+    return snapshot
 
 
 def save_latent_snapshot(path: str | Path, snapshot: dict[str, np.ndarray]) -> None:

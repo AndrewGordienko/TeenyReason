@@ -19,6 +19,12 @@ CONTINUOUS_CARTPOLE_NAME = "ContinuousCartPole-v0"
 CONTINUOUS_LUNAR_LANDER_NAME = "LunarLanderContinuous-v3"
 BIPEDAL_WALKER_NAME = "BipedalWalker-v3"
 
+ENV_DISPLAY_NAMES = {
+    CONTINUOUS_CARTPOLE_NAME: "Continuous CartPole",
+    CONTINUOUS_LUNAR_LANDER_NAME: "Continuous LunarLander",
+    BIPEDAL_WALKER_NAME: "Bipedal Walker",
+}
+
 
 def make_env(
     env_name: str,
@@ -32,6 +38,11 @@ def make_env(
     if render_mode is None:
         return gym.make(env_name)
     return gym.make(env_name, render_mode=render_mode)
+
+
+def get_env_display_name(env_name: str) -> str:
+    """Human-friendly label used by logs and the dashboard."""
+    return ENV_DISPLAY_NAMES.get(env_name, env_name)
 
 
 def _build_scalar_action_values(action_space, action_bins: int) -> np.ndarray:

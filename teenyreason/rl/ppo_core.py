@@ -123,7 +123,17 @@ class ProbeConditionedGaussianActorCritic(nn.Module):
         self.actor_beta_1 = init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5)
         self.actor_gamma_2 = init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5)
         self.actor_beta_2 = init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5)
-        self.actor_mean = init_linear(nn.Linear(hidden_dim * 2, action_dim), gain=0.01)
+        self.actor_residual_mean = init_linear(nn.Linear(hidden_dim * 2, action_dim), gain=0.01)
+        self.actor_belief_prior = nn.Sequential(
+            init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5),
+            nn.Tanh(),
+            init_linear(nn.Linear(hidden_dim, action_dim), gain=0.01),
+        )
+        self.actor_belief_gate = nn.Sequential(
+            init_linear(nn.Linear(belief_dim, hidden_dim // 2), gain=0.5),
+            nn.Tanh(),
+            init_linear(nn.Linear(hidden_dim // 2, action_dim), gain=0.01),
+        )
 
         self.value_state_in = init_linear(nn.Linear(state_dim, hidden_dim), gain=np.sqrt(2.0))
         self.value_state_hidden = init_linear(nn.Linear(hidden_dim, hidden_dim), gain=np.sqrt(2.0))
@@ -135,7 +145,12 @@ class ProbeConditionedGaussianActorCritic(nn.Module):
         self.value_beta_1 = init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5)
         self.value_gamma_2 = init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5)
         self.value_beta_2 = init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5)
-        self.value_head = init_linear(nn.Linear(hidden_dim * 2, 1), gain=1.0)
+        self.value_residual_head = init_linear(nn.Linear(hidden_dim * 2, 1), gain=1.0)
+        self.value_belief_prior = nn.Sequential(
+            init_linear(nn.Linear(belief_dim, hidden_dim), gain=0.5),
+            nn.Tanh(),
+            init_linear(nn.Linear(hidden_dim, 1), gain=1.0),
+        )
         self.log_std = nn.Parameter(torch.full((action_dim,), -1.5))
 
     def apply_film(
@@ -156,14 +171,19 @@ class ProbeConditionedGaussianActorCritic(nn.Module):
         actor_features = torch.tanh(self.actor_state_hidden(actor_features))
         actor_features = self.apply_film(actor_features, self.actor_gamma_2, self.actor_beta_2, belief)
         actor_context = self.actor_belief_proj(belief)
-        mean = self.actor_mean(torch.cat([actor_features, actor_context], dim=-1))
+        actor_residual = self.actor_residual_mean(torch.cat([actor_features, actor_context], dim=-1))
+        actor_prior = self.actor_belief_prior(belief)
+        actor_gate = torch.sigmoid(self.actor_belief_gate(belief))
+        mean = actor_residual + actor_gate * actor_prior
 
         value_features = torch.tanh(self.value_state_in(state))
         value_features = self.apply_film(value_features, self.value_gamma_1, self.value_beta_1, belief)
         value_features = torch.tanh(self.value_state_hidden(value_features))
         value_features = self.apply_film(value_features, self.value_gamma_2, self.value_beta_2, belief)
         value_context = self.value_belief_proj(belief)
-        value = self.value_head(torch.cat([value_features, value_context], dim=-1)).squeeze(-1)
+        value_residual = self.value_residual_head(torch.cat([value_features, value_context], dim=-1)).squeeze(-1)
+        value_prior = self.value_belief_prior(belief).squeeze(-1)
+        value = value_residual + value_prior
         return mean, value
 
 

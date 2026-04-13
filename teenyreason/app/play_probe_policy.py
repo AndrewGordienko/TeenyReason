@@ -1,13 +1,13 @@
 """Render a saved probe-conditioned PPO policy."""
 
 import argparse
-from collections import deque
 import pickle
 
 import numpy as np
 import torch
 
 from ..envs import get_action_values, make_env
+from ..models.env_belief import EnvBeliefAggregator, EnvParamPredictorEnsemble
 from ..rl.ppo_core import (
     ProbeConditionedGaussianActorCritic,
     RunningNormalizer,
@@ -17,12 +17,14 @@ from ..rl.ppo_core import (
 )
 from ..probe.probe_data import apply_env_params, default_env_params
 from ..probe.probe_latent import (
-    build_belief_vector,
+    aggregate_env_belief,
     collect_adaptive_probe_window,
+    encode_window_posterior,
+    init_recurrent_belief_hidden,
     maybe_update_online_belief,
     nearest_probe_action_idx,
-    encode_window_posterior,
     select_episode_physics,
+    update_recurrent_belief_from_window,
 )
 from ..representation import DeltaPredictorEnsemble, WorldEncoder
 
@@ -86,6 +88,7 @@ def main():
     env_name = checkpoint["env_name"]
     window_size = int(checkpoint["window_size"])
     z_dim = int(checkpoint["z_dim"])
+    belief_dim = int(checkpoint.get("belief_dim", z_dim * 3))
     action_bins = int(checkpoint["action_bins"])
     hidden_dim = int(checkpoint["hidden_dim"])
     online_z_update_alpha = float(checkpoint["online_z_update_alpha"])
@@ -94,6 +97,8 @@ def main():
     max_probe_episodes = int(checkpoint.get("max_probe_episodes", base_probe_episodes))
     randomize_physics = bool(checkpoint.get("randomize_physics", False))
     predictor_ensemble_size = int(checkpoint.get("predictor_ensemble_size", 0))
+    env_param_dim = int(checkpoint.get("env_param_dim", 1))
+    env_param_predictor_ensemble_size = int(checkpoint.get("env_param_predictor_ensemble_size", predictor_ensemble_size))
     solve_probe_count = checkpoint.get("solve_probe_count")
 
     device = torch.device("cpu")
@@ -132,10 +137,29 @@ def main():
         predictor.load_state_dict(checkpoint["predictor_state_dict"])
         predictor.eval()
 
+    if "belief_aggregator_state_dict" not in checkpoint:
+        raise RuntimeError(
+            "This checkpoint was saved before env-level belief aggregation was added. "
+            "Please retrain with the current code before using play_probe_policy.py."
+        )
+    belief_aggregator = EnvBeliefAggregator(window_z_dim=z_dim).to(device)
+    belief_aggregator.load_state_dict(checkpoint["belief_aggregator_state_dict"])
+    belief_aggregator.eval()
+
+    env_param_predictor = None
+    if "env_param_predictor_state_dict" in checkpoint:
+        env_param_predictor = EnvParamPredictorEnsemble(
+            ensemble_size=env_param_predictor_ensemble_size,
+            input_dim=z_dim,
+            output_dim=env_param_dim,
+        ).to(device)
+        env_param_predictor.load_state_dict(checkpoint["env_param_predictor_state_dict"])
+        env_param_predictor.eval()
+
     policy = ProbeConditionedGaussianActorCritic(
         state_dim=state_dim,
         action_dim=action_dim,
-        belief_dim=z_dim * 3,
+        belief_dim=belief_dim,
         hidden_dim=hidden_dim,
     ).to(device)
     policy_state_dict = checkpoint["policy_state_dict"]
@@ -183,10 +207,10 @@ def main():
     for episode in range(1, args.episodes + 1):
         rng = np.random.default_rng(episode)
         episode_physics = select_episode_physics(rng, randomize_physics, base_physics)
-        probe_posteriors = []
         belief = None
-        for probe_idx in range(probe_count):
-            del probe_idx
+        belief_hidden = init_recurrent_belief_hidden(encoder=encoder, device=device)
+        belief_posteriors: list[tuple[np.ndarray, np.ndarray]] = []
+        for _ in range(probe_count):
             window_states, window_actions, window_rewards, probe_failed, _probe_steps_used = collect_adaptive_probe_window(
                 env=probe_env,
                 encoder=encoder,
@@ -200,23 +224,34 @@ def main():
             )
             if probe_failed:
                 raise RuntimeError("Could not collect a full probe window for playback.")
-            probe_posteriors.append(
-                encode_window_posterior(
-                    encoder=encoder,
-                    device=device,
-                    window_states=window_states,
-                    window_actions=window_actions,
-                    window_rewards=window_rewards,
-                )
+            window_posterior = encode_window_posterior(
+                encoder=encoder,
+                device=device,
+                window_states=window_states,
+                window_actions=window_actions,
+                window_rewards=window_rewards,
             )
-            belief = build_belief_vector(probe_posteriors)
+            _window_belief, belief_hidden, _posterior = update_recurrent_belief_from_window(
+                encoder=encoder,
+                device=device,
+                belief_hidden=belief_hidden,
+                window_states=window_states,
+                window_actions=window_actions,
+                window_rewards=window_rewards,
+                prior_belief=None,
+                alpha=1.0,
+            )
+            belief_posteriors.append(window_posterior)
+            belief, _payload = aggregate_env_belief(
+                belief_aggregator=belief_aggregator,
+                env_param_predictor=env_param_predictor,
+                device=device,
+                posterior_views=belief_posteriors,
+            )
 
         apply_env_params(env, episode_physics)
         raw_state, _info = env.reset()
         raw_state = np.asarray(raw_state, dtype=np.float32)
-        recent_states = deque([raw_state.copy()], maxlen=window_size + 1)
-        recent_action_idx = deque(maxlen=window_size)
-        recent_rewards = deque(maxlen=window_size)
         episode_return = 0.0
         episode_step = 0
         done = False
@@ -238,18 +273,21 @@ def main():
             else:
                 action = mean_to_continuous_action(mean, action_low, action_high)
 
+            prev_raw_state = raw_state.copy()
             next_raw_state, reward, terminated, truncated, _info = env.step(action)
             next_raw_state = np.asarray(next_raw_state, dtype=np.float32)
-            recent_states.append(next_raw_state.copy())
-            recent_action_idx.append(nearest_probe_action_idx(action, action_values))
             episode_step += 1
-            recent_rewards.append(float(reward))
-            belief = maybe_update_online_belief(
+            belief, belief_hidden, belief_posteriors = maybe_update_online_belief(
                 encoder=encoder,
+                belief_aggregator=belief_aggregator,
+                env_param_predictor=env_param_predictor,
                 device=device,
-                recent_states=recent_states,
-                recent_action_idx=recent_action_idx,
-                recent_rewards=recent_rewards,
+                belief_hidden=belief_hidden,
+                belief_posteriors=belief_posteriors,
+                prev_state=prev_raw_state,
+                action_idx=nearest_probe_action_idx(action, action_values),
+                reward=float(reward),
+                next_state=next_raw_state,
                 belief=belief,
                 online_z_update_alpha=online_z_update_alpha,
                 online_z_update_freq=online_z_update_freq,

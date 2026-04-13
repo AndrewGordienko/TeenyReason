@@ -1,10 +1,13 @@
 """Small localhost dashboard for latent snapshots and benchmark summaries."""
 
+import json
 from pathlib import Path
 
 import numpy as np
 from flask import Flask, jsonify, render_template
 
+from ..app.benchmark import build_experiment_config
+from ..envs import get_env_display_name
 from ..representation import list_latent_snapshot_paths, load_latent_snapshot
 
 
@@ -26,32 +29,288 @@ def downsample_indices(count: int, max_points: int = 1500) -> np.ndarray:
     return np.linspace(0, count - 1, num=max_points, dtype=np.int32)
 
 
+def sampled_rows(values: np.ndarray, max_rows: int = 640) -> np.ndarray:
+    """Keep expensive pairwise diagnostics bounded for large artifacts."""
+    if values.shape[0] <= max_rows:
+        return values
+    return values[downsample_indices(values.shape[0], max_points=max_rows)]
+
+
+def safe_pairwise_mean_distance(values: np.ndarray) -> float:
+    """Average pairwise Euclidean distance across rows."""
+    if values.shape[0] < 2:
+        return 0.0
+    deltas = values[:, None, :] - values[None, :, :]
+    distances = np.linalg.norm(deltas, axis=-1)
+    mask = ~np.eye(values.shape[0], dtype=bool)
+    return float(distances[mask].mean()) if np.any(mask) else 0.0
+
+
+def compute_linear_env_fit(latent_mean: np.ndarray, env_params: np.ndarray) -> float:
+    """Fit env params from latent coordinates as a quick mechanics-alignment sanity check."""
+    if latent_mean.shape[0] < 4 or env_params.size == 0:
+        return 0.0
+    design = np.concatenate(
+        [
+            latent_mean.astype(np.float32),
+            np.ones((latent_mean.shape[0], 1), dtype=np.float32),
+        ],
+        axis=1,
+    )
+    coef, _residuals, _rank, _singular_values = np.linalg.lstsq(design, env_params, rcond=None)
+    prediction = design @ coef
+    ss_res = np.sum(np.square(env_params - prediction), axis=0)
+    ss_tot = np.sum(
+        np.square(env_params - env_params.mean(axis=0, keepdims=True)),
+        axis=0,
+    )
+    valid = ss_tot > 1e-6
+    if not np.any(valid):
+        return 0.0
+    per_dim_r2 = 1.0 - ss_res[valid] / ss_tot[valid]
+    return float(np.mean(per_dim_r2))
+
+
+def compute_per_param_env_fit(
+    latent_mean: np.ndarray,
+    env_params: np.ndarray,
+    param_names: np.ndarray,
+) -> list[dict[str, float | str]]:
+    """Report one linear env-fit R² per hidden parameter."""
+    if latent_mean.shape[0] < 4 or env_params.size == 0:
+        return [{"name": str(name), "r2": 0.0} for name in param_names.tolist()]
+
+    design = np.concatenate(
+        [
+            latent_mean.astype(np.float32),
+            np.ones((latent_mean.shape[0], 1), dtype=np.float32),
+        ],
+        axis=1,
+    )
+    coef, _residuals, _rank, _singular_values = np.linalg.lstsq(design, env_params, rcond=None)
+    prediction = design @ coef
+    ss_res = np.sum(np.square(env_params - prediction), axis=0)
+    ss_tot = np.sum(
+        np.square(env_params - env_params.mean(axis=0, keepdims=True)),
+        axis=0,
+    )
+    rows = []
+    for idx, name in enumerate(param_names.tolist()):
+        if idx >= env_params.shape[1] or ss_tot[idx] <= 1e-6:
+            rows.append({"name": str(name), "r2": 0.0})
+            continue
+        rows.append({"name": str(name), "r2": float(1.0 - ss_res[idx] / ss_tot[idx])})
+    return rows
+
+
+def compute_neighbor_env_alignment(latent_mean: np.ndarray, env_params: np.ndarray) -> float:
+    """Measure whether nearby latents tend to correspond to nearby env parameters."""
+    latent_rows = sampled_rows(latent_mean.astype(np.float32))
+    env_rows = sampled_rows(env_params.astype(np.float32), max_rows=latent_rows.shape[0])
+    if latent_rows.shape[0] < 3:
+        return 0.0
+
+    latent_deltas = latent_rows[:, None, :] - latent_rows[None, :, :]
+    latent_dist = np.sum(np.square(latent_deltas), axis=-1)
+    np.fill_diagonal(latent_dist, np.inf)
+    nearest_idx = np.argmin(latent_dist, axis=1)
+
+    nn_param_distance = np.linalg.norm(env_rows - env_rows[nearest_idx], axis=1).mean()
+    baseline_param_distance = safe_pairwise_mean_distance(env_rows)
+    if baseline_param_distance <= 1e-6:
+        return 0.0
+    return float(1.0 - nn_param_distance / baseline_param_distance)
+
+
+def compute_mode_leakage(latent_mean: np.ndarray, probe_modes: np.ndarray) -> float:
+    """Estimate how much latent variance is explained by probe mode instead of mechanics."""
+    if latent_mean.shape[0] < 4:
+        return 0.0
+    global_mean = latent_mean.mean(axis=0, keepdims=True)
+    total_var = float(np.mean(np.var(latent_mean, axis=0)))
+    if total_var <= 1e-6:
+        return 0.0
+
+    between_var = 0.0
+    for mode in np.unique(probe_modes):
+        mode_rows = latent_mean[probe_modes == mode]
+        if mode_rows.shape[0] == 0:
+            continue
+        center_shift = mode_rows.mean(axis=0, keepdims=True) - global_mean
+        between_var += mode_rows.shape[0] * float(np.mean(np.square(center_shift)))
+    between_var /= float(latent_mean.shape[0])
+    return float(between_var / total_var)
+
+
+def compute_same_env_spread(env_view_spread: np.ndarray) -> dict[str, float]:
+    """Summarize how much per-window latents disagree inside one env instance."""
+    if env_view_spread.size == 0:
+        return {"mean": 0.0, "p90": 0.0, "max": 0.0}
+    spread_norm = np.linalg.norm(env_view_spread.astype(np.float32), axis=1)
+    return {
+        "mean": float(np.mean(spread_norm)),
+        "p90": float(np.quantile(spread_norm, 0.90)),
+        "max": float(np.max(spread_norm)),
+    }
+
+
+def compute_failure_lift(uncertainty: np.ndarray, terminated: np.ndarray) -> dict[str, float]:
+    """Compare termination rates in low- vs high-uncertainty windows."""
+    if uncertainty.shape[0] < 8:
+        rate = float(np.mean(terminated)) if terminated.size else 0.0
+        return {"low_rate": rate, "high_rate": rate, "gap": 0.0, "lift": 1.0}
+
+    low_cut = float(np.quantile(uncertainty, 0.25))
+    high_cut = float(np.quantile(uncertainty, 0.75))
+    low_mask = uncertainty <= low_cut
+    high_mask = uncertainty >= high_cut
+    low_rate = float(np.mean(terminated[low_mask])) if np.any(low_mask) else 0.0
+    high_rate = float(np.mean(terminated[high_mask])) if np.any(high_mask) else 0.0
+    if low_rate <= 1e-6:
+        lift = 1.0 if high_rate <= 1e-6 else float("inf")
+    else:
+        lift = high_rate / low_rate
+    return {
+        "low_rate": low_rate,
+        "high_rate": high_rate,
+        "gap": high_rate - low_rate,
+        "lift": float(lift),
+    }
+
+
+def mode_payload_rows(
+    probe_mode: np.ndarray,
+    uncertainty: np.ndarray,
+    terminated: np.ndarray,
+) -> list[dict[str, float | int | str]]:
+    """Summarize each probe mode with count, uncertainty, and failure pressure."""
+    rows = []
+    total_count = max(int(probe_mode.shape[0]), 1)
+    for mode in np.unique(probe_mode):
+        mask = probe_mode == mode
+        rows.append(
+            {
+                "probe_mode": str(mode),
+                "count": int(np.sum(mask)),
+                "share": float(np.sum(mask) / total_count),
+                "uncertainty_mean": float(np.mean(uncertainty[mask])),
+                "terminated_rate": float(np.mean(terminated[mask])),
+            }
+        )
+    return sorted(rows, key=lambda row: (-row["count"], row["probe_mode"]))
+
+
 def build_index_payload(artifact_dir: Path) -> dict:
     """List the available dashboard artifacts."""
+    context = load_dashboard_context(artifact_dir)
     return {
         "artifact_dir": str(artifact_dir),
         "latent_snapshots": [path.name for path in list_latent_snapshot_paths(artifact_dir)],
         "benchmark_summaries": [path.name for path in list_benchmark_paths(artifact_dir)],
+        "run_context": context,
     }
+
+
+def load_dashboard_context(artifact_dir: Path) -> dict | None:
+    """Load the most recent training selection written by the benchmark entrypoint."""
+    context_path = artifact_dir / "dashboard_context.json"
+    if not context_path.exists():
+        return load_main_module_context()
+    try:
+        return json.loads(context_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return load_main_module_context()
+
+
+def load_main_module_context() -> dict | None:
+    """Fallback to the root main.py selection when no saved dashboard context exists yet."""
+    try:
+        import main as root_main
+    except Exception:
+        return None
+
+    env_name = getattr(root_main, "ENV_NAME", None)
+    seeds = getattr(root_main, "SEEDS", None)
+    if not isinstance(env_name, str):
+        return None
+
+    try:
+        benchmark_tag = build_experiment_config(env_name).benchmark_tag
+    except Exception:
+        benchmark_tag = env_name.replace("-", "_").replace("/", "_").lower()
+
+    if not isinstance(seeds, list) or not seeds:
+        seeds = [0, 1, 2, 3, 4]
+
+    return {
+        "env_name": env_name,
+        "env_display_name": get_env_display_name(env_name),
+        "benchmark_tag": benchmark_tag,
+        "default_benchmark_summary": f"{benchmark_tag}_solve_benchmark.npz",
+        "default_latent_snapshot": f"{benchmark_tag}_seed_{seeds[-1]}_latent_snapshot.npz",
+        "seeds": seeds,
+    }
+
+
+def load_optional_string(data: dict[str, np.ndarray], key: str) -> str | None:
+    """Read an optional string-like field stored in an NPZ artifact."""
+    value = data.get(key)
+    if value is None:
+        return None
+    if isinstance(value, np.ndarray) and value.shape == ():
+        return str(value.item())
+    return str(value)
 
 
 def build_latent_payload(path: Path) -> dict:
     """Convert one latent snapshot artifact into a JSON-friendly payload."""
     snapshot = load_latent_snapshot(path)
-    indices = downsample_indices(int(snapshot["latent_mean"].shape[0]))
+    env_name = load_optional_string(snapshot, "env_name")
+    benchmark_tag = load_optional_string(snapshot, "benchmark_tag")
+    indices = downsample_indices(int(snapshot["env_belief_mean"].shape[0]))
     projection = snapshot["projection_2d"][indices]
-    reward_sum = snapshot["reward_sum"][indices]
-    uncertainty = snapshot["uncertainty"][indices]
-    probe_mode = snapshot["probe_mode"][indices]
-    episode_id = snapshot["episode_id"][indices]
-    terminated = snapshot["terminated"][indices]
+    uncertainty = snapshot["env_uncertainty"][indices]
     env_params = snapshot["env_params"][indices]
+    env_window_count = snapshot["env_window_count"][indices]
+    env_view_spread = snapshot["env_view_spread"][indices]
+    full_env_mean = snapshot["env_belief_mean"].astype(np.float32)
+    full_env_params = snapshot["env_params"].astype(np.float32)
+    full_uncertainty = snapshot["env_uncertainty"].astype(np.float32)
+    full_env_view_spread = snapshot.get("env_subset_latent_std", snapshot["env_view_spread"]).astype(np.float32)
+    full_window_probe_mode = snapshot["window_probe_mode"].astype("U")
+    full_window_terminated = snapshot["window_terminated"].astype(np.float32)
+    full_window_latent_mean = snapshot["window_latent_mean"].astype(np.float32)
+    full_window_uncertainty = np.exp(0.5 * snapshot["window_latent_logvar"].astype(np.float32)).mean(axis=1)
+    full_param_names = snapshot["env_param_names"].astype("U")
 
-    unique_modes, counts = np.unique(snapshot["probe_mode"], return_counts=True)
-    mode_counts = [
-        {"probe_mode": str(mode), "count": int(count)}
-        for mode, count in sorted(zip(unique_modes.tolist(), counts.tolist()), key=lambda item: item[0])
-    ]
+    env_ids = snapshot["env_instance_id"].astype(np.int32)
+    window_env_ids = snapshot["window_env_instance_id"].astype(np.int32)
+    window_reward_sum = snapshot["window_reward_sum"].astype(np.float32)
+    env_terminated_rate = np.zeros(env_ids.shape[0], dtype=np.float32)
+    env_reward_mean = np.zeros(env_ids.shape[0], dtype=np.float32)
+    for idx, env_id in enumerate(env_ids.tolist()):
+        env_mask = window_env_ids == env_id
+        env_terminated_rate[idx] = float(np.mean(full_window_terminated[env_mask])) if np.any(env_mask) else 0.0
+        env_reward_mean[idx] = float(np.mean(window_reward_sum[env_mask])) if np.any(env_mask) else 0.0
+    terminated = env_terminated_rate[indices]
+    reward_sum = env_reward_mean[indices]
+
+    mode_counts = mode_payload_rows(
+        probe_mode=full_window_probe_mode,
+        uncertainty=full_window_uncertainty,
+        terminated=full_window_terminated,
+    )
+    diagnostics = {
+        "linear_env_fit_r2": compute_linear_env_fit(full_env_mean, full_env_params),
+        "per_param_env_fit_r2": compute_per_param_env_fit(full_env_mean, full_env_params, full_param_names),
+        "neighbor_env_alignment": compute_neighbor_env_alignment(full_env_mean, full_env_params),
+        "window_mode_leakage": compute_mode_leakage(full_window_latent_mean, full_window_probe_mode),
+        "same_env_spread": compute_same_env_spread(full_env_view_spread),
+        "failure_lift": compute_failure_lift(full_uncertainty, env_terminated_rate.astype(np.float32)),
+        "env_param_uncertainty_mean": float(
+            np.mean(snapshot.get("env_subset_param_std", snapshot["env_param_std"]).astype(np.float32))
+        ),
+    }
 
     points = []
     for idx in range(len(indices)):
@@ -61,27 +320,32 @@ def build_latent_payload(path: Path) -> dict:
                 "y": float(projection[idx, 1]),
                 "reward_sum": float(reward_sum[idx]),
                 "uncertainty": float(uncertainty[idx]),
-                "probe_mode": str(probe_mode[idx]),
-                "episode_id": int(episode_id[idx]),
+                "window_count": int(env_window_count[idx]),
                 "terminated": bool(int(terminated[idx])),
+                "terminated_numeric": float(terminated[idx]),
                 "env_param_mean": float(np.mean(env_params[idx])),
+                "same_env_spread": float(np.linalg.norm(env_view_spread[idx])),
             }
         )
 
     return {
         "name": path.name,
+        "artifact_mtime": float(path.stat().st_mtime),
+        "env_name": env_name,
+        "env_display_name": None if env_name is None else get_env_display_name(env_name),
+        "benchmark_tag": benchmark_tag,
         "summary": {
-            "num_windows": int(snapshot["latent_mean"].shape[0]),
-            "latent_dim": int(snapshot["latent_mean"].shape[1]),
+            "num_envs": int(snapshot["env_belief_mean"].shape[0]),
+            "num_windows": int(snapshot["window_latent_mean"].shape[0]),
+            "latent_dim": int(snapshot["env_belief_mean"].shape[1]),
             "env_param_dim": int(snapshot["env_params"].shape[1]),
-            "reward_min": float(snapshot["reward_sum"].min()),
-            "reward_max": float(snapshot["reward_sum"].max()),
-            "reward_mean": float(snapshot["reward_sum"].mean()),
-            "uncertainty_mean": float(snapshot["uncertainty"].mean()),
-            "terminated_rate": float(snapshot["terminated"].mean()),
+            "uncertainty_mean": float(snapshot["env_uncertainty"].mean()),
+            "terminated_rate": float(np.mean(env_terminated_rate)),
+            "window_count_mean": float(snapshot["env_window_count"].mean()),
             "pca_explained": [float(value) for value in snapshot["pca_explained"].tolist()],
             "sampled_points": int(len(points)),
         },
+        "diagnostics": diagnostics,
         "mode_counts": mode_counts,
         "points": points,
     }
@@ -105,6 +369,7 @@ def summarize_solve_array(values: np.ndarray, caps: np.ndarray) -> dict:
 def build_benchmark_payload(path: Path) -> dict:
     """Convert one benchmark summary artifact into a JSON-friendly payload."""
     summary = load_benchmark_summary(path)
+    env_name = load_optional_string(summary, "env_name")
     seeds = summary["seeds"].astype(np.int64).tolist()
     baseline_episode_solves = summary.get("baseline_episode_solves", summary["baseline_solves"]).astype(np.int64)
     probe_episode_solves = summary.get("probe_episode_solves", summary["probe_solves"]).astype(np.int64)
@@ -154,6 +419,9 @@ def build_benchmark_payload(path: Path) -> dict:
 
     return {
         "name": path.name,
+        "artifact_mtime": float(path.stat().st_mtime),
+        "env_name": env_name,
+        "env_display_name": None if env_name is None else get_env_display_name(env_name),
         "rows": rows,
         "summaries": {
             "baseline_episode": summarize_solve_array(
@@ -182,6 +450,13 @@ def create_dashboard_app(artifact_dir: str | Path = "artifacts") -> Flask:
     template_dir = Path(__file__).with_name("templates")
     app = Flask(__name__, template_folder=str(template_dir))
     app.config["ARTIFACT_DIR"] = str(artifact_root)
+
+    @app.after_request
+    def add_no_store_headers(response):
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
 
     @app.get("/")
     def index():

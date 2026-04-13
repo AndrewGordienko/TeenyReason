@@ -14,7 +14,13 @@ only one downstream testbed. The main object of study is the latent space.
 
 ## Research Framing
 
-Read [docs/core_idea.md](docs/core_idea.md) first.
+Read [docs/README.md](docs/README.md) first for the full docs map.
+
+Then read [docs/core_idea.md](docs/core_idea.md) first.
+
+Then read [docs/research_manifesto.md](docs/research_manifesto.md) for the
+current thesis, intended architecture, target losses, and the metrics that are
+actually supposed to matter.
 
 The latent in this repo is intended to be:
 

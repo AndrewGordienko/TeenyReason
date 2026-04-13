@@ -1,5 +1,8 @@
 # Core Idea
 
+For the concrete research thesis, architecture, losses, and success criteria,
+read [research_manifesto.md](./research_manifesto.md) after this page.
+
 This repo is about one question:
 
 How can an agent build a compact, reusable, uncertainty-aware belief about an

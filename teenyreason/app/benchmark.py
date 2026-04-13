@@ -9,6 +9,7 @@ This file wires the whole benchmark together:
 5. compare how quickly each variant solves the task across seeds
 """
 
+import json
 import random
 import statistics
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from ..envs import (
     BIPEDAL_WALKER_NAME,
     CONTINUOUS_CARTPOLE_NAME,
     CONTINUOUS_LUNAR_LANDER_NAME,
+    get_env_display_name,
 )
 from ..probe.probe_data import ProbeCrawler
 from ..representation import build_latent_snapshot, save_latent_snapshot, train_encoder_predictor
@@ -42,6 +44,17 @@ class ExperimentConfig:
     probe_max_steps: int
     encoder_epochs: int
     encoder_batch_size: int
+    encoder_lr: float
+    encoder_kl_loss_weight: float
+    encoder_contrastive_loss_weight: float
+    encoder_contrastive_dim: int
+    encoder_env_consistency_loss_weight: float
+    encoder_env_geometry_loss_weight: float
+    encoder_mode_adversary_loss_weight: float
+    encoder_latent_rollout_loss_weight: float
+    encoder_env_within_between_loss_weight: float
+    encoder_belief_subset_count: int
+    encoder_belief_subset_size: int
     latent_memory_capacity: int
     base_probe_episodes: int
     max_probe_episodes: int
@@ -93,6 +106,17 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             probe_max_steps=400,
             encoder_epochs=80,
             encoder_batch_size=128,
+            encoder_lr=1e-3,
+            encoder_kl_loss_weight=2e-3,
+            encoder_contrastive_loss_weight=0.30,
+            encoder_contrastive_dim=64,
+            encoder_env_consistency_loss_weight=0.45,
+            encoder_env_geometry_loss_weight=0.25,
+            encoder_mode_adversary_loss_weight=0.15,
+            encoder_latent_rollout_loss_weight=0.20,
+            encoder_env_within_between_loss_weight=0.30,
+            encoder_belief_subset_count=4,
+            encoder_belief_subset_size=6,
             latent_memory_capacity=512,
             base_probe_episodes=2,
             max_probe_episodes=3,
@@ -142,6 +166,17 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             probe_max_steps=300,
             encoder_epochs=60,
             encoder_batch_size=128,
+            encoder_lr=1e-3,
+            encoder_kl_loss_weight=2e-3,
+            encoder_contrastive_loss_weight=0.25,
+            encoder_contrastive_dim=64,
+            encoder_env_consistency_loss_weight=0.40,
+            encoder_env_geometry_loss_weight=0.20,
+            encoder_mode_adversary_loss_weight=0.10,
+            encoder_latent_rollout_loss_weight=0.15,
+            encoder_env_within_between_loss_weight=0.25,
+            encoder_belief_subset_count=4,
+            encoder_belief_subset_size=6,
             latent_memory_capacity=512,
             base_probe_episodes=2,
             max_probe_episodes=3,
@@ -191,6 +226,17 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             probe_max_steps=250,
             encoder_epochs=40,
             encoder_batch_size=128,
+            encoder_lr=1e-3,
+            encoder_kl_loss_weight=2e-3,
+            encoder_contrastive_loss_weight=0.20,
+            encoder_contrastive_dim=64,
+            encoder_env_consistency_loss_weight=0.55,
+            encoder_env_geometry_loss_weight=0.35,
+            encoder_mode_adversary_loss_weight=0.20,
+            encoder_latent_rollout_loss_weight=0.20,
+            encoder_env_within_between_loss_weight=0.35,
+            encoder_belief_subset_count=4,
+            encoder_belief_subset_size=6,
             latent_memory_capacity=256,
             base_probe_episodes=2,
             max_probe_episodes=3,
@@ -268,6 +314,8 @@ def serialize_normalizer_state(normalizer_state: dict[str, np.ndarray | float]) 
 def save_training_artifacts(
     encoder,
     predictor,
+    belief_aggregator,
+    env_param_predictor,
     baseline_result,
     probe_result,
     artifact_tag: str,
@@ -331,6 +379,8 @@ def save_training_artifacts(
             "env_name": env_name,
             "window_size": window_size,
             "z_dim": z_dim,
+            "belief_dim": z_dim * 2,
+            "belief_style": "posterior_mean_std",
             "action_bins": action_bins,
             "hidden_dim": hidden_dim,
             "online_z_update_alpha": online_z_update_alpha,
@@ -340,6 +390,10 @@ def save_training_artifacts(
             "encoder_state_dict": encoder.state_dict(),
             "predictor_state_dict": predictor.state_dict(),
             "predictor_ensemble_size": int(predictor.ensemble_size),
+            "belief_aggregator_state_dict": belief_aggregator.state_dict(),
+            "env_param_predictor_state_dict": env_param_predictor.state_dict(),
+            "env_param_predictor_ensemble_size": int(env_param_predictor.ensemble_size),
+            "env_param_dim": int(env_param_predictor.output_dim),
             "policy_state_dict": probe_result.policy.state_dict(),
             "state_normalizer": serialize_normalizer(probe_result.state_normalizer),
             "best_policy_state_dict": probe_result.best_policy_state_dict,
@@ -374,6 +428,7 @@ def save_training_artifacts(
 
 
 def save_benchmark_results(
+    env_name: str,
     benchmark_tag: str,
     seeds,
     baseline_episode_solves,
@@ -393,6 +448,7 @@ def save_benchmark_results(
     benchmark_path = output_dir / f"{benchmark_tag}_solve_benchmark.npz"
     np.savez(
         benchmark_path,
+        env_name=np.asarray(env_name),
         seeds=np.asarray(seeds, dtype=np.int64),
         baseline_solves=np.asarray(baseline_episode_solves, dtype=np.int64),
         probe_solves=np.asarray(probe_episode_solves, dtype=np.int64),
@@ -407,6 +463,27 @@ def save_benchmark_results(
         probe_encoder_steps=np.asarray(probe_encoder_steps, dtype=np.int64),
     )
     print(f"Saved benchmark results to {benchmark_path}")
+
+
+def save_dashboard_context(
+    env_name: str,
+    benchmark_tag: str,
+    seeds: list[int],
+    artifact_dir: Path,
+):
+    """Persist the current training selection so the dashboard can default to it."""
+    artifact_dir.mkdir(exist_ok=True)
+    context_path = artifact_dir / "dashboard_context.json"
+    context = {
+        "env_name": env_name,
+        "env_display_name": get_env_display_name(env_name),
+        "benchmark_tag": benchmark_tag,
+        "default_benchmark_summary": f"{benchmark_tag}_solve_benchmark.npz",
+        "default_latent_snapshot": f"{benchmark_tag}_seed_{seeds[-1]}_latent_snapshot.npz",
+        "seeds": list(seeds),
+    }
+    context_path.write_text(json.dumps(context, indent=2), encoding="utf-8")
+    print(f"Saved dashboard context to {context_path}")
 
 
 def print_return_summary(name: str, returns):
@@ -469,18 +546,27 @@ def run_single_seed(
 
     print("\nTraining encoder + delta predictor...")
     # Train the latent encoder before either PPO variant so both runs see the same probe model.
-    encoder, predictor, device = train_encoder_predictor(
+    encoder, predictor, belief_aggregator, env_param_predictor, device = train_encoder_predictor(
         windows=windows,
         z_dim=config.z_dim,
         epochs=config.encoder_epochs,
         batch_size=config.encoder_batch_size,
-        lr=1e-3,
+        lr=config.encoder_lr,
         physics_loss_weight=config.physics_loss_weight,
         affordance_loss_weight=config.affordance_loss_weight,
         decision_loss_weight=1.0,
         return_loss_weight=0.5,
         risk_loss_weight=0.25,
-        kl_loss_weight=2e-3,
+        kl_loss_weight=config.encoder_kl_loss_weight,
+        contrastive_loss_weight=config.encoder_contrastive_loss_weight,
+        env_consistency_loss_weight=config.encoder_env_consistency_loss_weight,
+        env_geometry_loss_weight=config.encoder_env_geometry_loss_weight,
+        mode_adversary_loss_weight=config.encoder_mode_adversary_loss_weight,
+        latent_rollout_loss_weight=config.encoder_latent_rollout_loss_weight,
+        env_within_between_loss_weight=config.encoder_env_within_between_loss_weight,
+        belief_subset_count=config.encoder_belief_subset_count,
+        belief_subset_size=config.encoder_belief_subset_size,
+        contrastive_dim=config.encoder_contrastive_dim,
         ensemble_size=4,
         action_vocab_size=crawler.action_dim,
         intervention_horizon=config.intervention_horizon,
@@ -490,8 +576,12 @@ def run_single_seed(
 
     latent_snapshot = build_latent_snapshot(
         encoder=encoder,
+        belief_aggregator=belief_aggregator,
+        env_param_predictor=env_param_predictor,
         device=device,
         windows=windows,
+        env_name=config.env_name,
+        benchmark_tag=config.benchmark_tag,
     )
     latent_snapshot_path = Path("artifacts") / f"{artifact_tag}_latent_snapshot.npz"
     save_latent_snapshot(latent_snapshot_path, latent_snapshot)
@@ -537,6 +627,8 @@ def run_single_seed(
         env_name=config.env_name,
         encoder=encoder,
         predictor=predictor,
+        belief_aggregator=belief_aggregator,
+        env_param_predictor=env_param_predictor,
         device=device,
         num_episodes=config.num_episodes,
         window_size=config.window_size,
@@ -586,6 +678,8 @@ def run_single_seed(
     save_training_artifacts(
         encoder,
         predictor,
+        belief_aggregator,
+        env_param_predictor,
         baseline_result,
         probe_result,
         artifact_tag=artifact_tag,
@@ -646,6 +740,13 @@ def run_training_pipeline(
     config = build_experiment_config(env_name)
     if seeds is None:
         seeds = [0, 1, 2, 3, 4]
+    artifact_dir = Path("artifacts")
+    save_dashboard_context(
+        env_name=config.env_name,
+        benchmark_tag=config.benchmark_tag,
+        seeds=seeds,
+        artifact_dir=artifact_dir,
+    )
     results = []
 
     total_runs = len(seeds)
@@ -702,6 +803,7 @@ def run_training_pipeline(
         probe_total_env_steps,
     )
     save_benchmark_results(
+        config.env_name,
         config.benchmark_tag,
         seeds,
         [value if value is not None else -1 for value in baseline_episode_solves],
