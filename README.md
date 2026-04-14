@@ -22,12 +22,23 @@ Then read [docs/research_manifesto.md](docs/research_manifesto.md) for the
 current thesis, intended architecture, target losses, and the metrics that are
 actually supposed to matter.
 
+Then read [docs/general_crawler_belief.md](docs/general_crawler_belief.md) and
+[docs/language_domain_synthesis.md](docs/language_domain_synthesis.md) for the
+broader cross-domain version of the idea. The current code is mostly an RL
+testbed, but the intended latent-belief mechanism is supposed to generalize to
+language and other structured environments too.
+
 The latent in this repo is intended to be:
 
 - predictive
 - task-relevant
 - uncertainty-aware
 - reusable across downstream control
+
+More generally, the repo is trying to study a reusable
+`crawler -> belief -> solver` pattern, where the crawler learns the hidden
+constraints of a new environment quickly and the solver then focuses on the
+task instead of first having to infer the world from scratch.
 
 ## Repo Layout
 
