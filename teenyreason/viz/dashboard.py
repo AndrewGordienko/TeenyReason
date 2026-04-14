@@ -1,6 +1,7 @@
 """Small localhost dashboard for latent snapshots and benchmark summaries."""
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +10,26 @@ from flask import Flask, jsonify, render_template
 from ..app.benchmark import build_experiment_config
 from ..envs import get_env_display_name
 from ..representation import list_latent_snapshot_paths, load_latent_snapshot
+
+
+def sanitize_json_value(value):
+    """Convert nested payload values into JSON-safe finite primitives."""
+    if isinstance(value, dict):
+        return {str(key): sanitize_json_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [sanitize_json_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_json_value(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return sanitize_json_value(value.tolist())
+    if isinstance(value, (np.floating, float)):
+        scalar = float(value)
+        return scalar if math.isfinite(scalar) else 0.0
+    if isinstance(value, (np.integer, int)):
+        return int(value)
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    return value
 
 
 def list_benchmark_paths(artifact_dir: Path) -> list[Path]:
@@ -122,6 +143,30 @@ def compute_neighbor_env_alignment(latent_mean: np.ndarray, env_params: np.ndarr
     return float(1.0 - nn_param_distance / baseline_param_distance)
 
 
+def compute_split_retrieval_stats(
+    split_mean_a: np.ndarray,
+    split_mean_b: np.ndarray,
+) -> dict[str, float]:
+    """Check whether one disjoint support half retrieves the matching other half."""
+    if split_mean_a.shape[0] < 2 or split_mean_b.shape[0] != split_mean_a.shape[0]:
+        return {"top1": 0.0, "top5": 0.0, "mrr": 0.0, "median_rank": 0.0}
+    a = split_mean_a.astype(np.float32)
+    b = split_mean_b.astype(np.float32)
+    a = a / np.clip(np.linalg.norm(a, axis=1, keepdims=True), 1e-6, None)
+    b = b / np.clip(np.linalg.norm(b, axis=1, keepdims=True), 1e-6, None)
+    similarity = a @ b.T
+    labels = np.arange(a.shape[0], dtype=np.int32)
+    ranked_idx = np.argsort(-similarity, axis=1)
+    rank_positions = np.argmax(ranked_idx == labels[:, None], axis=1) + 1
+    nearest_idx = ranked_idx[:, 0]
+    return {
+        "top1": float(np.mean(nearest_idx == labels)),
+        "top5": float(np.mean(rank_positions <= min(5, a.shape[0]))),
+        "mrr": float(np.mean(1.0 / rank_positions)),
+        "median_rank": float(np.median(rank_positions)),
+    }
+
+
 def compute_mode_leakage(latent_mean: np.ndarray, probe_modes: np.ndarray) -> float:
     """Estimate how much latent variance is explained by probe mode instead of mechanics."""
     if latent_mean.shape[0] < 4:
@@ -142,15 +187,42 @@ def compute_mode_leakage(latent_mean: np.ndarray, probe_modes: np.ndarray) -> fl
     return float(between_var / total_var)
 
 
-def compute_same_env_spread(env_view_spread: np.ndarray) -> dict[str, float]:
-    """Summarize how much per-window latents disagree inside one env instance."""
-    if env_view_spread.size == 0:
+def compute_same_env_spread(
+    split_latent_disagreement: np.ndarray,
+    leaveout_shift: np.ndarray | None = None,
+) -> dict[str, float]:
+    """Summarize disagreement between small support-set beliefs from one world."""
+    if split_latent_disagreement.size == 0:
         return {"mean": 0.0, "p90": 0.0, "max": 0.0}
-    spread_norm = np.linalg.norm(env_view_spread.astype(np.float32), axis=1)
+    spread_norm = np.asarray(split_latent_disagreement, dtype=np.float32)
+    if leaveout_shift is not None and leaveout_shift.size != 0:
+        spread_norm = spread_norm + 0.5 * np.asarray(leaveout_shift, dtype=np.float32)
     return {
         "mean": float(np.mean(spread_norm)),
         "p90": float(np.quantile(spread_norm, 0.90)),
         "max": float(np.max(spread_norm)),
+    }
+
+
+def compute_same_env_gap_ratio(
+    env_mean: np.ndarray,
+    split_mean_a: np.ndarray,
+    split_mean_b: np.ndarray,
+) -> dict[str, float]:
+    """Compare same-world split disagreement to nearest different-world distance."""
+    if env_mean.shape[0] < 2 or split_mean_a.shape[0] != env_mean.shape[0]:
+        return {"mean": 0.0, "p90": 0.0}
+    same_gap = np.linalg.norm(split_mean_a.astype(np.float32) - split_mean_b.astype(np.float32), axis=1)
+    between = np.linalg.norm(
+        env_mean.astype(np.float32)[:, None, :] - env_mean.astype(np.float32)[None, :, :],
+        axis=-1,
+    )
+    np.fill_diagonal(between, np.inf)
+    nearest_between = np.min(between, axis=1)
+    ratio = same_gap / np.clip(nearest_between, 1e-6, None)
+    return {
+        "mean": float(np.mean(ratio)),
+        "p90": float(np.quantile(ratio, 0.90)),
     }
 
 
@@ -166,15 +238,40 @@ def compute_failure_lift(uncertainty: np.ndarray, terminated: np.ndarray) -> dic
     high_mask = uncertainty >= high_cut
     low_rate = float(np.mean(terminated[low_mask])) if np.any(low_mask) else 0.0
     high_rate = float(np.mean(terminated[high_mask])) if np.any(high_mask) else 0.0
-    if low_rate <= 1e-6:
-        lift = 1.0 if high_rate <= 1e-6 else float("inf")
-    else:
-        lift = high_rate / low_rate
+    lift = high_rate / max(low_rate, 1e-6)
     return {
         "low_rate": low_rate,
         "high_rate": high_rate,
         "gap": high_rate - low_rate,
         "lift": float(lift),
+    }
+
+
+def compute_uncertainty_error_alignment(
+    uncertainty: np.ndarray,
+    error: np.ndarray,
+) -> dict[str, float]:
+    """Check whether high-uncertainty beliefs also have larger mechanics error."""
+    if uncertainty.shape[0] < 4 or error.shape[0] != uncertainty.shape[0]:
+        mean_error = float(np.mean(error)) if error.size else 0.0
+        return {"correlation": 0.0, "low_error": mean_error, "high_error": mean_error, "gap": 0.0}
+
+    centered_u = uncertainty - np.mean(uncertainty)
+    centered_e = error - np.mean(error)
+    denom = float(np.sqrt(np.sum(centered_u ** 2) * np.sum(centered_e ** 2)))
+    correlation = 0.0 if denom <= 1e-6 else float(np.sum(centered_u * centered_e) / denom)
+
+    low_cut = float(np.quantile(uncertainty, 0.25))
+    high_cut = float(np.quantile(uncertainty, 0.75))
+    low_mask = uncertainty <= low_cut
+    high_mask = uncertainty >= high_cut
+    low_error = float(np.mean(error[low_mask])) if np.any(low_mask) else float(np.mean(error))
+    high_error = float(np.mean(error[high_mask])) if np.any(high_mask) else float(np.mean(error))
+    return {
+        "correlation": correlation,
+        "low_error": low_error,
+        "high_error": high_error,
+        "gap": high_error - low_error,
     }
 
 
@@ -272,20 +369,66 @@ def build_latent_payload(path: Path) -> dict:
     uncertainty = snapshot["env_uncertainty"][indices]
     env_params = snapshot["env_params"][indices]
     env_window_count = snapshot["env_window_count"][indices]
-    env_view_spread = snapshot["env_view_spread"][indices]
+    env_support_count = snapshot.get("env_support_count", snapshot["env_window_count"])[indices]
+    env_support_group_ratio = snapshot.get(
+        "env_support_group_ratio",
+        np.ones_like(snapshot.get("env_support_count", snapshot["env_window_count"]), dtype=np.float32),
+    )[indices]
+    env_view_spread = snapshot.get("env_subset_latent_std", snapshot["env_view_spread"])[indices]
     full_env_mean = snapshot["env_belief_mean"].astype(np.float32)
     full_env_params = snapshot["env_params"].astype(np.float32)
     full_uncertainty = snapshot["env_uncertainty"].astype(np.float32)
+    full_env_param_error = snapshot.get(
+        "env_param_error_mean",
+        np.zeros((full_env_mean.shape[0],), dtype=np.float32),
+    ).astype(np.float32)
+    full_split_mean_a = snapshot.get("env_split_mean_a", full_env_mean).astype(np.float32)
+    full_split_mean_b = snapshot.get("env_split_mean_b", full_env_mean).astype(np.float32)
+    full_split_latent_disagreement = snapshot.get(
+        "env_split_latent_disagreement",
+        np.linalg.norm(full_split_mean_a - full_split_mean_b, axis=1).astype(np.float32),
+    ).astype(np.float32)
+    full_nearest_between_distance = snapshot.get(
+        "env_nearest_between_distance",
+        np.ones((full_env_mean.shape[0],), dtype=np.float32),
+    ).astype(np.float32)
+    full_gap_ratio = snapshot.get(
+        "env_gap_ratio",
+        full_split_latent_disagreement / np.clip(full_nearest_between_distance, 1e-6, None),
+    ).astype(np.float32)
+    full_split_retrieval_margin_deficit = snapshot.get(
+        "env_split_retrieval_margin_deficit",
+        np.zeros((full_env_mean.shape[0],), dtype=np.float32),
+    ).astype(np.float32)
     full_env_view_spread = snapshot.get("env_subset_latent_std", snapshot["env_view_spread"]).astype(np.float32)
+    full_env_leaveout_latent_std = snapshot.get(
+        "env_leaveout_latent_std",
+        np.zeros_like(full_env_view_spread, dtype=np.float32),
+    ).astype(np.float32)
+    full_env_subset_shift = snapshot.get(
+        "env_subset_shift",
+        np.zeros((full_env_view_spread.shape[0],), dtype=np.float32),
+    ).astype(np.float32)
+    full_env_leaveout_shift = snapshot.get(
+        "env_leaveout_shift",
+        np.zeros((full_env_view_spread.shape[0],), dtype=np.float32),
+    ).astype(np.float32)
     full_window_probe_mode = snapshot["window_probe_mode"].astype("U")
     full_window_terminated = snapshot["window_terminated"].astype(np.float32)
     full_window_latent_mean = snapshot["window_latent_mean"].astype(np.float32)
-    full_window_uncertainty = np.exp(0.5 * snapshot["window_latent_logvar"].astype(np.float32)).mean(axis=1)
     full_param_names = snapshot["env_param_names"].astype("U")
 
     env_ids = snapshot["env_instance_id"].astype(np.int32)
     window_env_ids = snapshot["window_env_instance_id"].astype(np.int32)
     window_reward_sum = snapshot["window_reward_sum"].astype(np.float32)
+    env_uncertainty_by_id = {
+        int(env_id): float(full_uncertainty[idx])
+        for idx, env_id in enumerate(env_ids.tolist())
+    }
+    full_window_uncertainty = np.asarray(
+        [env_uncertainty_by_id.get(int(env_id), 0.0) for env_id in window_env_ids.tolist()],
+        dtype=np.float32,
+    )
     env_terminated_rate = np.zeros(env_ids.shape[0], dtype=np.float32)
     env_reward_mean = np.zeros(env_ids.shape[0], dtype=np.float32)
     for idx, env_id in enumerate(env_ids.tolist()):
@@ -300,16 +443,52 @@ def build_latent_payload(path: Path) -> dict:
         uncertainty=full_window_uncertainty,
         terminated=full_window_terminated,
     )
+    split_retrieval = compute_split_retrieval_stats(full_split_mean_a, full_split_mean_b)
     diagnostics = {
         "linear_env_fit_r2": compute_linear_env_fit(full_env_mean, full_env_params),
         "per_param_env_fit_r2": compute_per_param_env_fit(full_env_mean, full_env_params, full_param_names),
         "neighbor_env_alignment": compute_neighbor_env_alignment(full_env_mean, full_env_params),
+        "split_retrieval_top1": split_retrieval["top1"],
+        "split_retrieval_top5": split_retrieval["top5"],
+        "split_retrieval_mrr": split_retrieval["mrr"],
+        "split_retrieval_median_rank": split_retrieval["median_rank"],
         "window_mode_leakage": compute_mode_leakage(full_window_latent_mean, full_window_probe_mode),
-        "same_env_spread": compute_same_env_spread(full_env_view_spread),
-        "failure_lift": compute_failure_lift(full_uncertainty, env_terminated_rate.astype(np.float32)),
-        "env_param_uncertainty_mean": float(
-            np.mean(snapshot.get("env_subset_param_std", snapshot["env_param_std"]).astype(np.float32))
+        "same_env_spread": compute_same_env_spread(
+            full_split_latent_disagreement,
+            full_env_leaveout_shift,
         ),
+        "same_env_gap_ratio": compute_same_env_gap_ratio(full_env_mean, full_split_mean_a, full_split_mean_b),
+        "failure_lift": compute_failure_lift(full_uncertainty, env_terminated_rate.astype(np.float32)),
+        "uncertainty_error_alignment": compute_uncertainty_error_alignment(
+            full_uncertainty,
+            full_env_param_error,
+        ),
+        "env_param_uncertainty_mean": float(
+            np.mean(snapshot.get("env_split_param_disagreement", np.zeros((full_env_mean.shape[0],), dtype=np.float32)).astype(np.float32))
+            + 0.5 * np.mean(
+                snapshot.get(
+                    "env_leaveout_param_std",
+                    np.zeros_like(snapshot.get("env_param_std", np.zeros((full_env_mean.shape[0], 1), dtype=np.float32)), dtype=np.float32),
+                ).astype(np.float32)
+            )
+        ),
+        "support_group_ratio_mean": float(np.mean(
+            snapshot.get(
+                "env_support_group_ratio",
+                np.ones((full_env_mean.shape[0],), dtype=np.float32),
+            ).astype(np.float32)
+        )),
+        "env_param_error_mean": float(np.mean(full_env_param_error)),
+        "uncertainty_feature_importance": [
+            {
+                "name": str(name),
+                "weight": float(weight),
+            }
+            for name, weight in zip(
+                snapshot.get("env_uncertainty_feature_names", np.asarray([], dtype="U")).tolist(),
+                snapshot.get("env_uncertainty_feature_weights", np.asarray([], dtype=np.float32)).tolist(),
+            )
+        ],
     }
 
     points = []
@@ -321,10 +500,19 @@ def build_latent_payload(path: Path) -> dict:
                 "reward_sum": float(reward_sum[idx]),
                 "uncertainty": float(uncertainty[idx]),
                 "window_count": int(env_window_count[idx]),
+                "support_count": int(env_support_count[idx]),
+                "support_group_ratio": float(env_support_group_ratio[idx]),
                 "terminated": bool(int(terminated[idx])),
                 "terminated_numeric": float(terminated[idx]),
                 "env_param_mean": float(np.mean(env_params[idx])),
-                "same_env_spread": float(np.linalg.norm(env_view_spread[idx])),
+                "env_error": float(full_env_param_error[indices[idx]]),
+                "gap_ratio": float(full_gap_ratio[indices[idx]]),
+                "nearest_between_distance": float(full_nearest_between_distance[indices[idx]]),
+                "split_retrieval_margin_deficit": float(full_split_retrieval_margin_deficit[indices[idx]]),
+                "same_env_spread": float(
+                    full_split_latent_disagreement[indices[idx]]
+                    + 0.5 * full_env_leaveout_shift[indices[idx]]
+                ),
             }
         )
 
@@ -342,6 +530,13 @@ def build_latent_payload(path: Path) -> dict:
             "uncertainty_mean": float(snapshot["env_uncertainty"].mean()),
             "terminated_rate": float(np.mean(env_terminated_rate)),
             "window_count_mean": float(snapshot["env_window_count"].mean()),
+            "support_count_mean": float(snapshot.get("env_support_count", snapshot["env_window_count"]).mean()),
+            "support_group_ratio_mean": float(np.mean(
+                snapshot.get(
+                    "env_support_group_ratio",
+                    np.ones_like(snapshot.get("env_support_count", snapshot["env_window_count"]), dtype=np.float32),
+                )
+            )),
             "pca_explained": [float(value) for value in snapshot["pca_explained"].tolist()],
             "sampled_points": int(len(points)),
         },
@@ -464,20 +659,20 @@ def create_dashboard_app(artifact_dir: str | Path = "artifacts") -> Flask:
 
     @app.get("/api/index")
     def api_index():
-        return jsonify(build_index_payload(artifact_root))
+        return jsonify(sanitize_json_value(build_index_payload(artifact_root)))
 
     @app.get("/api/latent/<path:name>")
     def api_latent(name: str):
         path = artifact_root / name
         if not path.exists() or path.suffix != ".npz":
             return jsonify({"error": f"Unknown latent snapshot: {name}"}), 404
-        return jsonify(build_latent_payload(path))
+        return jsonify(sanitize_json_value(build_latent_payload(path)))
 
     @app.get("/api/benchmark/<path:name>")
     def api_benchmark(name: str):
         path = artifact_root / name
         if not path.exists() or path.suffix != ".npz":
             return jsonify({"error": f"Unknown benchmark summary: {name}"}), 404
-        return jsonify(build_benchmark_payload(path))
+        return jsonify(sanitize_json_value(build_benchmark_payload(path)))
 
     return app

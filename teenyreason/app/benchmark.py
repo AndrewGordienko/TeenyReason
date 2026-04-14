@@ -2,7 +2,7 @@
 
 This file wires the whole benchmark together:
 
-1. collect scripted probe data from the environment
+1. collect probe data from the environment
 2. train a latent encoder on those probe windows
 3. train a plain PPO baseline
 4. train a PPO agent conditioned on the learned probe belief
@@ -226,7 +226,7 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             probe_max_steps=250,
             encoder_epochs=40,
             encoder_batch_size=128,
-            encoder_lr=1e-3,
+            encoder_lr=3e-4,
             encoder_kl_loss_weight=2e-3,
             encoder_contrastive_loss_weight=0.20,
             encoder_contrastive_dim=64,
@@ -235,8 +235,8 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             encoder_mode_adversary_loss_weight=0.20,
             encoder_latent_rollout_loss_weight=0.20,
             encoder_env_within_between_loss_weight=0.35,
-            encoder_belief_subset_count=4,
-            encoder_belief_subset_size=6,
+            encoder_belief_subset_count=6,
+            encoder_belief_subset_size=4,
             latent_memory_capacity=256,
             base_probe_episodes=2,
             max_probe_episodes=3,
@@ -525,7 +525,7 @@ def run_single_seed(
 
     print(f"\n=== Seed {seed} | env={config.env_name} ===")
     print(f"Collecting probe data for {config.env_name}...")
-    # First collect short scripted probe rollouts that the encoder will learn from.
+    # First collect short probe rollouts that the encoder will learn from.
     crawler = ProbeCrawler(
         env_name=config.env_name,
         window_size=config.window_size,
@@ -582,6 +582,8 @@ def run_single_seed(
         windows=windows,
         env_name=config.env_name,
         benchmark_tag=config.benchmark_tag,
+        support_size=config.encoder_belief_subset_size,
+        subset_count=config.encoder_belief_subset_count,
     )
     latent_snapshot_path = Path("artifacts") / f"{artifact_tag}_latent_snapshot.npz"
     save_latent_snapshot(latent_snapshot_path, latent_snapshot)

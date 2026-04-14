@@ -13,9 +13,11 @@ If you are new to the project, read in this order:
 7. [language_belief_design.md](./language_belief_design.md)
 8. [image_domain_synthesis.md](./image_domain_synthesis.md)
 9. [image_belief_design.md](./image_belief_design.md)
-10. [architecture_and_training.md](./architecture_and_training.md)
-11. [evaluation_and_diagnostics.md](./evaluation_and_diagnostics.md)
-12. [agent_guide.md](./agent_guide.md)
+10. [human_learning_synthesis.md](./human_learning_synthesis.md)
+11. [human_learning_design.md](./human_learning_design.md)
+12. [architecture_and_training.md](./architecture_and_training.md)
+13. [evaluation_and_diagnostics.md](./evaluation_and_diagnostics.md)
+14. [agent_guide.md](./agent_guide.md)
 
 Each file has one job.
 
@@ -44,6 +46,13 @@ Each file has one job.
 - `image_belief_design.md`
   The concrete image-side design: visual latent factorization, crawler
   behavior, implementation phases, metrics, and module boundaries.
+- `human_learning_synthesis.md`
+  The developmental-science and neuroscience bridge: what child learning,
+  surprise, causal exploration, and predictive maps imply for the repo.
+- `human_learning_design.md`
+  The operational companion to the human-learning bridge: how to translate
+  those ideas into architecture, evidence collection, uncertainty, and module
+  design.
 - `architecture_and_training.md`
   Concrete system design, module ownership, data flow, artifact flow, and
   training-stage responsibilities.
@@ -72,6 +81,9 @@ The newer cross-domain docs also exist to keep the repo from accidentally
 shrinking its own idea. The current codebase is mostly a physical-control
 testbed, but the larger research question is about a general crawler that can
 infer hidden rules in many kinds of environments.
+
+The local paper library that backs these docs lives in
+[`papers/README.md`](../papers/README.md).
 
 ## The Short Version
 

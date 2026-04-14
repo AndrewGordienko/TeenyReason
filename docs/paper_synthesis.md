@@ -29,6 +29,11 @@ Across all of these papers, the common message is:
 That is the main reason this repo should be thought of as an active
 environment-belief project rather than as "probe-conditioned PPO".
 
+For the developmental-science and neuroscience bridge, read:
+
+- [human_learning_synthesis.md](./human_learning_synthesis.md)
+- [human_learning_design.md](./human_learning_design.md)
+
 ## 1. PEARL
 
 Paper:

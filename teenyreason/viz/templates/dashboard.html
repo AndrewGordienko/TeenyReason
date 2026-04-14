@@ -606,6 +606,9 @@
               <option value="env_param_mean" selected>Env Param Mean</option>
               <option value="uncertainty">Uncertainty</option>
               <option value="same_env_spread">Same-env Spread</option>
+              <option value="env_error">Env Error</option>
+              <option value="gap_ratio">Gap Ratio</option>
+              <option value="split_retrieval_margin_deficit">Retrieval Deficit</option>
               <option value="terminated">Termination</option>
               <option value="reward_sum">Reward Sum</option>
             </select>
@@ -640,6 +643,28 @@
         <div class="subsection">
           <div class="subhead">How To Read This Snapshot</div>
           <div id="latentGuide" class="summary-list"></div>
+        </div>
+      </div>
+
+      <div class="diagnostic-grid">
+        <div class="subsection">
+          <div class="subhead">Uncertainty vs Error</div>
+          <div class="plot-shell" id="uncertaintyErrorPlotWrap"></div>
+        </div>
+
+        <div class="subsection">
+          <div class="subhead">Same-world Gap vs Nearest Different-world Distance</div>
+          <div class="plot-shell" id="gapRatioPlotWrap"></div>
+        </div>
+
+        <div class="subsection">
+          <div class="subhead">Uncertainty Feature Weights</div>
+          <div id="uncertaintyFeatureWrap" class="summary-list"></div>
+        </div>
+
+        <div class="subsection">
+          <div class="subhead">Where To Dig</div>
+          <div id="outlierGuideWrap" class="summary-list"></div>
         </div>
       </div>
     </section>
@@ -824,7 +849,16 @@
         neighborEnvAlignment: diagnostics.neighbor_env_alignment ?? 0,
         windowModeLeakage: diagnostics.window_mode_leakage ?? 0,
         sameEnvSpread: diagnostics.same_env_spread ?? {mean: 0, p90: 0, max: 0},
+        splitRetrievalTop1: diagnostics.split_retrieval_top1 ?? 0,
+        splitRetrievalTop5: diagnostics.split_retrieval_top5 ?? 0,
+        splitRetrievalMrr: diagnostics.split_retrieval_mrr ?? 0,
+        splitRetrievalMedianRank: diagnostics.split_retrieval_median_rank ?? 0,
+        sameEnvGapRatio: diagnostics.same_env_gap_ratio ?? {mean: 0, p90: 0},
         envParamUncertaintyMean: diagnostics.env_param_uncertainty_mean ?? 0,
+        supportGroupRatioMean: diagnostics.support_group_ratio_mean ?? payload.summary.support_group_ratio_mean ?? 0,
+        envParamErrorMean: diagnostics.env_param_error_mean ?? 0,
+        uncertaintyFeatureImportance: diagnostics.uncertainty_feature_importance ?? [],
+        uncertaintyErrorAlignment: diagnostics.uncertainty_error_alignment || {correlation: 0, low_error: 0, high_error: 0, gap: 0},
         failureLift: diagnostics.failure_lift || {low_rate: 0, high_rate: 0, gap: 0, lift: 1},
       };
     }
@@ -890,14 +924,14 @@
           n: "how much closer latent neighbors are in env-parameter space than random pairings"
         },
         {
-          k: "Same-env Spread",
-          v: latentDerived ? latentDerived.sameEnvSpread.mean.toFixed(2) : "n/a",
-          n: "average disagreement between window latents inside one sampled env instance"
+          k: "Split Retrieval",
+          v: latentDerived ? `${(100 * latentDerived.splitRetrievalTop1).toFixed(1)}%` : "n/a",
+          n: "top-1 retrieval accuracy between two disjoint small support halves from the same sampled world"
         },
         {
-          k: "Probe Episode Median",
-          v: benchmark ? benchmark.probe_episode.median.toFixed(1) : "n/a",
-          n: "median solve episode for the latent-conditioned branch in the selected benchmark artifact"
+          k: "Support Diversity",
+          v: latentDerived ? `${(100 * latentDerived.supportGroupRatioMean).toFixed(1)}%` : "n/a",
+          n: "share of support windows that come from distinct experiment families instead of repeated copies of one probe"
         }
       ];
 
@@ -919,6 +953,15 @@
       }
       if (metric === "same_env_spread") {
         return "same_env_spread";
+      }
+      if (metric === "env_error") {
+        return "env_error";
+      }
+      if (metric === "gap_ratio") {
+        return "gap_ratio";
+      }
+      if (metric === "split_retrieval_margin_deficit") {
+        return "split_retrieval_margin_deficit";
       }
       if (metric === "reward_sum") {
         return "reward_sum";
@@ -966,6 +1009,57 @@
         const raw = Number(point[field]);
         return {...point, __normalized_metric: (raw - min) / span};
       });
+    }
+
+    function scatterShellSvg(points, xField, yField, xLabel, yLabel, colorField = null) {
+      if (!points || !points.length) {
+        return `<div class="empty">No diagnostic points are available yet.</div>`;
+      }
+      const valid = points.filter((point) => Number.isFinite(Number(point[xField])) && Number.isFinite(Number(point[yField])));
+      if (!valid.length) {
+        return `<div class="empty">No finite diagnostic points are available yet.</div>`;
+      }
+
+      const xs = valid.map((point) => Number(point[xField]));
+      const ys = valid.map((point) => Number(point[yField]));
+      const width = 520;
+      const height = 320;
+      const pad = 44;
+      const minX = Math.min(...xs);
+      const maxX = Math.max(...xs);
+      const minY = Math.min(...ys);
+      const maxY = Math.max(...ys);
+      const xScale = (value) => pad + ((value - minX) / Math.max(maxX - minX, 1e-6)) * (width - 2 * pad);
+      const yScale = (value) => height - pad - ((value - minY) / Math.max(maxY - minY, 1e-6)) * (height - 2 * pad);
+      const colored = colorField ? normalizeMetric(valid, colorField) : valid.map((point) => ({...point, __normalized_metric: 0.5}));
+      const identitySegments = xField === "same_env_spread" && yField === "nearest_between_distance"
+        ? (() => {
+            const start = Math.max(minX, minY);
+            const end = Math.min(maxX, maxY);
+            if (end <= start) {
+              return "";
+            }
+            return `<line x1="${xScale(start).toFixed(2)}" y1="${yScale(start).toFixed(2)}" x2="${xScale(end).toFixed(2)}" y2="${yScale(end).toFixed(2)}" stroke="#d3dae6" stroke-width="1.25" stroke-dasharray="5 4"></line>`;
+          })()
+        : "";
+      const circles = colored.map((point) => `
+        <circle cx="${xScale(Number(point[xField])).toFixed(2)}" cy="${yScale(Number(point[yField])).toFixed(2)}" r="4.4"
+          fill="${colorForMetric(point, colorField || "uncertainty", {})}" fill-opacity="0.86" stroke="#ffffff" stroke-width="1">
+          <title>${xLabel}=${Number(point[xField]).toFixed(3)} | ${yLabel}=${Number(point[yField]).toFixed(3)} | error=${Number(point.env_error ?? 0).toFixed(3)} | uncert=${Number(point.uncertainty ?? 0).toFixed(3)}</title>
+        </circle>
+      `).join("");
+
+      return `
+        <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${xLabel} vs ${yLabel}">
+          <rect x="0" y="0" width="${width}" height="${height}" fill="#ffffff"></rect>
+          <line x1="${pad}" y1="${height - pad}" x2="${width - pad}" y2="${height - pad}" stroke="#d7dee8" stroke-width="1.25"></line>
+          <line x1="${pad}" y1="${pad}" x2="${pad}" y2="${height - pad}" stroke="#d7dee8" stroke-width="1.25"></line>
+          ${identitySegments}
+          ${circles}
+          <text x="${pad}" y="${height - 12}" fill="#6e7685" font-size="12" letter-spacing="0.08em">${xLabel}</text>
+          <text x="14" y="${pad - 10}" fill="#6e7685" font-size="12" letter-spacing="0.08em">${yLabel}</text>
+        </svg>
+      `;
     }
 
     function matrixRow(label, value, note) {
@@ -1026,8 +1120,10 @@
         matrixRow("Env Instances", formatInteger(summary.num_envs), "sampled hidden worlds currently represented in this artifact"),
         matrixRow("Total Windows", formatInteger(summary.num_windows), "probe windows pooled into those env-level beliefs"),
         matrixRow("Windows / Env", summary.window_count_mean.toFixed(1), "average number of probe windows contributing to one env belief"),
+        matrixRow("Support / Env", summary.support_count_mean.toFixed(1), "average number of windows actually used to build each env belief"),
+        matrixRow("Support Diversity", `${(100 * (summary.support_group_ratio_mean ?? 1)).toFixed(1)}%`, "share of support windows that come from distinct goal families rather than repeated copies of one experiment"),
         matrixRow("Env Param Mean Band", `${derived ? derived.envMeanMin.toFixed(3) : "n/a"} to ${derived ? derived.envMeanMax.toFixed(3) : "n/a"}`, "coarse span of hidden parameter settings covered by the aggregated env beliefs"),
-        matrixRow("Uncertainty Mean", summary.uncertainty_mean.toFixed(3), "average disagreement across small subset-built env beliefs and their decoded mechanics"),
+        matrixRow("Uncertainty Mean", summary.uncertainty_mean.toFixed(3), "average disagreement across disjoint small support halves and their decoded mechanics"),
         matrixRow("PCA Explained", summary.pca_explained.map((value) => value.toFixed(2)).join(" / "), "variance captured by the first two PCA axes"),
       ].join("");
 
@@ -1044,13 +1140,38 @@
         ),
         readoutRow(
           "Same-env Spread",
-          derived.sameEnvSpread.mean.toFixed(2),
-          "Average disagreement between env beliefs rebuilt from different small probe subsets of the same sampled world. Lower means a few probes already pin down a stable mechanics belief."
+          derived.sameEnvSpread.mean.toFixed(3),
+          "Average disagreement between env beliefs rebuilt from two disjoint small support halves of the same sampled world. Lower means a few probes already pin down a stable mechanics belief."
+        ),
+        readoutRow(
+          "Gap Ratio",
+          `${(100 * derived.sameEnvGapRatio.mean).toFixed(1)}%`,
+          "Average same-world split disagreement as a share of the nearest different-world latent distance. Lower is better: same worlds should be much closer than different worlds."
+        ),
+        readoutRow(
+          "Split Retrieval",
+          `${(100 * derived.splitRetrievalTop1).toFixed(1)}%`,
+          "Top-1 retrieval accuracy when one disjoint support half tries to identify its matching other half. Higher means local geometry is becoming more world-consistent."
+        ),
+        readoutRow(
+          "Split MRR",
+          derived.splitRetrievalMrr.toFixed(2),
+          "Mean reciprocal rank for split-half retrieval. Higher is better and usually more stable than top-1 alone."
         ),
         readoutRow(
           "Env Param Disagreement",
           derived.envParamUncertaintyMean.toFixed(3),
-          "Average decoded-mechanics spread across subset-built env beliefs. This is now the main uncertainty source, not the collapsed posterior std head."
+          "Average decoded-mechanics spread across disjoint support halves and leave-one-goal-out beliefs. This is now the main uncertainty source, not the collapsed posterior std head."
+        ),
+        readoutRow(
+          "Support Diversity",
+          `${(100 * derived.supportGroupRatioMean).toFixed(1)}%`,
+          "How much of the support set comes from distinct experiment families. Low values usually mean the scientist is repeating one comfortable probe instead of testing the world broadly."
+        ),
+        readoutRow(
+          "Uncert. vs Error",
+          `${derived.uncertaintyErrorAlignment.correlation.toFixed(2)} corr`,
+          "Correlation between env-level uncertainty and actual mechanics prediction error. Higher is better if uncertainty is honest."
         ),
         ...derived.perParamEnvFitR2.map((row) => readoutRow(
           `${row.name} R²`,
@@ -1066,18 +1187,24 @@
         "weak mechanics signal";
       const localConsistency =
         !derived ? "n/a" :
-        derived.neighborEnvAlignment > 0.45 ? "neighbors track mechanics well" :
+        derived.splitRetrievalTop1 > 0.70 ? "support halves retrieve cleanly" :
+        derived.splitRetrievalTop1 > 0.40 ? "support halves partly retrieve" :
         derived.neighborEnvAlignment > 0.20 ? "neighbors partially aligned" :
         "neighbors weakly aligned";
       const sameEnvSpread =
         !derived ? "n/a" :
-        derived.sameEnvSpread.mean < 0.25 ? "few probes already agree" :
-        derived.sameEnvSpread.mean < 0.50 ? "subset beliefs partially agree" :
+        derived.sameEnvGapRatio.mean < 0.12 ? "few probes already agree" :
+        derived.sameEnvGapRatio.mean < 0.25 ? "subset beliefs partially agree" :
         "subset beliefs still disagree";
+      const supportDiversity =
+        !derived ? "n/a" :
+        derived.supportGroupRatioMean > 0.85 ? "support is broadly covered" :
+        derived.supportGroupRatioMean > 0.60 ? "support is partly diverse" :
+        "support is too narrow";
       const uncertaintySignal =
         !derived ? "n/a" :
-        derived.failureLift.gap > 0.15 ? "uncertainty marks failure-prone regions" :
-        derived.failureLift.gap > 0.05 ? "uncertainty weakly tracks failures" :
+        derived.uncertaintyErrorAlignment.correlation > 0.45 ? "uncertainty tracks mechanics error" :
+        derived.uncertaintyErrorAlignment.correlation > 0.20 ? "uncertainty weakly tracks mechanics error" :
         "uncertainty mostly flat";
 
       el("latentGuide").innerHTML = derived ? [
@@ -1089,19 +1216,60 @@
         readoutRow(
           "Local Consistency",
           localConsistency,
-          `Nearest-neighbor alignment is ${(100 * derived.neighborEnvAlignment).toFixed(1)}%. If this stays low, the env-belief cloud may look structured while still failing to preserve the real similarity of worlds.`
+          `Nearest-neighbor alignment is ${(100 * derived.neighborEnvAlignment).toFixed(1)}%, and split retrieval is ${(100 * derived.splitRetrievalTop1).toFixed(1)}%. If both stay low, the env-belief cloud may look structured while still failing to preserve the real similarity of worlds.`
         ),
         readoutRow(
           "Same-env Agreement",
           sameEnvSpread,
-          `Dominant mode is ${derived.topModeName} at ${(100 * derived.topModeShare).toFixed(1)}%, but the more important number now is subset disagreement: ${derived.sameEnvSpread.mean.toFixed(2)} on average, ${derived.sameEnvSpread.p90.toFixed(2)} at the 90th percentile.`
+          `Dominant mode is ${derived.topModeName} at ${(100 * derived.topModeShare).toFixed(1)}%, but the more important numbers now are split disagreement ${derived.sameEnvSpread.mean.toFixed(3)} and gap ratio ${(100 * derived.sameEnvGapRatio.mean).toFixed(1)}% of nearest-between distance.`
+        ),
+        readoutRow(
+          "Support Coverage",
+          supportDiversity,
+          `Support diversity is ${(100 * derived.supportGroupRatioMean).toFixed(1)}%. If this is low, low same-env spread can be misleading because the belief was never forced to reconcile different experiment families.`
         ),
         readoutRow(
           "Uncertainty Usefulness",
           uncertaintySignal,
-          `Low-uncertainty env beliefs terminate at ${(100 * derived.failureLift.low_rate).toFixed(1)}%, while high-uncertainty env beliefs terminate at ${(100 * derived.failureLift.high_rate).toFixed(1)}%. This checks whether env-level disagreement is actually pointing toward brittle regimes.`
+          `Low-uncertainty env beliefs have mechanics error ${derived.uncertaintyErrorAlignment.low_error.toFixed(3)}, while high-uncertainty beliefs have ${derived.uncertaintyErrorAlignment.high_error.toFixed(3)}. This is the main check on whether uncertainty is honest instead of decorative.`
         ),
       ].join("") : `<div class="empty">No latent interpretation is available yet.</div>`;
+
+      const featureRows = derived?.uncertaintyFeatureImportance || [];
+      el("uncertaintyFeatureWrap").innerHTML = featureRows.length ? featureRows.map((row) => readoutRow(
+        row.name.replace(/_/g, " "),
+        `${(100 * Number(row.weight)).toFixed(1)}%`,
+        "Share of the monotone uncertainty head's learned positive weight budget."
+      )).join("") : `<div class="empty">No learned uncertainty feature weights are available yet.</div>`;
+
+      const sortedByGap = [...payload.points].sort((left, right) => Number(right.gap_ratio) - Number(left.gap_ratio));
+      const sortedByError = [...payload.points].sort((left, right) => Number(right.env_error) - Number(left.env_error));
+      const sortedByUncertainty = [...payload.points].sort((left, right) => Number(right.uncertainty) - Number(left.uncertainty));
+      const topGap = sortedByGap[0];
+      const topError = sortedByError[0];
+      const topUncertainty = sortedByUncertainty[0];
+      el("outlierGuideWrap").innerHTML = derived ? [
+        readoutRow(
+          "Worst Gap Ratio",
+          topGap ? `${(100 * topGap.gap_ratio).toFixed(1)}%` : "n/a",
+          "Highest same-world split disagreement as a share of nearest different-world distance. This is the sharpest local-geometry failure case."
+        ),
+        readoutRow(
+          "Worst Mechanics Error",
+          topError ? topError.env_error.toFixed(3) : "n/a",
+          "Largest env-parameter prediction error among saved env beliefs. Useful for finding brittle worlds even when median fit looks good."
+        ),
+        readoutRow(
+          "Highest Uncertainty",
+          topUncertainty ? topUncertainty.uncertainty.toFixed(3) : "n/a",
+          "Largest env-level uncertainty score. Compare this to the worst-error case to see whether uncertainty is actually pointing at the right worlds."
+        ),
+        readoutRow(
+          "Median Nearest-Between Distance",
+          quantile(payload.points.map((point) => Number(point.nearest_between_distance)), 0.50).toFixed(3),
+          "Typical distance to the nearest different-world belief. This gives context for whether same-world split gaps are truly small."
+        ),
+      ].join("") : `<div class="empty">No outlier readout is available yet.</div>`;
 
       const metric = el("colorSelect").value;
       const points = normalizeMetric(payload.points, metric);
@@ -1110,6 +1278,10 @@
         el("latentLegend").innerHTML = "";
         el("modeTableWrap").innerHTML = `<div class="empty">No probe-mode summary is available yet.</div>`;
         el("latentGuide").innerHTML = `<div class="empty">No latent interpretation is available yet.</div>`;
+        el("uncertaintyErrorPlotWrap").innerHTML = `<div class="empty">No uncertainty/error diagnostic points are available yet.</div>`;
+        el("gapRatioPlotWrap").innerHTML = `<div class="empty">No same-world gap diagnostics are available yet.</div>`;
+        el("uncertaintyFeatureWrap").innerHTML = `<div class="empty">No learned uncertainty feature weights are available yet.</div>`;
+        el("outlierGuideWrap").innerHTML = `<div class="empty">No outlier readout is available yet.</div>`;
         return;
       }
 
@@ -1171,12 +1343,35 @@
               ? "Darker blue points indicate larger average probe reward across the env belief's windows."
               : metric === "env_param_mean"
                 ? "Darker teal points indicate larger hidden-parameter mean across the env-parameter vector."
-                : metric === "same_env_spread"
-                  ? "Darker indigo points indicate larger disagreement between window latents inside one env instance."
-                  : "Darker indigo points indicate larger ensemble disagreement over hidden env parameters."
+                : metric === "env_error"
+                  ? "Darker indigo points indicate larger hidden-mechanics prediction error for the env belief."
+                  : metric === "gap_ratio"
+                  ? "Darker indigo points indicate same-world split halves that are too far apart relative to nearby different worlds."
+                    : metric === "split_retrieval_margin_deficit"
+                      ? "Darker indigo points indicate worlds whose two disjoint support halves still look too much like other worlds."
+                  : metric === "same_env_spread"
+                    ? "Darker indigo points indicate larger disagreement between env beliefs rebuilt from two disjoint support halves."
+                    : "Darker indigo points indicate larger ensemble disagreement over hidden env parameters."
           }</span>
         `;
       }
+
+      el("uncertaintyErrorPlotWrap").innerHTML = scatterShellSvg(
+        payload.points,
+        "uncertainty",
+        "env_error",
+        "UNCERTAINTY",
+        "MECHANICS ERROR",
+        "gap_ratio",
+      );
+      el("gapRatioPlotWrap").innerHTML = scatterShellSvg(
+        payload.points,
+        "same_env_spread",
+        "nearest_between_distance",
+        "SAME-WORLD GAP",
+        "NEAREST DIFFERENT-WORLD",
+        "env_error",
+      );
 
       const totalModeCount = payload.mode_counts.reduce((sum, row) => sum + row.count, 0);
       const sortedModes = [...payload.mode_counts];
@@ -1288,6 +1483,10 @@
         el("latentLegend").innerHTML = "";
         el("modeTableWrap").innerHTML = `<div class="empty">No probe-mode summary is available yet.</div>`;
         el("latentGuide").innerHTML = `<div class="empty">No latent interpretation is available yet.</div>`;
+        el("uncertaintyErrorPlotWrap").innerHTML = `<div class="empty">No uncertainty/error diagnostic points are available yet.</div>`;
+        el("gapRatioPlotWrap").innerHTML = `<div class="empty">No same-world gap diagnostics are available yet.</div>`;
+        el("uncertaintyFeatureWrap").innerHTML = `<div class="empty">No learned uncertainty feature weights are available yet.</div>`;
+        el("outlierGuideWrap").innerHTML = `<div class="empty">No outlier readout is available yet.</div>`;
         return;
       }
       renderLatent(await fetchJson(`/api/latent/${encodeURIComponent(name)}`));

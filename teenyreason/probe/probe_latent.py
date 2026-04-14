@@ -17,6 +17,7 @@ import torch
 
 from ..envs import action_index_to_env_action
 from .probe_data import ProbePolicy, apply_env_params, sample_env_params
+from .cartpole_scientist import build_probe_planner
 from ..models.env_belief import (
     EnvBeliefAggregator,
     EnvParamPredictorEnsemble,
@@ -25,12 +26,42 @@ from ..models.env_belief import (
 from ..representation import DeltaPredictorEnsemble, WorldEncoder
 
 
+def sanitize_array(
+    values: np.ndarray,
+    *,
+    nan: float = 0.0,
+    posinf: float = 0.0,
+    neginf: float = 0.0,
+) -> np.ndarray:
+    """Replace non-finite values in a NumPy array and keep float32 semantics."""
+    return np.nan_to_num(
+        np.asarray(values, dtype=np.float32),
+        nan=nan,
+        posinf=posinf,
+        neginf=neginf,
+    ).astype(np.float32)
+
+
+def sanitize_belief_vector(belief: np.ndarray) -> np.ndarray:
+    """Keep belief vectors finite and keep the uncertainty half non-negative."""
+    belief_np = sanitize_array(belief, nan=0.0, posinf=0.0, neginf=0.0).reshape(-1)
+    if belief_np.size == 0:
+        return belief_np
+    half = belief_np.shape[0] // 2
+    if half <= 0:
+        return belief_np
+    mean = sanitize_array(belief_np[:half], nan=0.0, posinf=0.0, neginf=0.0)
+    spread = sanitize_array(belief_np[half:], nan=0.0, posinf=1.0, neginf=0.0)
+    spread = np.clip(spread, 1e-4, 5.0).astype(np.float32)
+    return np.concatenate([mean, spread], axis=0).astype(np.float32)
+
+
 def normalize_latent(latent: np.ndarray) -> np.ndarray:
     """Normalize a latent to unit length unless it is effectively zero."""
-    latent_np = np.asarray(latent, dtype=np.float32)
+    latent_np = sanitize_array(latent, nan=0.0, posinf=0.0, neginf=0.0)
     norm = float(np.linalg.norm(latent_np))
-    if norm <= 1e-6:
-        return latent_np
+    if not np.isfinite(norm) or norm <= 1e-6:
+        return np.zeros_like(latent_np, dtype=np.float32)
     # Most downstream comparisons treat latent direction as the meaningful signal.
     return (latent_np / norm).astype(np.float32)
 
@@ -161,26 +192,35 @@ def aggregate_env_belief(
         window_means=window_means,
         window_logvars=window_logvars,
     )
+    payload["belief"] = sanitize_belief_vector(payload["belief"])
+    payload["env_mean"] = sanitize_array(payload["env_mean"])
+    payload["env_logvar"] = sanitize_array(payload["env_logvar"])
+    payload["view_spread"] = sanitize_array(payload["view_spread"], nan=0.0, posinf=1.0, neginf=0.0)
+    payload["env_param_mean"] = sanitize_array(payload["env_param_mean"])
+    payload["env_param_std"] = sanitize_array(payload["env_param_std"], nan=0.0, posinf=1.0, neginf=0.0)
     return payload["belief"], payload
 
 
 def belief_mean_z(belief: np.ndarray) -> np.ndarray:
     """Extract the mean-latent half of a belief vector."""
-    half = belief.shape[0] // 2
-    return np.asarray(belief[:half], dtype=np.float32)
+    belief_np = sanitize_belief_vector(belief)
+    half = belief_np.shape[0] // 2
+    return np.asarray(belief_np[:half], dtype=np.float32)
 
 
 def belief_uncertainty(belief: np.ndarray) -> float:
     """Collapse the spread half of the belief into one scalar uncertainty."""
-    half = belief.shape[0] // 2
-    spread = np.asarray(belief[half:], dtype=np.float32)
+    belief_np = sanitize_belief_vector(belief)
+    half = belief_np.shape[0] // 2
+    spread = np.asarray(belief_np[half:], dtype=np.float32)
     return float(np.mean(spread))
 
 
 def belief_posterior_std(belief: np.ndarray) -> np.ndarray:
     """Extract the posterior-std portion of a posterior-style belief vector."""
-    half = belief.shape[0] // 2
-    return np.asarray(belief[half:], dtype=np.float32)
+    belief_np = sanitize_belief_vector(belief)
+    half = belief_np.shape[0] // 2
+    return np.asarray(belief_np[half:], dtype=np.float32)
 
 
 def belief_epistemic_std(belief: np.ndarray) -> np.ndarray:
@@ -233,6 +273,13 @@ def init_recurrent_belief_hidden(
     return encoder.init_hidden(batch_size=1, device=device)
 
 
+def clone_recurrent_belief_hidden(belief_hidden: torch.Tensor | None) -> torch.Tensor | None:
+    """Clone a recurrent hidden state so probe planning can branch safely."""
+    if belief_hidden is None:
+        return None
+    return belief_hidden.detach().clone()
+
+
 def update_recurrent_belief_from_transition(
     encoder: WorldEncoder,
     device: torch.device,
@@ -261,6 +308,8 @@ def update_recurrent_belief_from_transition(
 
     mean = mean_t.squeeze(0).cpu().numpy().astype(np.float32)
     logvar = logvar_t.squeeze(0).cpu().numpy().astype(np.float32)
+    mean = sanitize_array(mean, nan=0.0, posinf=0.0, neginf=0.0)
+    logvar = sanitize_array(logvar, nan=0.0, posinf=2.0, neginf=-5.0)
     if prior_belief is None:
         belief = build_belief_vector([(mean, logvar)])
     else:
@@ -270,7 +319,7 @@ def update_recurrent_belief_from_transition(
             new_logvar=logvar,
             alpha=alpha,
         )
-    return belief, belief_hidden, (mean, logvar)
+    return sanitize_belief_vector(belief), belief_hidden, (mean, logvar)
 
 
 def update_recurrent_belief_from_window(
@@ -412,6 +461,7 @@ def score_probe_actions(
     belief_hidden: torch.Tensor | None,
     action_vocab_size: int,
     recent_actions: list[int],
+    action_prior_scores: np.ndarray | None = None,
 ) -> np.ndarray:
     """Score candidate probe actions by disagreement, novelty, and posterior shrinkage."""
     base_scores = np.zeros(action_vocab_size, dtype=np.float32)
@@ -459,7 +509,50 @@ def score_probe_actions(
 
     counts = np.bincount(recent_actions, minlength=action_vocab_size).astype(np.float32)
     novelty_bonus = 1.0 / (1.0 + counts)
-    return base_scores + 0.10 * novelty_bonus
+    total_scores = base_scores + 0.10 * novelty_bonus
+    if action_prior_scores is not None:
+        prior_scores = np.asarray(action_prior_scores, dtype=np.float32).reshape(-1)
+        if prior_scores.shape[0] != action_vocab_size:
+            raise ValueError("Action prior scores must match the action vocabulary size")
+        total_scores += 0.45 * (prior_scores - float(np.mean(prior_scores)))
+    return np.nan_to_num(
+        total_scores.astype(np.float32),
+        nan=-1.0,
+        posinf=5.0,
+        neginf=-5.0,
+    )
+
+
+def safe_choice_weights(
+    scores: np.ndarray,
+    temperature: float,
+    fallback_scores: np.ndarray | None = None,
+) -> np.ndarray:
+    """Convert scores into a stable sampling distribution with sane fallbacks."""
+    safe_scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+    safe_scores = np.nan_to_num(safe_scores, nan=-1.0, posinf=5.0, neginf=-5.0)
+
+    if fallback_scores is not None:
+        fallback_scores = np.asarray(fallback_scores, dtype=np.float32).reshape(-1)
+        fallback_scores = np.nan_to_num(fallback_scores, nan=0.0, posinf=1.0, neginf=-1.0)
+    else:
+        fallback_scores = None
+
+    logits = safe_scores - float(np.max(safe_scores))
+    weights = np.exp(logits / max(float(temperature), 1e-3)).astype(np.float32)
+    weight_sum = float(np.sum(weights))
+    if np.isfinite(weight_sum) and weight_sum > 1e-6:
+        return weights / weight_sum
+
+    if fallback_scores is not None and fallback_scores.shape == safe_scores.shape:
+        fallback_logits = fallback_scores - float(np.max(fallback_scores))
+        fallback_weights = np.exp(fallback_logits / 0.35).astype(np.float32)
+        fallback_sum = float(np.sum(fallback_weights))
+        if np.isfinite(fallback_sum) and fallback_sum > 1e-6:
+            return fallback_weights / fallback_sum
+
+    uniform = np.ones_like(safe_scores, dtype=np.float32)
+    return uniform / float(max(uniform.shape[0], 1))
 
 
 def _score_second_probe_step(
@@ -526,10 +619,15 @@ def choose_active_probe_action(
     belief_hidden: torch.Tensor | None,
     action_vocab_size: int,
     recent_actions: list[int],
+    action_prior_scores: np.ndarray | None = None,
 ) -> int:
     """Choose an exploratory action using disagreement and a little randomness."""
     if belief is None or len(recent_actions) < 2 or predictor is None or belief_hidden is None:
-        return int(rng.integers(0, action_vocab_size))
+        if action_prior_scores is None:
+            return int(rng.integers(0, action_vocab_size))
+        prior = np.asarray(action_prior_scores, dtype=np.float32).reshape(-1)
+        weights = safe_choice_weights(prior, temperature=0.35)
+        return int(rng.choice(np.arange(action_vocab_size), p=weights))
 
     scores = score_probe_actions(
         encoder=encoder,
@@ -540,11 +638,14 @@ def choose_active_probe_action(
         belief_hidden=belief_hidden,
         action_vocab_size=action_vocab_size,
         recent_actions=recent_actions,
+        action_prior_scores=action_prior_scores,
     )
     temperature = 0.35
-    logits = scores - np.max(scores)
-    weights = np.exp(logits / max(temperature, 1e-3))
-    weights = weights / np.clip(np.sum(weights), 1e-6, None)
+    weights = safe_choice_weights(
+        scores,
+        temperature=temperature,
+        fallback_scores=action_prior_scores,
+    )
     return int(rng.choice(np.arange(action_vocab_size), p=weights))
 
 
@@ -557,25 +658,38 @@ def collect_adaptive_probe_window(
     window_size: int,
     episode_physics,
     action_values: np.ndarray,
+    env_name: str | None = None,
     prior_belief: np.ndarray | None = None,
+    prior_hidden: torch.Tensor | None = None,
+    planner=None,
     max_probe_retries: int = 12,
 ):
     """Collect one probe window using disagreement-driven active actions."""
-    del prior_belief
     action_vocab_size = int(len(action_values))
     steps_used = 0
+    local_planner = planner
+    if local_planner is None and env_name is not None:
+        local_planner = build_probe_planner(env_name=env_name, action_values=action_values, rng=rng)
+
     for _ in range(max_probe_retries):
         apply_env_params(env, episode_physics)
         state, _info = env.reset()
         states = [np.asarray(state, dtype=np.float32)]
         actions: list[int] = []
         rewards: list[float] = []
-        current_belief = None
-        current_hidden = init_recurrent_belief_hidden(encoder=encoder, device=device)
+        current_belief = None if prior_belief is None else np.asarray(prior_belief, dtype=np.float32).copy()
+        current_hidden = clone_recurrent_belief_hidden(prior_hidden)
+        if current_hidden is None:
+            current_hidden = init_recurrent_belief_hidden(encoder=encoder, device=device)
+        if local_planner is not None:
+            local_planner.begin_rollout()
         done = False
 
         for step_idx in range(window_size):
             del step_idx
+            action_prior_scores = None
+            if local_planner is not None:
+                action_prior_scores = local_planner.action_prior_scores(states[-1], actions)
             action_idx = choose_active_probe_action(
                 encoder=encoder,
                 predictor=predictor,
@@ -586,6 +700,7 @@ def collect_adaptive_probe_window(
                 belief_hidden=current_hidden,
                 action_vocab_size=action_vocab_size,
                 recent_actions=actions,
+                action_prior_scores=action_prior_scores,
             )
             env_action = action_index_to_env_action(action_idx, action_values)
             next_state, reward, terminated, truncated, _info = env.step(env_action)
@@ -593,6 +708,14 @@ def collect_adaptive_probe_window(
             states.append(np.asarray(next_state, dtype=np.float32))
             actions.append(int(action_idx))
             rewards.append(float(reward))
+            if local_planner is not None:
+                local_planner.observe_transition(
+                    prev_state=np.asarray(states[-2], dtype=np.float32),
+                    action_idx=int(action_idx),
+                    next_state=np.asarray(states[-1], dtype=np.float32),
+                    terminated=bool(terminated),
+                    truncated=bool(truncated),
+                )
             done = bool(terminated or truncated)
             if done:
                 break
@@ -682,7 +805,7 @@ def maybe_update_online_belief(
         (1.0 - online_z_update_alpha) * np.asarray(belief, dtype=np.float32)
         + online_z_update_alpha * aggregated_belief
     ).astype(np.float32)
-    return blended_belief, next_hidden, updated_posteriors
+    return sanitize_belief_vector(blended_belief), next_hidden, updated_posteriors
 
 
 def choose_probe_count(
@@ -693,7 +816,7 @@ def choose_probe_count(
     novelty_probe_threshold: float,
     low_return_probe_threshold: float,
 ) -> tuple[int, float, float]:
-    """Decide how many scripted probes to run before the control episode."""
+    """Decide how many probe windows to run before the control episode."""
     novelty = performance_memory.novelty(z)
     expected_return = performance_memory.expected_return(z)
     probe_count = base_probe_episodes

@@ -8,6 +8,7 @@ import torch
 
 from ..envs import get_action_values, make_env
 from ..models.env_belief import EnvBeliefAggregator, EnvParamPredictorEnsemble
+from ..probe.cartpole_scientist import build_probe_planner
 from ..rl.ppo_core import (
     ProbeConditionedGaussianActorCritic,
     RunningNormalizer,
@@ -70,7 +71,7 @@ def main():
         "--probe-count",
         type=int,
         default=None,
-        help="Override how many scripted probes to run before each rendered episode.",
+        help="Override how many probe windows to run before each rendered episode.",
     )
     parser.add_argument(
         "--use-final-policy",
@@ -210,6 +211,9 @@ def main():
         belief = None
         belief_hidden = init_recurrent_belief_hidden(encoder=encoder, device=device)
         belief_posteriors: list[tuple[np.ndarray, np.ndarray]] = []
+        probe_planner = build_probe_planner(env_name=env_name, action_values=action_values, rng=rng)
+        if probe_planner is not None:
+            probe_planner.begin_env_instance()
         for _ in range(probe_count):
             window_states, window_actions, window_rewards, probe_failed, _probe_steps_used = collect_adaptive_probe_window(
                 env=probe_env,
@@ -220,7 +224,10 @@ def main():
                 window_size=window_size,
                 episode_physics=episode_physics,
                 action_values=action_values,
+                env_name=env_name,
                 prior_belief=belief,
+                prior_hidden=belief_hidden,
+                planner=probe_planner,
             )
             if probe_failed:
                 raise RuntimeError("Could not collect a full probe window for playback.")

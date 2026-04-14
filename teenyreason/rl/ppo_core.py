@@ -36,6 +36,28 @@ def init_linear(layer: nn.Linear, gain: float, bias: float = 0.0) -> nn.Linear:
     return layer
 
 
+def sanitize_numpy(values: np.ndarray, fill_value: float = 0.0) -> np.ndarray:
+    """Keep rollout arrays finite before they are converted back into tensors."""
+    return np.nan_to_num(
+        np.asarray(values, dtype=np.float32),
+        nan=fill_value,
+        posinf=fill_value,
+        neginf=fill_value,
+    ).astype(np.float32)
+
+
+def sanitize_tensor(values: torch.Tensor, fill_value: float = 0.0) -> torch.Tensor:
+    """Replace non-finite tensor values with a harmless finite fallback."""
+    if torch.isfinite(values).all():
+        return values
+    return torch.nan_to_num(
+        values,
+        nan=fill_value,
+        posinf=fill_value,
+        neginf=fill_value,
+    )
+
+
 class RunningNormalizer:
     """Online mean/variance tracker for observations or rewards."""
     def __init__(self, shape, clip: float = 5.0, epsilon: float = 1e-4):
@@ -97,9 +119,10 @@ class PlainGaussianActorCritic(nn.Module):
         self.log_std = nn.Parameter(torch.full((action_dim,), -1.5))
 
     def forward(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        features = self.trunk(state)
-        mean = self.actor_mean(features)
-        value = self.value_head(features).squeeze(-1)
+        state = sanitize_tensor(state)
+        features = sanitize_tensor(self.trunk(state))
+        mean = sanitize_tensor(self.actor_mean(features))
+        value = sanitize_tensor(self.value_head(features).squeeze(-1))
         return mean, value
 
 
@@ -160,30 +183,38 @@ class ProbeConditionedGaussianActorCritic(nn.Module):
         beta_layer: nn.Linear,
         belief: torch.Tensor,
     ) -> torch.Tensor:
-        gamma = torch.tanh(gamma_layer(belief))
-        beta = torch.tanh(beta_layer(belief))
-        return torch.tanh(features * (1.0 + 0.75 * gamma) + 0.75 * beta)
+        features = sanitize_tensor(features)
+        belief = sanitize_tensor(belief)
+        gamma = torch.tanh(sanitize_tensor(gamma_layer(belief)))
+        beta = torch.tanh(sanitize_tensor(beta_layer(belief)))
+        return sanitize_tensor(torch.tanh(features * (1.0 + 0.75 * gamma) + 0.75 * beta))
 
     def forward(self, state: torch.Tensor, belief: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Predict action mean and value under the current state/belief."""
-        actor_features = torch.tanh(self.actor_state_in(state))
+        state = sanitize_tensor(state)
+        belief = sanitize_tensor(belief)
+        actor_features = torch.tanh(sanitize_tensor(self.actor_state_in(state)))
         actor_features = self.apply_film(actor_features, self.actor_gamma_1, self.actor_beta_1, belief)
-        actor_features = torch.tanh(self.actor_state_hidden(actor_features))
+        actor_features = torch.tanh(sanitize_tensor(self.actor_state_hidden(actor_features)))
         actor_features = self.apply_film(actor_features, self.actor_gamma_2, self.actor_beta_2, belief)
-        actor_context = self.actor_belief_proj(belief)
-        actor_residual = self.actor_residual_mean(torch.cat([actor_features, actor_context], dim=-1))
-        actor_prior = self.actor_belief_prior(belief)
-        actor_gate = torch.sigmoid(self.actor_belief_gate(belief))
-        mean = actor_residual + actor_gate * actor_prior
+        actor_context = sanitize_tensor(self.actor_belief_proj(belief))
+        actor_residual = sanitize_tensor(
+            self.actor_residual_mean(torch.cat([actor_features, actor_context], dim=-1))
+        )
+        actor_prior = sanitize_tensor(self.actor_belief_prior(belief))
+        actor_gate = torch.sigmoid(sanitize_tensor(self.actor_belief_gate(belief)))
+        mean = sanitize_tensor(actor_residual + actor_gate * actor_prior)
 
-        value_features = torch.tanh(self.value_state_in(state))
+        value_features = torch.tanh(sanitize_tensor(self.value_state_in(state)))
         value_features = self.apply_film(value_features, self.value_gamma_1, self.value_beta_1, belief)
-        value_features = torch.tanh(self.value_state_hidden(value_features))
+        value_features = torch.tanh(sanitize_tensor(self.value_state_hidden(value_features)))
         value_features = self.apply_film(value_features, self.value_gamma_2, self.value_beta_2, belief)
-        value_context = self.value_belief_proj(belief)
-        value_residual = self.value_residual_head(torch.cat([value_features, value_context], dim=-1)).squeeze(-1)
-        value_prior = self.value_belief_prior(belief).squeeze(-1)
-        value = value_residual + value_prior
+        value_context = sanitize_tensor(self.value_belief_proj(belief))
+        value_residual = sanitize_tensor(
+            self.value_residual_head(torch.cat([value_features, value_context], dim=-1)).squeeze(-1)
+        )
+        value_prior = sanitize_tensor(self.value_belief_prior(belief).squeeze(-1))
+        value = sanitize_tensor(value_residual + value_prior)
         return mean, value
 
 
@@ -217,7 +248,10 @@ def action_scale_bias(
 
 def build_tanh_normal(mean: torch.Tensor, log_std: torch.Tensor) -> Normal:
     """Build the unsquashed Gaussian used before tanh action squashing."""
+    mean = sanitize_tensor(mean)
+    log_std = sanitize_tensor(log_std, fill_value=-1.5)
     std = torch.exp(torch.clamp(log_std, -5.0, 1.0))
+    std = sanitize_tensor(std, fill_value=float(np.exp(-1.5)))
     return Normal(mean, std)
 
 
@@ -235,7 +269,7 @@ def sample_continuous_action(
     action = bias + scale * squashed_action
     log_prob = dist.log_prob(raw_action) - torch.log(scale * (1.0 - squashed_action.pow(2)) + 1e-6)
     return (
-        action.squeeze(0).detach().cpu().numpy().astype(np.float32),
+        sanitize_numpy(action.squeeze(0).detach().cpu().numpy()),
         float(log_prob.sum(dim=-1).item()),
     )
 
@@ -246,10 +280,11 @@ def mean_to_continuous_action(
     action_high: np.ndarray,
 ) -> np.ndarray:
     """Convert the policy mean into a deterministic bounded environment action."""
+    mean = sanitize_tensor(mean)
     squashed_mean = torch.tanh(mean)
     scale, bias = action_scale_bias(action_low, action_high, mean.device)
     action = bias + scale * squashed_mean
-    return action.squeeze(0).detach().cpu().numpy().astype(np.float32)
+    return sanitize_numpy(action.squeeze(0).detach().cpu().numpy())
 
 
 def evaluate_continuous_actions(
@@ -262,10 +297,11 @@ def evaluate_continuous_actions(
     """Compute log-prob and entropy for already-sampled bounded actions."""
     dist = build_tanh_normal(mean, log_std)
     scale, bias = action_scale_bias(action_low, action_high, mean.device)
+    actions = sanitize_tensor(actions)
     normalized_action = torch.clamp((actions - bias) / scale, -0.999, 0.999)
     raw_action = atanh(normalized_action)
     log_prob = dist.log_prob(raw_action) - torch.log(scale * (1.0 - normalized_action.pow(2)) + 1e-6)
-    return log_prob.sum(dim=-1), dist.entropy().sum(dim=-1)
+    return sanitize_tensor(log_prob.sum(dim=-1)), sanitize_tensor(dist.entropy().sum(dim=-1))
 
 
 def compute_gae(
@@ -360,15 +396,15 @@ def update_ppo_policy(
 ):
     """Run one PPO optimization phase over a collected batch."""
     device = next(model.parameters()).device
-    states = torch.tensor(batch.states, dtype=torch.float32, device=device)
-    actions = torch.tensor(batch.actions, dtype=torch.float32, device=device)
-    old_log_probs = torch.tensor(batch.old_log_probs, dtype=torch.float32, device=device)
-    returns = torch.tensor(batch.returns, dtype=torch.float32, device=device)
-    advantages = torch.tensor(batch.advantages, dtype=torch.float32, device=device)
+    states = torch.tensor(sanitize_numpy(batch.states), dtype=torch.float32, device=device)
+    actions = torch.tensor(sanitize_numpy(batch.actions), dtype=torch.float32, device=device)
+    old_log_probs = torch.tensor(sanitize_numpy(batch.old_log_probs), dtype=torch.float32, device=device)
+    returns = torch.tensor(sanitize_numpy(batch.returns), dtype=torch.float32, device=device)
+    advantages = torch.tensor(sanitize_numpy(batch.advantages), dtype=torch.float32, device=device)
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-6)
     beliefs = None
     if batch.beliefs is not None:
-        beliefs = torch.tensor(batch.beliefs, dtype=torch.float32, device=device)
+        beliefs = torch.tensor(sanitize_numpy(batch.beliefs), dtype=torch.float32, device=device)
 
     total_steps = states.shape[0]
     minibatch_size = min(minibatch_size, total_steps)
@@ -409,12 +445,15 @@ def update_ppo_policy(
             if auxiliary_loss_fn is not None:
                 loss = loss + auxiliary_loss_fn()
 
+            if not torch.isfinite(loss):
+                continue
+
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
 
-            approx_kl = float((batch_old_log_probs - new_log_prob).mean().item())
+            approx_kl = float(sanitize_tensor((batch_old_log_probs - new_log_prob).mean()).item())
             if approx_kl > 1.5 * target_kl:
                 stop_early = True
                 break

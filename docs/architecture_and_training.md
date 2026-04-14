@@ -226,6 +226,181 @@ The intended data flow is:
 
 That flow should stay easy to explain in one whiteboard sketch.
 
+## Numerical Hygiene Is Part Of The Design
+
+This repo should treat numerical stability as part of the scientist-belief
+architecture, not as a separate cleanup task.
+
+Why:
+
+- a single non-finite belief can poison the controller and make the crawler
+  look broken for the wrong reason
+- collapsed uncertainty can masquerade as confidence if non-finite values are
+  quietly zeroed too late
+- long probe-conditioned PPO runs magnify small stability mistakes
+
+The current intended rule is:
+
+- sanitize state, belief, and action tensors at module boundaries
+- keep Gaussian policy construction finite even if one rollout gets corrupted
+- skip poisoned PPO minibatches rather than pushing non-finite gradients
+- clip encoder and controller gradients before optimizer steps
+- prefer calmer encoder learning rates on small CartPole-style probe datasets
+- treat repeated NaN guarding as a symptom to investigate, not as proof the
+  belief is healthy
+
+This means numerical guards are allowed and required in:
+
+- belief aggregation
+- online belief updates
+- controller input construction
+- Gaussian action sampling
+- PPO loss/update code
+
+These guards should preserve training continuity, but they should not become an
+excuse to ignore deeper representation failures.
+
+## Current CartPole Scientist Design
+
+For `ContinuousCartPole`, the crawler should be understood as a small
+experiment schedule, not a free-running probe script.
+
+The current intended offline support schedule is:
+
+1. `passive_decay`
+2. `impulse_left`
+3. `impulse_right`
+4. `chirp`
+5. `boundary_push`
+6. `cart_brake`
+
+Why this schedule exists:
+
+- `passive_decay` reveals natural drift and passive stability
+- `impulse_left/right` reveal actuation scale and directional response
+- `chirp` reveals alternating-frequency response
+- `boundary_push` reveals behavior near failure boundaries
+- `cart_brake` reveals cart inertia and braking / recovery behavior
+
+Important:
+
+- `counter_balance` is still a useful online behavior, but it should not be
+  the dominant offline scientist experiment
+- if one experiment family dominates the support set, low same-env spread can
+  become misleading
+
+The practical rule is:
+
+- each sampled CartPole world should be identified from a small, diverse set of
+  named experiments, not from many nearly interchangeable windows
+
+## Current CartPole Belief Budget
+
+The intended CartPole belief budget is deliberately small.
+
+The current target is:
+
+- about one saved window per named experiment rollout
+- roughly `6` windows available per environment instance
+- only `4` support windows actually used to build the canonical env belief
+- diagnostics should prefer two disjoint support halves rather than overlapping
+  random subsets
+- leave-one-goal-out ablations remain important as a second stability check
+
+This matters because the repo is explicitly trying to answer:
+
+- can a small number of informative experiments pin down the world?
+
+It is not trying to answer:
+
+- can a large pile of windows be averaged into a decent env code?
+
+## Current Uncertainty Definition
+
+For CartPole, env-level uncertainty should now mean:
+
+- how much the belief changes when rebuilt from a smaller support set
+- how much decoded mechanics change when rebuilt from a smaller support set
+- how much the belief changes when one experiment family is removed from the
+  support set
+- how narrow or diverse the support set is
+
+The current uncertainty object should not be interpreted as:
+
+- posterior variance from one window encoder
+- a generic latent spread term
+- confidence in a PCA plot
+
+In practice, the intended uncertainty now combines:
+
+- ensemble disagreement in mechanics decoding from the canonical support belief
+- disagreement between two disjoint small support halves
+- leave-one-goal-out belief shift
+- leave-one-goal-out mechanics shift
+- mean view spread inside the selected support set
+- a support-diversity penalty when the support set repeats one goal family too
+  heavily
+
+Important nuance:
+
+- local-geometry diagnostics such as split retrieval and gap ratio are crucial
+  research metrics
+- but they should not automatically dominate the uncertainty object if they are
+  not actually tracking mechanics prediction error in a given run
+
+The preferred implementation is now:
+
+- build these disagreement features explicitly
+- map them through a small learned monotone uncertainty head so larger
+  disagreement features cannot directly reduce the reported uncertainty
+- train that head against actual mechanics error and support-ambiguity targets
+- seed the head with a mechanics-first prior so decoder and leave-one-goal-out
+  signals matter more than decorative geometry by default
+
+That is better than a fully hand-written uncertainty scalar because it lets the
+repo learn which disagreement signals really matter without pretending the
+uncertainty object is "just posterior variance."
+
+The intended direct calibration target is:
+
+- higher uncertainty when actual env-parameter prediction error is higher
+- lower uncertainty when disjoint support halves and leave-one-goal-out beliefs
+  agree cleanly
+
+The intended local-geometry check is:
+
+- can one disjoint support half retrieve its matching other half?
+- does the matching half beat hard negatives that are mechanics-similar but not
+  identical?
+- is same-world split disagreement still small after normalizing by nearest
+  different-world distance?
+- if not, the env belief may be decodable globally while still failing as a
+  reusable local mechanics space
+
+The dashboard should now make these failure modes visible directly:
+
+- uncertainty vs actual mechanics-error scatter
+- same-world gap vs nearest-between distance scatter
+- learned uncertainty-feature weights
+- outlier readouts for worst geometry, worst error, and highest uncertainty
+
+## Current CartPole Failure Modes To Watch
+
+Even after the recent rewrite, these are still the main failure modes:
+
+- `passive_decay` or another single goal family dominates the support set
+- same-env spread looks great only because support diversity is poor
+- uncertainty collapses toward zero while mechanics error remains non-trivial
+- mechanics fit improves globally but nearest-neighbor alignment stays weak
+
+If one of those happens, the right fix is usually in:
+
+- crawler goal scheduling
+- support-set construction
+- leave-one-goal-out diagnostics
+
+not in PPO tuning.
+
 ## The Training Stages
 
 The intended training stages are:

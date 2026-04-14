@@ -150,6 +150,23 @@ Typical symptoms:
 - poor calibration
 - no meaningful error tracking
 
+### 4a. Numerical Collapse Masquerading As Confidence
+
+The belief or controller path can become numerically unhealthy before the
+dashboard makes that obvious.
+
+Typical symptoms:
+
+- `NaN` or `inf` in the policy mean, belief vector, or PPO loss
+- zero or near-zero uncertainty after aggressive sanitization
+- a run that looks "confident" only because bad values were flattened away
+
+The practical rule:
+
+- add finite-value guards where tensors cross subsystem boundaries
+- keep training alive when one rollout goes bad
+- do not mistake a finite fallback path for evidence that the belief is honest
+
 ### 5. Controller Compensation
 
 The controller benefits even though the belief is weak.
@@ -177,10 +194,19 @@ Typical symptoms:
 These are usually aligned with the project:
 
 - making same-env beliefs more stable across probe subsets
+- preferring disjoint support-split agreement over overlapping-subset agreement
 - making nearby env beliefs correspond to nearby mechanics
+- improving split-retrieval between two small support halves of the same world
+- improving same-world gap ratio so matching halves are not only close in
+  absolute terms but clearly closer than nearby different worlds
 - improving mechanics decode from env beliefs
 - improving uncertainty calibration against real mechanics error
+- replacing a hand-written uncertainty scalar with a learned but interpretable
+  monotone calibration head when the fixed heuristic has flattened out
 - making the crawler choose more informative interventions
+- forcing the crawler support set to cover multiple experiment families
+- reducing the actual support budget so "few probes" is true in data, not only
+  in analysis masking
 - reducing probe leakage at the env-belief level
 - making the controller use the env belief more directly and honestly
 - testing whether the belief still works under meaningful compression
@@ -193,9 +219,25 @@ These are not automatically bad, but they need strong justification:
 - adding more PPO complexity when the belief is weak
 - changing dashboard visuals without improving artifact semantics
 - optimizing reward-colored plots
+- letting one crawler experiment family dominate while calling the result a
+  general world belief
+- using many windows per env and then claiming the belief comes from a few
+  probes only because the support mask is small
 - mixing window-level and env-level metrics in the same readout
+- using overlapping subsets as the main same-env stability story when disjoint
+  support halves are available
 - adding losses that do not map to a clear failure mode
 - celebrating bitrate reduction without checking what information survived
+
+When uncertainty is the weak point, the best fixes are usually:
+
+- stronger ranking and separation losses against mechanics error
+- monotone uncertainty features that cannot reduce uncertainty when
+  disagreement gets larger
+- reducing or removing geometry-heavy uncertainty features when they are not
+  actually tracking mechanics error
+- dashboard views that show uncertainty vs actual error directly instead of
+  only one summary number
 
 ## The Coding Rules For This Repo
 

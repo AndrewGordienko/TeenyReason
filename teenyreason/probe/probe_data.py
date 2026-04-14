@@ -1,17 +1,14 @@
 """Probe data collection.
 
-This module is responsible for asking the environment a fixed set of simple
-"questions" before policy learning begins. Those questions are implemented as
-short scripted probe trajectories such as "hold center", "pulse left", or
-"sticky random".
+This module owns the offline crawler dataset used to train the window encoder.
 
-The collected data is stored in two views:
-
-- individual transitions for easy inspection
-- fixed-length windows for the latent encoder
+For CartPole, the dataset is now collected by a small active "scientist"
+crawler that chooses informative interventions across one sampled hidden world.
+For the other environments, the older scripted probe library remains in place
+as a fallback path until they get the same rewrite.
 """
 
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -22,10 +19,10 @@ from ..envs import (
     CONTINUOUS_CARTPOLE_NAME,
     CONTINUOUS_LUNAR_LANDER_NAME,
     action_index_to_env_action,
-    get_action_dim,
     get_action_values,
     make_env,
 )
+from .cartpole_scientist import CARTPOLE_SUPPORT_GOAL_SEQUENCE, build_probe_planner
 
 
 PROBE_MODES = (
@@ -42,6 +39,8 @@ PROBE_MODES = (
     "anti_repeat",
     "phase_random",
 )
+
+CARTPOLE_ACTIVE_EPISODES_PER_ENV = len(CARTPOLE_SUPPORT_GOAL_SEQUENCE)
 
 # These names are mostly for readability when inspecting stored parameter arrays.
 CARTPOLE_PARAM_NAMES = (
@@ -503,11 +502,76 @@ class CartPoleCrawler:
         if env_name == BIPEDAL_WALKER_NAME:
             probe_profile = "bipedal"
         self.probe_policy = ProbePolicy(self.action_dim, profile=probe_profile)
+        self.active_window_stride = max(2, window_size // 2)
+        self.cartpole_active_episodes_per_env = CARTPOLE_ACTIVE_EPISODES_PER_ENV
+        self.cartpole_active_step_cap = max(window_size + 8, 24)
+        if env_name == CONTINUOUS_CARTPOLE_NAME:
+            # For the scientist path, treat each rollout like one named experiment
+            # and keep windows sparse enough that "few probes" means something.
+            self.active_window_stride = window_size
 
         # Keep both granular transitions and fixed-length windows because the
         # encoder cares about short temporal patterns, not just one-step effects.
         self.transitions: list[Transition] = []
         self.windows: list[WindowRecord] = []
+
+    def _append_transition(
+        self,
+        env_instance_id: int,
+        episode_id: int,
+        step_idx: int,
+        probe_mode: str,
+        env_params: np.ndarray,
+        state: np.ndarray,
+        action_idx: int,
+        next_state: np.ndarray,
+        reward: float,
+        terminated: bool,
+        truncated: bool,
+    ) -> None:
+        self.transitions.append(
+            Transition(
+                env_instance_id=env_instance_id,
+                episode_id=episode_id,
+                step_idx=step_idx,
+                probe_mode=probe_mode,
+                env_params=env_params.copy(),
+                state=np.asarray(state, dtype=np.float32).copy(),
+                action=int(action_idx),
+                next_state=np.asarray(next_state, dtype=np.float32).copy(),
+                reward=float(reward),
+                terminated=bool(terminated),
+                truncated=bool(truncated),
+            )
+        )
+
+    def _append_window(
+        self,
+        env_instance_id: int,
+        episode_id: int,
+        step_idx: int,
+        probe_mode: str,
+        env_params: np.ndarray,
+        state_window: deque[np.ndarray],
+        action_window: deque[int],
+        reward_window: deque[float],
+        terminated: bool,
+        truncated: bool,
+    ) -> None:
+        self.windows.append(
+            WindowRecord(
+                env_instance_id=env_instance_id,
+                episode_id=episode_id,
+                end_step_idx=step_idx,
+                probe_mode=probe_mode,
+                env_params=env_params.copy(),
+                states=np.stack(state_window, axis=0),
+                actions=np.asarray(action_window, dtype=np.int64),
+                rewards=np.asarray(reward_window, dtype=np.float32),
+                terminated=bool(terminated),
+                truncated=bool(truncated),
+            )
+        )
 
     def run_episode(
         self,
@@ -544,21 +608,18 @@ class CartPoleCrawler:
 
             state_np = np.asarray(state, dtype=np.float32)
             next_state_np = np.asarray(next_state, dtype=np.float32)
-
-            self.transitions.append(
-                Transition(
-                    env_instance_id=env_instance_id,
-                    episode_id=episode_id,
-                    step_idx=step_idx,
-                    probe_mode=probe_mode,
-                    env_params=env_params.copy(),
-                    state=state_np.copy(),
-                    action=int(action_idx),
-                    next_state=next_state_np.copy(),
-                    reward=float(reward),
-                    terminated=bool(terminated),
-                    truncated=bool(truncated),
-                )
+            self._append_transition(
+                env_instance_id=env_instance_id,
+                episode_id=episode_id,
+                step_idx=step_idx,
+                probe_mode=probe_mode,
+                env_params=env_params,
+                state=state_np,
+                action_idx=int(action_idx),
+                next_state=next_state_np,
+                reward=float(reward),
+                terminated=bool(terminated),
+                truncated=bool(truncated),
             )
 
             action_window.append(int(action_idx))
@@ -566,20 +627,17 @@ class CartPoleCrawler:
             state_window.append(next_state_np.copy())
 
             if len(action_window) == self.window_size and len(state_window) == self.window_size + 1:
-                # Each window becomes one training example for the world encoder.
-                self.windows.append(
-                    WindowRecord(
-                        env_instance_id=env_instance_id,
-                        episode_id=episode_id,
-                        end_step_idx=step_idx,
-                        probe_mode=probe_mode,
-                        env_params=env_params.copy(),
-                        states=np.stack(state_window, axis=0),
-                        actions=np.asarray(action_window, dtype=np.int64),
-                        rewards=np.asarray(reward_window, dtype=np.float32),
-                        terminated=bool(terminated),
-                        truncated=bool(truncated),
-                    )
+                self._append_window(
+                    env_instance_id=env_instance_id,
+                    episode_id=episode_id,
+                    step_idx=step_idx,
+                    probe_mode=probe_mode,
+                    env_params=env_params,
+                    state_window=state_window,
+                    action_window=action_window,
+                    reward_window=reward_window,
+                    terminated=bool(terminated),
+                    truncated=bool(truncated),
                 )
 
             state = next_state
@@ -587,8 +645,132 @@ class CartPoleCrawler:
             if terminated or truncated:
                 break
 
+    def run_active_cartpole_episode(
+        self,
+        env_instance_id: int,
+        episode_id: int,
+        episode_physics,
+        max_steps: int,
+        planner,
+        primary_goal: str | None = None,
+        reset_options: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Run one short active scientist rollout for a single hidden world."""
+        apply_env_params(self.env, episode_physics)
+        env_params = episode_physics.as_array()
+        state, _info = self.env.reset(options=reset_options)
+        state_np = np.asarray(state, dtype=np.float32)
+        rollout_goal = primary_goal or planner.choose_rollout_goal(state_np)
+        planner.begin_rollout(primary_goal=rollout_goal)
+
+        state_window = deque([state_np.copy()], maxlen=self.window_size + 1)
+        action_window: deque[int] = deque(maxlen=self.window_size)
+        reward_window: deque[float] = deque(maxlen=self.window_size)
+        mode_window: deque[str] = deque(maxlen=self.window_size)
+        next_window_step = self.window_size - 1
+
+        step_limit = min(max_steps, self.cartpole_active_step_cap)
+        for step_idx in range(step_limit):
+            probe_mode = planner.ensure_goal(state_np)
+            action_prior = planner.action_prior_scores(state_np, list(action_window))
+            logits = action_prior - float(np.max(action_prior))
+            weights = np.exp(logits / 0.35).astype(np.float32)
+            weights /= np.clip(np.sum(weights), 1e-6, None)
+            action_idx = int(self.rng.choice(np.arange(self.action_dim), p=weights))
+
+            env_action = action_index_to_env_action(action_idx, self.action_values)
+            next_state, reward, terminated, truncated, _info = self.env.step(env_action)
+            next_state_np = np.asarray(next_state, dtype=np.float32)
+
+            self._append_transition(
+                env_instance_id=env_instance_id,
+                episode_id=episode_id,
+                step_idx=step_idx,
+                probe_mode=probe_mode,
+                env_params=env_params,
+                state=state_np,
+                action_idx=action_idx,
+                next_state=next_state_np,
+                reward=float(reward),
+                terminated=bool(terminated),
+                truncated=bool(truncated),
+            )
+
+            planner.observe_transition(
+                prev_state=state_np,
+                action_idx=action_idx,
+                next_state=next_state_np,
+                terminated=bool(terminated),
+                truncated=bool(truncated),
+            )
+
+            action_window.append(action_idx)
+            reward_window.append(float(reward))
+            state_window.append(next_state_np.copy())
+            mode_window.append(probe_mode)
+
+            if (
+                len(action_window) == self.window_size
+                and len(state_window) == self.window_size + 1
+                and step_idx >= next_window_step
+            ):
+                dominant_mode = Counter(mode_window).most_common(1)[0][0]
+                window_mode = planner.rollout_goal if planner.rollout_goal is not None else dominant_mode
+                self._append_window(
+                    env_instance_id=env_instance_id,
+                    episode_id=episode_id,
+                    step_idx=step_idx,
+                    probe_mode=window_mode,
+                    env_params=env_params,
+                    state_window=state_window,
+                    action_window=action_window,
+                    reward_window=reward_window,
+                    terminated=bool(terminated),
+                    truncated=bool(truncated),
+                )
+                next_window_step += self.active_window_stride
+
+            state_np = next_state_np
+            if terminated or truncated:
+                break
+
+    def _collect_cartpole_active_dataset(self, env_instances: int, max_steps: int) -> None:
+        """Collect CartPole data via active short-horizon experiments per world."""
+        episode_id = 0
+        planner = build_probe_planner(
+            env_name=self.env_name,
+            action_values=self.action_values,
+            rng=self.rng,
+        )
+        if planner is None:
+            raise ValueError("CartPole active dataset requested without a scientist planner")
+
+        for env_instance_id in range(env_instances):
+            if self.randomize_physics:
+                episode_physics = sample_env_params(self.rng, self.base_physics)
+            else:
+                episode_physics = self.base_physics
+            planner.begin_env_instance()
+            goal_schedule = list(CARTPOLE_SUPPORT_GOAL_SEQUENCE)
+            if self.cartpole_active_episodes_per_env > len(goal_schedule):
+                goal_schedule.extend([None] * (self.cartpole_active_episodes_per_env - len(goal_schedule)))
+            for primary_goal in goal_schedule[:self.cartpole_active_episodes_per_env]:
+                self.run_active_cartpole_episode(
+                    env_instance_id=env_instance_id,
+                    episode_id=episode_id,
+                    episode_physics=episode_physics,
+                    max_steps=max_steps,
+                    planner=planner,
+                    primary_goal=primary_goal,
+                )
+                episode_id += 1
+
     def collect(self, episodes_per_mode: int = 20, max_steps: int = 200):
-        """Run the full probe library enough times to build a training dataset."""
+        """Collect an encoder dataset for the current environment family."""
+        if self.env_name == CONTINUOUS_CARTPOLE_NAME:
+            self._collect_cartpole_active_dataset(env_instances=episodes_per_mode, max_steps=max_steps)
+            return
+
         episode_id = 0
         # Sample one hidden environment instance, then view it through every
         # probe mode. This creates "same world, different probe" supervision.

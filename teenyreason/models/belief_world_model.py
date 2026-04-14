@@ -5,15 +5,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.nn.utils import clip_grad_norm_
 
 from ..envs import BIPEDAL_WALKER_NAME
 from .env_belief import (
     EnvBeliefAggregator,
     EnvParamPredictorEnsemble,
+    build_diverse_support_mask,
     build_env_group_tensors,
-    build_env_subset_masks,
+    build_uncertainty_feature_tensor,
+    compute_disjoint_support_splits,
+    build_leave_one_group_out_masks,
     group_window_latents_torch,
-    sample_env_belief_subsets,
 )
 
 
@@ -352,7 +355,7 @@ class ContrastiveProjector(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.normalize(self.net(x), dim=-1)
+        return safe_normalize(self.net(x), dim=-1)
 
 
 class GradientReversal(torch.autograd.Function):
@@ -402,6 +405,7 @@ def supervised_same_env_contrastive_loss(
     temperature: float = 0.1,
 ) -> torch.Tensor:
     """Pull together embeddings from the same env instance across probe modes."""
+    embeddings = safe_normalize(embeddings, dim=-1)
     if embeddings.shape[0] < 2:
         return embeddings.sum() * 0.0
 
@@ -418,7 +422,7 @@ def supervised_same_env_contrastive_loss(
     if not torch.any(valid_rows):
         return embeddings.sum() * 0.0
 
-    exp_logits = torch.exp(logits) * (~self_mask)
+    exp_logits = sanitize_tensor(torch.exp(logits) * (~self_mask))
     positive_mass = (exp_logits * positive_mask).sum(dim=1).clamp_min(1e-6)
     total_mass = exp_logits.sum(dim=1).clamp_min(1e-6)
     loss = -torch.log(positive_mass / total_mass)
@@ -433,15 +437,16 @@ def pairwise_env_geometry_loss(
     if latent_mean.shape[0] < 2:
         return latent_mean.sum() * 0.0
 
-    normalized_latent = F.normalize(latent_mean, dim=-1)
+    normalized_latent = safe_normalize(latent_mean, dim=-1)
+    normalized_env_params = sanitize_tensor(normalized_env_params)
     latent_distance = 1.0 - normalized_latent @ normalized_latent.T
     env_distance = torch.cdist(normalized_env_params, normalized_env_params, p=2)
     mask = ~torch.eye(latent_mean.shape[0], dtype=torch.bool, device=latent_mean.device)
     if not torch.any(mask):
         return latent_mean.sum() * 0.0
 
-    latent_values = latent_distance[mask]
-    env_values = env_distance[mask]
+    latent_values = sanitize_tensor(latent_distance[mask])
+    env_values = sanitize_tensor(env_distance[mask])
     latent_values = latent_values / latent_values.mean().clamp_min(1e-6)
     env_values = env_values / env_values.mean().clamp_min(1e-6)
     return F.mse_loss(latent_values, env_values)
@@ -457,6 +462,9 @@ def within_between_env_loss(
     if env_mean.shape[0] < 2:
         return env_mean.sum() * 0.0
 
+    env_mean = sanitize_tensor(env_mean)
+    subset_env_mean = sanitize_tensor(subset_env_mean)
+    env_params = sanitize_tensor(env_params)
     within = torch.norm(subset_env_mean - env_mean.unsqueeze(1), dim=-1).mean(dim=1)
     between = torch.cdist(env_mean, env_mean, p=2)
     self_mask = torch.eye(env_mean.shape[0], dtype=torch.bool, device=env_mean.device)
@@ -476,8 +484,201 @@ def within_between_env_loss(
         nearest_between = torch.where(torch.isfinite(nearest_between), nearest_between, fallback_between)
 
     margin_loss = F.relu(within + margin - nearest_between).mean()
-    ratio_loss = (within / nearest_between.clamp_min(1e-6)).mean()
+    ratio_loss = torch.clamp(within / nearest_between.clamp_min(1e-3), max=10.0).mean()
     return margin_loss + 0.10 * ratio_loss
+
+
+def subset_retrieval_loss(
+    anchor_env_mean: torch.Tensor,
+    positive_env_mean: torch.Tensor,
+    temperature: float = 0.15,
+) -> torch.Tensor:
+    """Force one disjoint support half to retrieve the matching other half."""
+    return info_nce_loss(
+        safe_normalize(anchor_env_mean, dim=-1),
+        safe_normalize(positive_env_mean, dim=-1),
+        temperature=temperature,
+    )
+
+
+def hard_negative_retrieval_loss(
+    anchor_env_mean: torch.Tensor,
+    positive_env_mean: torch.Tensor,
+    env_params: torch.Tensor,
+    margin: float = 0.15,
+) -> torch.Tensor:
+    """Push matching worlds above semantically similar non-matches."""
+    if anchor_env_mean.shape[0] < 2:
+        return anchor_env_mean.sum() * 0.0
+
+    anchor_env_mean = safe_normalize(anchor_env_mean, dim=-1)
+    positive_env_mean = safe_normalize(positive_env_mean, dim=-1)
+    env_params = sanitize_tensor(env_params)
+    similarity = anchor_env_mean @ positive_env_mean.T
+    positive_similarity = torch.diagonal(similarity)
+
+    param_distance = torch.cdist(env_params, env_params, p=2)
+    self_mask = torch.eye(anchor_env_mean.shape[0], dtype=torch.bool, device=anchor_env_mean.device)
+    valid_param = param_distance[~self_mask]
+    if valid_param.numel() == 0:
+        return anchor_env_mean.sum() * 0.0
+
+    param_scale = valid_param.mean().clamp_min(1e-3)
+    negative_weight = torch.exp(-param_distance / param_scale)
+    negative_weight = negative_weight.masked_fill(self_mask, 0.0)
+    ranking_loss = F.relu(margin + similarity - positive_similarity.unsqueeze(1))
+    weighted_loss = ranking_loss * negative_weight
+    return weighted_loss.sum() / negative_weight.sum().clamp_min(1.0)
+
+
+def split_gap_ratio_loss(
+    env_mean: torch.Tensor,
+    split_mean_a: torch.Tensor,
+    split_mean_b: torch.Tensor,
+    margin: float = 0.10,
+    target_ratio: float = 0.35,
+) -> torch.Tensor:
+    """Make same-world split halves much closer than nearby different worlds."""
+    if env_mean.shape[0] < 2:
+        return env_mean.sum() * 0.0
+    env_mean = sanitize_tensor(env_mean)
+    split_mean_a = sanitize_tensor(split_mean_a)
+    split_mean_b = sanitize_tensor(split_mean_b)
+    same_gap = torch.linalg.norm(split_mean_a - split_mean_b, dim=-1)
+    between = torch.cdist(env_mean, env_mean, p=2)
+    self_mask = torch.eye(env_mean.shape[0], dtype=torch.bool, device=env_mean.device)
+    between = between.masked_fill(self_mask, float("inf"))
+    nearest_between = between.min(dim=1).values.clamp_min(1e-3)
+    margin_loss = F.relu(same_gap + margin - nearest_between).mean()
+    ratio_loss = F.relu(same_gap / nearest_between - target_ratio).mean()
+    return margin_loss + 0.25 * ratio_loss
+
+
+def split_geometry_stats(
+    env_mean: torch.Tensor,
+    split_mean_a: torch.Tensor,
+    split_mean_b: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Summarize same-world split geometry against nearby different worlds."""
+    if env_mean.shape[0] == 0:
+        empty = env_mean.new_zeros((0,))
+        return {
+            "same_gap": empty,
+            "nearest_between": empty,
+            "gap_ratio": empty,
+        }
+
+    env_mean = sanitize_tensor(env_mean)
+    split_mean_a = sanitize_tensor(split_mean_a)
+    split_mean_b = sanitize_tensor(split_mean_b)
+    same_gap = torch.linalg.norm(split_mean_a - split_mean_b, dim=-1)
+    if env_mean.shape[0] < 2:
+        nearest_between = torch.ones_like(same_gap)
+    else:
+        between = torch.cdist(env_mean, env_mean, p=2)
+        self_mask = torch.eye(env_mean.shape[0], dtype=torch.bool, device=env_mean.device)
+        between = between.masked_fill(self_mask, float("inf"))
+        nearest_between = between.min(dim=1).values.clamp_min(1e-3)
+    return {
+        "same_gap": same_gap,
+        "nearest_between": nearest_between,
+        "gap_ratio": same_gap / nearest_between.clamp_min(1e-3),
+    }
+
+
+def split_retrieval_margin_deficit(
+    split_mean_a: torch.Tensor,
+    split_mean_b: torch.Tensor,
+    margin: float = 0.20,
+) -> torch.Tensor:
+    """Return how far each split-half pair is from a safe retrieval margin."""
+    if split_mean_a.shape[0] < 2:
+        return split_mean_a.new_zeros((split_mean_a.shape[0],))
+
+    norm_a = safe_normalize(split_mean_a, dim=-1)
+    norm_b = safe_normalize(split_mean_b, dim=-1)
+    similarity = norm_a @ norm_b.T
+    positive = torch.diagonal(similarity)
+    self_mask = torch.eye(similarity.shape[0], dtype=torch.bool, device=similarity.device)
+    hard_negative_a = similarity.masked_fill(self_mask, float("-inf")).max(dim=1).values
+    hard_negative_b = similarity.T.masked_fill(self_mask, float("-inf")).max(dim=1).values
+    margin_a = positive - hard_negative_a
+    margin_b = positive - hard_negative_b
+    deficit_a = F.relu(margin - margin_a)
+    deficit_b = F.relu(margin - margin_b)
+    return 0.5 * (deficit_a + deficit_b)
+
+
+def uncertainty_ranking_loss(
+    uncertainty_signal: torch.Tensor,
+    target_error: torch.Tensor,
+    margin: float = 0.02,
+) -> torch.Tensor:
+    """Encourage higher uncertainty for envs with larger mechanics error."""
+    if uncertainty_signal.shape[0] < 2:
+        return uncertainty_signal.sum() * 0.0
+    error_diff = target_error[:, None] - target_error[None, :]
+    uncert_diff = uncertainty_signal[:, None] - uncertainty_signal[None, :]
+    pair_mask = torch.abs(error_diff) > 1e-4
+    if not torch.any(pair_mask):
+        return uncertainty_signal.sum() * 0.0
+    direction = torch.sign(error_diff[pair_mask])
+    signed_gap = direction * uncert_diff[pair_mask]
+    return F.relu(margin - signed_gap).mean()
+
+
+def correlation_alignment_loss(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Encourage uncertainty scores to preserve the ordering structure of error."""
+    if predicted.shape[0] < 2:
+        return predicted.sum() * 0.0
+    predicted_centered = sanitize_tensor(predicted - predicted.mean())
+    target_centered = sanitize_tensor(target - target.mean())
+    numerator = torch.sum(predicted_centered * target_centered)
+    denominator = torch.linalg.norm(predicted_centered) * torch.linalg.norm(target_centered)
+    if not torch.isfinite(denominator) or float(denominator.item()) <= 1e-6:
+        return predicted.sum() * 0.0
+    correlation = torch.clamp(numerator / denominator, -1.0, 1.0)
+    return 1.0 - correlation
+
+
+def minmax_scale(values: torch.Tensor) -> torch.Tensor:
+    """Map a 1D signal into `[0, 1]` without producing NaNs."""
+    values = sanitize_tensor(values)
+    lower = values.min()
+    upper = values.max()
+    return (values - lower) / (upper - lower).clamp_min(1e-6)
+
+
+def uncertainty_separation_loss(
+    uncertainty_signal: torch.Tensor,
+    target_error: torch.Tensor,
+    margin: float = 0.12,
+) -> torch.Tensor:
+    """Force high-error worlds to carry more uncertainty than low-error worlds."""
+    if uncertainty_signal.shape[0] < 4:
+        return uncertainty_signal.sum() * 0.0
+    low_cut = torch.quantile(target_error, 0.25)
+    high_cut = torch.quantile(target_error, 0.75)
+    low_mask = target_error <= low_cut
+    high_mask = target_error >= high_cut
+    if not torch.any(low_mask) or not torch.any(high_mask):
+        return uncertainty_signal.sum() * 0.0
+    low_mean = uncertainty_signal[low_mask].mean()
+    high_mean = uncertainty_signal[high_mask].mean()
+    return F.relu(margin - (high_mean - low_mean))
+
+
+def uncertainty_spread_floor_loss(
+    uncertainty_signal: torch.Tensor,
+    min_std: float = 0.10,
+) -> torch.Tensor:
+    """Keep uncertainty from collapsing to a near-constant scalar."""
+    if uncertainty_signal.numel() < 2:
+        return uncertainty_signal.sum() * 0.0
+    return F.relu(min_std - torch.std(uncertainty_signal, unbiased=False))
 
 
 def build_generic_affordance_targets(
@@ -766,9 +967,44 @@ def info_nce_loss(
     temperature: float = 0.1,
 ) -> torch.Tensor:
     """Symmetric InfoNCE loss between latent-prefix queries and future-summary keys."""
+    query_embeddings = torch.nan_to_num(query_embeddings, nan=0.0, posinf=0.0, neginf=0.0)
+    key_embeddings = torch.nan_to_num(key_embeddings, nan=0.0, posinf=0.0, neginf=0.0)
     logits = query_embeddings @ key_embeddings.T / max(temperature, 1e-4)
+    logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
     labels = torch.arange(logits.shape[0], device=logits.device)
     return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
+
+
+def sanitize_tensor(values: torch.Tensor, fill_value: float = 0.0) -> torch.Tensor:
+    """Replace non-finite tensor entries with a finite fallback."""
+    if torch.isfinite(values).all():
+        return values
+    return torch.nan_to_num(values, nan=fill_value, posinf=fill_value, neginf=fill_value)
+
+
+def safe_normalize(values: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    """Normalize vectors without letting tiny norms create numerical junk."""
+    return sanitize_tensor(F.normalize(sanitize_tensor(values), dim=dim, eps=eps))
+
+
+def modules_are_finite(modules: list[nn.Module]) -> bool:
+    """Return True when all tracked parameters remain finite."""
+    for module in modules:
+        for param in module.parameters():
+            if not torch.isfinite(param).all():
+                return False
+    return True
+
+
+def sanitize_modules_(modules: list[nn.Module]) -> None:
+    """Repair non-finite parameters in-place so training can continue."""
+    with torch.no_grad():
+        for module in modules:
+            for param in module.parameters():
+                if torch.isfinite(param).all():
+                    continue
+                param.data = torch.nan_to_num(param.data, nan=0.0, posinf=1.0, neginf=-1.0)
+                param.data.clamp_(-100.0, 100.0)
 
 
 def train_encoder_predictor(
@@ -789,6 +1025,7 @@ def train_encoder_predictor(
     mode_adversary_loss_weight: float = 0.10,
     latent_rollout_loss_weight: float = 0.15,
     env_within_between_loss_weight: float = 0.30,
+    env_retrieval_loss_weight: float = 0.30,
     belief_subset_count: int = 4,
     belief_subset_size: int = 6,
     contrastive_dim: int = 64,
@@ -797,6 +1034,7 @@ def train_encoder_predictor(
     intervention_horizon: int = 12,
     analytic_affordances: bool = True,
     env_name: str | None = None,
+    max_grad_norm: float = 1.0,
 ) -> tuple[
     WorldEncoder,
     DeltaPredictorEnsemble,
@@ -914,7 +1152,24 @@ def train_encoder_predictor(
         + list(env_belief_projector.parameters())
         + list(mode_adversary.parameters()),
         lr=lr,
+        eps=1e-5,
     )
+    train_modules = [
+        encoder,
+        predictor,
+        belief_aggregator,
+        env_param_predictor,
+        latent_transition_model,
+        affordance_predictor,
+        decision_predictor,
+        return_predictor,
+        risk_predictor,
+        contrastive_query,
+        contrastive_key,
+        env_projector,
+        env_belief_projector,
+        mode_adversary,
+    ]
     mse_loss = nn.MSELoss()
     bce_loss = nn.BCEWithLogitsLoss()
     ce_loss = nn.CrossEntropyLoss()
@@ -931,8 +1186,12 @@ def train_encoder_predictor(
         total_env_param_loss = 0.0
         total_env_split_loss = 0.0
         total_env_split_contrastive_loss = 0.0
+        total_env_retrieval_loss = 0.0
+        total_env_gap_ratio_loss = 0.0
         total_uncertainty_calibration_loss = 0.0
         total_env_within_between_loss = 0.0
+        skipped_window_batches = 0
+        skipped_env_updates = 0
 
         for start in range(0, num_windows, batch_size):
             idx = permutation[start:start + batch_size]
@@ -959,23 +1218,34 @@ def train_encoder_predictor(
                 batch_actions,
                 rewards=batch_rewards,
             )
+            mean = sanitize_tensor(mean)
+            logvar = sanitize_tensor(logvar)
             step_mean, step_logvar = encoder.encode_step_posteriors(
                 batch_states,
                 batch_actions,
                 rewards=batch_rewards,
             )
+            step_mean = sanitize_tensor(step_mean)
+            step_logvar = sanitize_tensor(step_logvar)
             prefix_mean, _prefix_logvar = encoder.encode_posterior(
                 batch_prefix_states,
                 batch_prefix_actions,
                 rewards=batch_prefix_rewards,
             )
+            prefix_mean = sanitize_tensor(prefix_mean)
             z = encoder.sample_latent(mean, logvar)
+            z = sanitize_tensor(z)
             parts = encoder.split_latent(z)
             delta_preds = predictor.predict_all(batch_current_state, batch_current_action, z)
             affordance_pred = affordance_predictor(z)
             decision_pred = decision_predictor(torch.cat([parts["ctrl"], parts["contact"]], dim=1))
             return_pred = return_predictor(torch.cat([parts["dyn"], parts["ctrl"]], dim=1))
             risk_pred = risk_predictor(torch.cat([parts["ctrl"], parts["contact"]], dim=1))
+            delta_preds = sanitize_tensor(delta_preds)
+            affordance_pred = sanitize_tensor(affordance_pred)
+            decision_pred = sanitize_tensor(decision_pred)
+            return_pred = sanitize_tensor(return_pred)
+            risk_pred = sanitize_tensor(risk_pred)
 
             delta_loss = torch.stack(
                 [mse_loss(delta_preds[member_idx], batch_target_delta) for member_idx in range(predictor.ensemble_size)],
@@ -1035,10 +1305,30 @@ def train_encoder_predictor(
                 + mode_adversary_loss_weight * mode_adversary_loss
                 + latent_rollout_loss_weight * latent_rollout_loss
             )
+            loss = sanitize_tensor(loss)
+            if not torch.isfinite(loss):
+                skipped_window_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                sanitize_modules_(train_modules)
+                continue
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            grad_norm = clip_grad_norm_(
+                [param for module in train_modules for param in module.parameters()],
+                max_grad_norm,
+            )
+            if not torch.isfinite(torch.as_tensor(grad_norm)):
+                skipped_window_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                sanitize_modules_(train_modules)
+                continue
             optimizer.step()
+            if not modules_are_finite(train_modules):
+                skipped_window_batches += 1
+                sanitize_modules_(train_modules)
+                optimizer.zero_grad(set_to_none=True)
+                continue
             total_loss += loss.item() * len(idx)
             total_contrastive_loss += contrastive_loss.item() * len(idx)
             total_env_consistency_loss += env_consistency_loss.item() * len(idx)
@@ -1051,25 +1341,49 @@ def train_encoder_predictor(
             window_actions,
             rewards=window_rewards,
         )
+        env_mean_full = sanitize_tensor(env_mean_full)
+        env_logvar_full = sanitize_tensor(env_logvar_full)
         env_group_tensors_torch = group_window_latents_torch(
             window_mean=env_mean_full,
             window_logvar=env_logvar_full,
             env_instance_id=env_instance_id,
             env_params=target_env_params,
+            view_group_id=probe_mode_idx,
         )
         grouped_mean = env_group_tensors_torch["window_mean"]
         grouped_logvar = env_group_tensors_torch["window_logvar"]
         grouped_mask = env_group_tensors_torch["mask"]
         env_target_env_params = env_group_tensors_torch["env_params"]
+        grouped_probe_mode_idx = env_group_tensors_torch["view_group_id"]
+
+        support_mask = build_diverse_support_mask(
+            mask=grouped_mask,
+            support_size=max(1, belief_subset_size),
+            group_ids=grouped_probe_mode_idx,
+        )
+        support_group_ratio = torch.ones((grouped_mean.shape[0],), dtype=torch.float32, device=device)
+        for env_idx in range(grouped_mean.shape[0]):
+            support_idx = torch.nonzero(support_mask[env_idx] > 0, as_tuple=False).squeeze(-1)
+            if support_idx.numel() == 0:
+                support_group_ratio[env_idx] = 0.0
+                continue
+            support_groups = grouped_probe_mode_idx[env_idx, support_idx]
+            unique_groups = torch.unique(support_groups[support_groups >= 0], sorted=True)
+            support_group_ratio[env_idx] = float(unique_groups.numel()) / max(float(support_idx.numel()), 1.0)
 
         env_mean, env_logvar, env_view_spread = belief_aggregator(
             grouped_mean,
             grouped_logvar,
-            grouped_mask,
+            support_mask,
         )
+        env_mean = sanitize_tensor(env_mean)
+        env_logvar = sanitize_tensor(env_logvar)
+        env_view_spread = sanitize_tensor(env_view_spread)
         env_param_preds = env_param_predictor.predict_all(env_mean)
+        env_param_preds = sanitize_tensor(env_param_preds)
         env_param_mean = env_param_preds.mean(dim=0)
-        env_param_std = env_param_preds.std(dim=0)
+        env_param_std = env_param_preds.std(dim=0, unbiased=False)
+        env_view_spread_mean = env_view_spread.mean(dim=1)
         env_param_loss = torch.stack(
             [
                 mse_loss(env_param_preds[member_idx], env_target_env_params)
@@ -1078,17 +1392,17 @@ def train_encoder_predictor(
             dim=0,
         ).mean()
 
-        split_mask_a, split_mask_b = build_env_subset_masks(grouped_mask)
-        env_mean_a, env_logvar_a, _env_view_spread_a = belief_aggregator(
-            grouped_mean,
-            grouped_logvar,
-            split_mask_a,
+        split_payload = compute_disjoint_support_splits(
+            aggregator=belief_aggregator,
+            grouped_mean=grouped_mean,
+            grouped_logvar=grouped_logvar,
+            support_mask=support_mask,
+            env_param_predictor=env_param_predictor,
         )
-        env_mean_b, env_logvar_b, _env_view_spread_b = belief_aggregator(
-            grouped_mean,
-            grouped_logvar,
-            split_mask_b,
-        )
+        env_mean_a = sanitize_tensor(split_payload["env_mean"][:, 0, :])
+        env_mean_b = sanitize_tensor(split_payload["env_mean"][:, 1, :])
+        env_logvar_a = sanitize_tensor(split_payload["env_logvar"][:, 0, :])
+        env_logvar_b = sanitize_tensor(split_payload["env_logvar"][:, 1, :])
         env_split_loss = (
             mse_loss(env_mean_a, env_mean_b)
             + 0.25 * mse_loss(torch.exp(0.5 * env_logvar_a), torch.exp(0.5 * env_logvar_b))
@@ -1097,19 +1411,70 @@ def train_encoder_predictor(
             env_belief_projector(env_mean_a),
             env_belief_projector(env_mean_b),
         )
-        subset_payload = sample_env_belief_subsets(
-            aggregator=belief_aggregator,
-            grouped_mean=grouped_mean,
-            grouped_logvar=grouped_logvar,
-            grouped_mask=grouped_mask,
-            env_param_predictor=env_param_predictor,
-            subset_count=belief_subset_count,
-            subset_size=belief_subset_size,
+        env_retrieval_loss = 0.5 * (
+            subset_retrieval_loss(env_mean_a, env_mean_b)
+            + subset_retrieval_loss(env_mean_b, env_mean_a)
         )
-        subset_env_mean = subset_payload["env_mean"]
-        subset_env_param_mean = subset_payload["env_param_mean"]
-        subset_env_param_std = subset_env_param_mean.std(dim=1)
-        subset_env_latent_std = subset_env_mean.std(dim=1)
+        env_retrieval_loss = env_retrieval_loss + 0.5 * (
+            hard_negative_retrieval_loss(env_mean_a, env_mean_b, env_target_env_params)
+            + hard_negative_retrieval_loss(env_mean_b, env_mean_a, env_target_env_params)
+        )
+        env_gap_stats = split_geometry_stats(env_mean, env_mean_a, env_mean_b)
+        env_gap_ratio_loss = split_gap_ratio_loss(
+            env_mean=env_mean,
+            split_mean_a=env_mean_a,
+            split_mean_b=env_mean_b,
+        )
+        retrieval_margin_deficit = split_retrieval_margin_deficit(env_mean_a, env_mean_b)
+        subset_env_mean = sanitize_tensor(split_payload["env_mean"])
+        subset_env_param_mean = sanitize_tensor(split_payload["env_param_mean"])
+        subset_env_param_std = subset_env_param_mean.std(dim=1, unbiased=False)
+        subset_env_latent_std = subset_env_mean.std(dim=1, unbiased=False)
+        subset_param_disagreement = sanitize_tensor(split_payload["env_param_disagreement"])
+        subset_latent_disagreement = sanitize_tensor(split_payload["latent_disagreement"])
+        subset_env_shift = torch.linalg.norm(
+            subset_env_mean - env_mean.unsqueeze(1),
+            dim=-1,
+        ).mean(dim=1)
+        split_prediction_error = sanitize_tensor(
+            torch.mean(
+                torch.abs(subset_env_param_mean - env_target_env_params.unsqueeze(1)),
+                dim=(1, 2),
+            )
+        )
+        leave_masks, leave_valid = build_leave_one_group_out_masks(support_mask, grouped_probe_mode_idx)
+        leaveout_param_std = torch.zeros_like(env_param_mean)
+        leaveout_shift = torch.zeros((grouped_mean.shape[0],), dtype=torch.float32, device=device)
+        leaveout_prediction_error = torch.zeros((grouped_mean.shape[0],), dtype=torch.float32, device=device)
+        if leave_masks.shape[1] > 0 and torch.any(leave_valid > 0):
+            batch_size, leave_count, max_views = leave_masks.shape
+            latent_dim = grouped_mean.shape[-1]
+            repeated_mean = grouped_mean[:, None, :, :].expand(-1, leave_count, -1, -1)
+            repeated_logvar = grouped_logvar[:, None, :, :].expand(-1, leave_count, -1, -1)
+            leave_env_mean, _leave_env_logvar, _leave_view_spread = belief_aggregator(
+                repeated_mean.reshape(batch_size * leave_count, max_views, latent_dim),
+                repeated_logvar.reshape(batch_size * leave_count, max_views, latent_dim),
+                leave_masks.reshape(batch_size * leave_count, max_views),
+            )
+            leave_env_mean = leave_env_mean.reshape(batch_size, leave_count, latent_dim)
+            leave_param_mean = env_param_predictor.predict_all(
+                leave_env_mean.reshape(batch_size * leave_count, latent_dim)
+            ).mean(dim=0).reshape(batch_size, leave_count, -1)
+            for env_idx in range(batch_size):
+                valid_idx = torch.nonzero(leave_valid[env_idx] > 0, as_tuple=False).squeeze(-1)
+                if valid_idx.numel() == 0:
+                    continue
+                leaveout_param_std[env_idx] = leave_param_mean[env_idx, valid_idx].std(dim=0, unbiased=False)
+                leaveout_shift[env_idx] = torch.linalg.norm(
+                    leave_env_mean[env_idx, valid_idx] - env_mean[env_idx].unsqueeze(0),
+                    dim=-1,
+                ).mean()
+                leaveout_prediction_error[env_idx] = torch.mean(
+                    torch.abs(
+                        leave_param_mean[env_idx, valid_idx]
+                        - env_target_env_params[env_idx].unsqueeze(0)
+                    )
+                )
         env_subset_consistency_loss = mse_loss(
             subset_env_mean,
             env_mean.unsqueeze(1).expand_as(subset_env_mean),
@@ -1124,9 +1489,41 @@ def train_encoder_predictor(
             normalized_env_params=env_target_env_params,
         )
         env_prediction_error = torch.mean(torch.abs(env_param_mean - env_target_env_params), dim=1)
-        uncertainty_calibration_loss = F.l1_loss(
-            subset_env_param_std.mean(dim=1) + 0.25 * subset_env_latent_std.mean(dim=1),
-            env_prediction_error.detach(),
+        uncertainty_features = build_uncertainty_feature_tensor(
+            env_param_std_mean=env_param_std.mean(dim=1),
+            split_param_disagreement=subset_param_disagreement,
+            split_latent_disagreement=subset_latent_disagreement,
+            split_env_shift=subset_env_shift,
+            leaveout_param_std_mean=leaveout_param_std.mean(dim=1),
+            leaveout_shift=leaveout_shift,
+            env_view_spread_mean=env_view_spread_mean,
+            support_group_ratio=support_group_ratio,
+        )
+        uncertainty_signal = sanitize_tensor(
+            belief_aggregator.predict_uncertainty(uncertainty_features)
+        )
+        uncertainty_target = sanitize_tensor(
+            0.50 * env_prediction_error
+            + 0.35 * split_prediction_error
+            + 0.15 * leaveout_prediction_error
+        )
+        normalized_uncertainty_signal = minmax_scale(uncertainty_signal)
+        normalized_uncertainty_target = minmax_scale(uncertainty_target.detach())
+        uncertainty_calibration_loss = F.smooth_l1_loss(
+            normalized_uncertainty_signal,
+            normalized_uncertainty_target,
+        ) + 0.60 * uncertainty_ranking_loss(
+            normalized_uncertainty_signal,
+            uncertainty_target.detach(),
+            margin=0.04,
+        ) + 0.25 * correlation_alignment_loss(
+            normalized_uncertainty_signal,
+            uncertainty_target.detach(),
+        ) + 0.20 * uncertainty_separation_loss(
+            normalized_uncertainty_signal,
+            uncertainty_target.detach(),
+        ) + 0.10 * uncertainty_spread_floor_loss(
+            normalized_uncertainty_signal,
         )
         env_loss = (
             physics_loss_weight * env_param_loss
@@ -1134,14 +1531,37 @@ def train_encoder_predictor(
             + contrastive_loss_weight * env_split_contrastive_loss
             + env_geometry_loss_weight * env_geometry_belief_loss
             + env_within_between_loss_weight * env_within_between_loss
-            + 0.10 * uncertainty_calibration_loss
+            + env_retrieval_loss_weight * env_retrieval_loss
+            + 0.10 * env_gap_ratio_loss
+            + 0.18 * uncertainty_calibration_loss
         )
-        optimizer.zero_grad()
-        env_loss.backward()
-        optimizer.step()
+        env_loss = sanitize_tensor(env_loss)
+        if not torch.isfinite(env_loss):
+            skipped_env_updates += 1
+            optimizer.zero_grad(set_to_none=True)
+            sanitize_modules_(train_modules)
+        else:
+            optimizer.zero_grad(set_to_none=True)
+            env_loss.backward()
+            grad_norm = clip_grad_norm_(
+                [param for module in train_modules for param in module.parameters()],
+                max_grad_norm,
+            )
+            if not torch.isfinite(torch.as_tensor(grad_norm)):
+                skipped_env_updates += 1
+                optimizer.zero_grad(set_to_none=True)
+                sanitize_modules_(train_modules)
+            else:
+                optimizer.step()
+                if not modules_are_finite(train_modules):
+                    skipped_env_updates += 1
+                    sanitize_modules_(train_modules)
+                    optimizer.zero_grad(set_to_none=True)
         total_env_param_loss = float(env_param_loss.item())
         total_env_split_loss = float(env_split_loss.item())
         total_env_split_contrastive_loss = float(env_split_contrastive_loss.item())
+        total_env_retrieval_loss = float(env_retrieval_loss.item())
+        total_env_gap_ratio_loss = float(env_gap_ratio_loss.item())
         total_uncertainty_calibration_loss = float(uncertainty_calibration_loss.item())
         total_env_within_between_loss = float(env_within_between_loss.item())
 
@@ -1162,8 +1582,12 @@ def train_encoder_predictor(
             f"env-param = {total_env_param_loss:.6f} | "
             f"env-split = {total_env_split_loss:.6f} | "
             f"env-contrast = {total_env_split_contrastive_loss:.6f} | "
+            f"env-retrieval = {total_env_retrieval_loss:.6f} | "
+            f"gap-ratio = {total_env_gap_ratio_loss:.6f} | "
             f"env-metric = {total_env_within_between_loss:.6f} | "
-            f"uncert-cal = {total_uncertainty_calibration_loss:.6f}"
+            f"uncert-cal = {total_uncertainty_calibration_loss:.6f} | "
+            f"skipped-window = {skipped_window_batches} | "
+            f"skipped-env = {skipped_env_updates}"
         )
 
     return encoder, predictor, belief_aggregator, env_param_predictor, device

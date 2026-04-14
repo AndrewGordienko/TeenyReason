@@ -3,8 +3,8 @@
 This module contains the direct comparison the project cares about:
 
 - `train_plain_ppo`: standard PPO that only sees environment state
-- `train_probe_conditioned_ppo`: PPO that first runs scripted probes, builds a
-  latent belief, and conditions the policy/value function on that belief
+- `train_probe_conditioned_ppo`: PPO that first runs an active identification
+  phase, builds an env belief, and conditions the policy/value function on it
 """
 
 from dataclasses import dataclass
@@ -25,10 +25,12 @@ from .ppo_core import (
     evaluate_continuous_actions,
     mean_to_continuous_action,
     sample_continuous_action,
+    sanitize_numpy,
     update_ppo_policy,
     validate_continuous_env,
 )
 from ..probe.probe_data import apply_env_params, default_env_params
+from ..probe.cartpole_scientist import build_probe_planner
 from ..probe.probe_latent import (
     EliteTrajectoryBuffer,
     LatentPerformanceMemory,
@@ -43,6 +45,7 @@ from ..probe.probe_latent import (
     init_recurrent_belief_hidden,
     maybe_update_online_belief,
     nearest_probe_action_idx,
+    sanitize_belief_vector,
     select_episode_physics,
     should_promote_episode_to_elite,
     update_recurrent_belief_from_window,
@@ -135,7 +138,7 @@ def evaluate_plain_policy(
         episode_return = 0.0
 
         while not done:
-            state = state_normalizer.normalize(raw_state)
+            state = sanitize_numpy(state_normalizer.normalize(raw_state))
             state_t = torch.tensor(state[None, :], dtype=torch.float32, device=device)
             with torch.no_grad():
                 mean, _value = policy(state_t)
@@ -185,6 +188,9 @@ def evaluate_probe_policy(
         belief = None
         belief_hidden = init_recurrent_belief_hidden(encoder=encoder, device=device)
         belief_posteriors: list[tuple[np.ndarray, np.ndarray]] = []
+        probe_planner = build_probe_planner(env_name=env_name, action_values=action_values, rng=rng)
+        if probe_planner is not None:
+            probe_planner.begin_env_instance()
 
         for _ in range(probe_count):
             window_states, window_actions, window_rewards, probe_failed, probe_steps_used = collect_adaptive_probe_window(
@@ -196,7 +202,10 @@ def evaluate_probe_policy(
                 window_size=window_size,
                 episode_physics=episode_physics,
                 action_values=action_values,
+                env_name=env_name,
                 prior_belief=belief,
+                prior_hidden=belief_hidden,
+                planner=probe_planner,
             )
             total_steps += probe_steps_used
             if probe_failed:
@@ -240,8 +249,9 @@ def evaluate_probe_policy(
         episode_step = 0
 
         while not done:
-            state = state_normalizer.normalize(raw_state)
+            state = sanitize_numpy(state_normalizer.normalize(raw_state))
             state_t = torch.tensor(state[None, :], dtype=torch.float32, device=device)
+            belief = sanitize_belief_vector(belief)
             belief_t = torch.tensor(belief[None, :], dtype=torch.float32, device=device)
             with torch.no_grad():
                 mean, _value = policy(state_t, belief_t)
@@ -290,11 +300,11 @@ def compute_sil_loss(
     """Compute the self-imitation auxiliary loss from elite replay samples."""
     # Self-imitation learning replays especially good trajectories alongside PPO.
     states, beliefs, actions, returns_to_go, sample_weight = elite_buffer.sample(batch_size)
-    state_t = torch.tensor(states, dtype=torch.float32, device=device)
-    belief_t = torch.tensor(beliefs, dtype=torch.float32, device=device)
-    action_t = torch.tensor(actions, dtype=torch.float32, device=device)
-    return_t = torch.tensor(returns_to_go, dtype=torch.float32, device=device)
-    weight_t = torch.tensor(sample_weight, dtype=torch.float32, device=device)
+    state_t = torch.tensor(sanitize_numpy(states), dtype=torch.float32, device=device)
+    belief_t = torch.tensor(sanitize_numpy(beliefs), dtype=torch.float32, device=device)
+    action_t = torch.tensor(sanitize_numpy(actions), dtype=torch.float32, device=device)
+    return_t = torch.tensor(sanitize_numpy(returns_to_go), dtype=torch.float32, device=device)
+    weight_t = torch.tensor(sanitize_numpy(sample_weight), dtype=torch.float32, device=device)
 
     mean, value = model(state_t, belief_t)
     log_prob, _entropy = evaluate_continuous_actions(
@@ -378,7 +388,7 @@ def train_plain_ppo(
         raw_state, _info = env.reset()
         raw_state = np.asarray(raw_state, dtype=np.float32)
         state_normalizer.update(raw_state)
-        state = state_normalizer.normalize(raw_state)
+        state = sanitize_numpy(state_normalizer.normalize(raw_state))
 
         states = []
         actions = []
@@ -393,7 +403,7 @@ def train_plain_ppo(
 
         while not done:
             # Roll out one baseline policy step using only the normalized state.
-            state_t = torch.tensor(state[None, :], dtype=torch.float32, device=device)
+            state_t = torch.tensor(sanitize_numpy(state[None, :]), dtype=torch.float32, device=device)
             with torch.no_grad():
                 mean, value = policy(state_t)
             action, log_prob = sample_continuous_action(
@@ -406,7 +416,7 @@ def train_plain_ppo(
             total_env_steps += 1
             next_raw_state = np.asarray(next_raw_state, dtype=np.float32)
             state_normalizer.update(next_raw_state)
-            next_state = state_normalizer.normalize(next_raw_state)
+            next_state = sanitize_numpy(state_normalizer.normalize(next_raw_state))
             raw_reward = float(reward)
             train_reward = raw_reward
             if reward_normalizer is not None:
@@ -415,7 +425,7 @@ def train_plain_ppo(
                     reward_normalizer.scale_only(np.asarray([raw_reward], dtype=np.float32))[0]
                 )
 
-            states.append(state.copy())
+            states.append(sanitize_numpy(state.copy()))
             actions.append(action.copy())
             log_probs.append(log_prob)
             rewards.append(train_reward)
@@ -430,7 +440,7 @@ def train_plain_ppo(
 
         bootstrap_value = 0.0
         if not last_terminated:
-            next_state_t = torch.tensor(last_next_state[None, :], dtype=torch.float32, device=device)
+            next_state_t = torch.tensor(sanitize_numpy(last_next_state[None, :]), dtype=torch.float32, device=device)
             with torch.no_grad():
                 _mean, next_value = policy(next_state_t)
             bootstrap_value = float(next_value.item())
@@ -510,10 +520,10 @@ def train_plain_ppo(
             if len(elite_buffer) >= sil_batch_size:
                 def auxiliary_loss_fn():
                     states_np, _beliefs_np, actions_np, returns_np, weights_np = elite_buffer.sample(sil_batch_size)
-                    state_t = torch.tensor(states_np, dtype=torch.float32, device=device)
-                    action_t = torch.tensor(actions_np, dtype=torch.float32, device=device)
-                    return_t = torch.tensor(returns_np, dtype=torch.float32, device=device)
-                    weight_t = torch.tensor(weights_np, dtype=torch.float32, device=device)
+                    state_t = torch.tensor(sanitize_numpy(states_np), dtype=torch.float32, device=device)
+                    action_t = torch.tensor(sanitize_numpy(actions_np), dtype=torch.float32, device=device)
+                    return_t = torch.tensor(sanitize_numpy(returns_np), dtype=torch.float32, device=device)
+                    weight_t = torch.tensor(sanitize_numpy(weights_np), dtype=torch.float32, device=device)
                     mean, value = policy(state_t)
                     log_prob, _entropy = evaluate_continuous_actions(
                         mean=mean,
@@ -710,7 +720,11 @@ def train_probe_conditioned_ppo(
         episode_probe_steps = 0
         episode_physics = select_episode_physics(rng, randomize_physics, base_physics)
         belief_posteriors: list[tuple[np.ndarray, np.ndarray]] = []
+        probe_planner = build_probe_planner(env_name=env_name, action_values=action_values, rng=rng)
+        if probe_planner is not None:
+            probe_planner.begin_env_instance()
         # Probe first, act second: each episode starts by actively querying the env.
+        belief_hidden = init_recurrent_belief_hidden(encoder=encoder, device=device)
         first_states, first_actions, first_rewards, probe_failed, probe_steps_used = collect_adaptive_probe_window(
             env=probe_env,
             encoder=encoder,
@@ -720,6 +734,9 @@ def train_probe_conditioned_ppo(
             window_size=window_size,
             episode_physics=episode_physics,
             action_values=action_values,
+            env_name=env_name,
+            prior_hidden=belief_hidden,
+            planner=probe_planner,
         )
         total_env_steps += probe_steps_used
         episode_probe_steps += probe_steps_used
@@ -732,7 +749,6 @@ def train_probe_conditioned_ppo(
             returns.append(0.0)
             continue
 
-        belief_hidden = init_recurrent_belief_hidden(encoder=encoder, device=device)
         first_posterior = encode_window_posterior(
             encoder=encoder,
             device=device,
@@ -777,7 +793,10 @@ def train_probe_conditioned_ppo(
                 window_size=window_size,
                 episode_physics=episode_physics,
                 action_values=action_values,
+                env_name=env_name,
                 prior_belief=belief,
+                prior_hidden=belief_hidden,
+                planner=probe_planner,
             )
             total_env_steps += probe_steps_used
             episode_probe_steps += probe_steps_used
@@ -848,7 +867,7 @@ def train_probe_conditioned_ppo(
         raw_state, _info = train_env.reset()
         raw_state = np.asarray(raw_state, dtype=np.float32)
         state_normalizer.update(raw_state)
-        state = state_normalizer.normalize(raw_state)
+        state = sanitize_numpy(state_normalizer.normalize(raw_state))
 
         states = []
         beliefs = []
@@ -865,8 +884,9 @@ def train_probe_conditioned_ppo(
 
         while not done:
             # The actor sees the current environment state plus the current belief.
-            state_t = torch.tensor(state[None, :], dtype=torch.float32, device=device)
-            belief_t = torch.tensor(belief[None, :], dtype=torch.float32, device=device)
+            belief = sanitize_belief_vector(belief)
+            state_t = torch.tensor(sanitize_numpy(state[None, :]), dtype=torch.float32, device=device)
+            belief_t = torch.tensor(sanitize_numpy(belief[None, :]), dtype=torch.float32, device=device)
             with torch.no_grad():
                 mean, value = policy(state_t, belief_t)
             action, log_prob = sample_continuous_action(
@@ -908,10 +928,10 @@ def train_probe_conditioned_ppo(
                 episode_step=episode_step,
             )
             state_normalizer.update(next_raw_state)
-            next_state = state_normalizer.normalize(next_raw_state)
+            next_state = sanitize_numpy(state_normalizer.normalize(next_raw_state))
 
-            states.append(state.copy())
-            beliefs.append(belief.copy())
+            states.append(sanitize_numpy(state.copy()))
+            beliefs.append(sanitize_belief_vector(belief.copy()))
             actions.append(action.copy())
             log_probs.append(log_prob)
             rewards.append(train_reward)
@@ -927,8 +947,9 @@ def train_probe_conditioned_ppo(
 
         bootstrap_value = 0.0
         if not last_terminated:
-            next_state_t = torch.tensor(last_next_state[None, :], dtype=torch.float32, device=device)
-            next_belief_t = torch.tensor(belief[None, :], dtype=torch.float32, device=device)
+            belief = sanitize_belief_vector(belief)
+            next_state_t = torch.tensor(sanitize_numpy(last_next_state[None, :]), dtype=torch.float32, device=device)
+            next_belief_t = torch.tensor(sanitize_numpy(belief[None, :]), dtype=torch.float32, device=device)
             with torch.no_grad():
                 _mean, next_value = policy(next_state_t, next_belief_t)
             bootstrap_value = float(next_value.item())

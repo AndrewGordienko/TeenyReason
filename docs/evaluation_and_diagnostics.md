@@ -218,6 +218,120 @@ Question:
 
 This is the operational "few probes are enough" uncertainty metric.
 
+Important refinement:
+
+- subset disagreement only means something if the subsets are genuinely small
+  and diverse
+- if the support set itself is narrow, low disagreement can be fake
+
+For the current CartPole path, the intended interpretation is:
+
+- canonical support is roughly `4` windows
+- diagnostic disagreement should come mainly from two disjoint support halves
+- disagreement should also be tested under leave-one-goal-out ablations
+
+Important:
+
+- overlapping random subsets can make uncertainty and same-env spread look
+  better than they really are
+- disjoint splits are the more honest "would a different small experiment set
+  infer the same world?" test
+
+### Support Diversity
+
+Question:
+
+- do the windows used to build the env belief come from distinct experiment
+  families?
+
+Why it matters:
+
+- a low-disagreement belief built from repeated copies of one easy probe is not
+  evidence of broad world understanding
+
+What a good result looks like:
+
+- high support diversity ratio
+- multiple goal families represented inside the actual support set
+
+What can fool it:
+
+- many total windows per env but only a narrow support subset actually used
+- a crawler that repeats one safe experiment and only occasionally touches the
+  rest
+
+### Uncertainty vs Actual Mechanics Error
+
+Question:
+
+- when uncertainty is high, is mechanics prediction error also high?
+
+This should be treated as the main honesty check for uncertainty.
+
+What a good result looks like:
+
+- high-uncertainty env beliefs have larger actual mechanics decode error
+- low-uncertainty env beliefs are genuinely easier and more stable
+
+What can fool it:
+
+- uncertainty that only tracks support count
+- uncertainty that collapses because all subsets are too similar or too
+  overlapping
+- uncertainty that is measured on window latents while being interpreted as an
+  env-belief quantity
+- uncertainty that is free to invert the ordering because the calibration head
+  is unconstrained
+
+Preferred current implementation:
+
+- use a monotone learned uncertainty head over explicit disagreement features
+- train against normalized mechanics-error targets plus ranking and
+  high-error-vs-low-error separation losses
+- inspect the learned feature weights in the dashboard so we can see which
+  uncertainty ingredients the model is actually using
+- if geometry-heavy features become anti-correlated with mechanics error, keep
+  them as diagnostics but reduce their role inside the uncertainty object
+
+### Split Retrieval
+
+Question:
+
+- if one disjoint support half describes a world, can it retrieve the matching
+  other half?
+
+Why it matters:
+
+- this is a direct local-geometry check
+- it is often more operational than a PCA plot
+
+What a good result looks like:
+
+- high top-1 retrieval between split A and split B
+- rising mean reciprocal rank or improving median match rank, not only one
+  noisy top-1 number
+- retrieval improves alongside neighbor alignment, not instead of it
+
+What can fool it:
+
+- retrieval on projected auxiliary embeddings while the raw env belief remains
+  muddy
+- easy retrieval only because the environment set is tiny or trivially
+  separated
+
+Additional honesty check:
+
+- compare same-world split disagreement against nearest different-world latent
+  distance
+- if same-world disagreement is a large fraction of nearest-between distance,
+  the belief space is still locally weak even if raw disagreement looks small
+
+Current dashboard expectation:
+
+- show both raw same-world gap and nearest-between distance
+- plot these against each other so the ratio is visually obvious
+- treat gap ratio as more trustworthy than rounded same-env spread alone
+
 ### Failure Lift
 
 Question:
@@ -315,6 +429,7 @@ The dashboard is helpful, but it can mislead.
 - env-level belief points, not raw window points
 - per-parameter decode rows
 - same-env subset spread
+- support diversity ratio
 - uncertainty vs actual error
 - mechanics-based coloring
 

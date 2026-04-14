@@ -14,6 +14,20 @@ That is a stronger goal than "add a probe vector to PPO."
 The latent should not just be a compressed history. It should act like a belief
 over hidden causal structure.
 
+The repo is also explicitly guided by three external sample-efficiency stories:
+
+- children building fast world beliefs from play and surprise
+- language learners extracting grammar and meaning from small but structured
+  evidence
+- visual learners building object- and concept-level structure from limited
+  examples
+
+Those bridges are written out in:
+
+- [language_domain_synthesis.md](./language_domain_synthesis.md)
+- [image_domain_synthesis.md](./image_domain_synthesis.md)
+- [human_learning_synthesis.md](./human_learning_synthesis.md)
+
 ## What The Latent Should Mean
 
 A good latent in this repo should be:

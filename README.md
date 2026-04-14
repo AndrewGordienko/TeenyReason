@@ -33,6 +33,12 @@ Then read [docs/image_domain_synthesis.md](docs/image_domain_synthesis.md) and
 version of the same thesis: few-shot concept learning, object-centric visual
 beliefs, and support-set-efficient downstream solving.
 
+Then read [docs/human_learning_synthesis.md](docs/human_learning_synthesis.md)
+and [docs/human_learning_design.md](docs/human_learning_design.md) for the
+developmental-science and neuroscience bridge: core knowledge, surprise-driven
+exploration, predictive maps, and what "child-like" sample efficiency should
+mean in code rather than only as a metaphor.
+
 The latent in this repo is intended to be:
 
 - predictive
@@ -65,6 +71,9 @@ task instead of first having to infer the world from scratch.
   Current recurrent posterior encoder and structured latent supervision.
 - `teenyreason/models/world_model.py`
   Older simpler prototype kept around as a reference point.
+- `papers/`
+  Local paper library for the repo. See [papers/README.md](papers/README.md)
+  for the categorized reading map.
 
 ## Current Flow
 
