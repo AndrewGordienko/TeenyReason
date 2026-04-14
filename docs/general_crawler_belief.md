@@ -17,6 +17,7 @@ scratch.
 That broader environment may be:
 
 - a physical control system
+- an image corpus or stream of visual scenes
 - a text corpus
 - an interactive dialogue setting
 - a codebase
@@ -44,7 +45,10 @@ regimes:
 
 1. Physical environments
    Example: a pendulum with unknown mass, friction, delay, or torque limits.
-2. Linguistic environments
+2. Visual environments
+   Example: a new object class, scene family, or image domain with unknown
+   invariances, part structure, and concept boundaries.
+3. Linguistic environments
    Example: a new corpus, dialogue partner, or symbolic language with unknown
    grammar, lexicon, discourse regularities, and world assumptions.
 
@@ -85,13 +89,13 @@ This is the central abstraction for the repo.
 
 The table below is the intended mental model.
 
-| Concept | Physical Control | Language / Text | Interactive Language |
-| --- | --- | --- | --- |
-| hidden rules `h` | gravity, mass, friction, delay, contacts, actuation limits | grammar, lexicon, discourse regularities, stylistic conventions, latent world assumptions | same as text plus partner behavior, grounding rules, tool affordances |
-| observation `o_t` | state vector, pixels, contacts | token stream, sentence, paragraph, document context | utterance, response, external feedback |
-| action `a_t` | torque, force, control action | read next span, mask/reconstruct, reorder, query, continue, compress, paraphrase | ask question, clarify, propose action, use tool |
-| evidence window | short rollout | short text span plus local transformations or predictions | short interaction segment |
-| downstream solver | PPO, MPC, Dreamer actor | generator, parser, QA system, reasoning policy | dialogue / tool-using policy |
+| Concept | Physical Control | Images / Vision | Language / Text | Interactive Language |
+| --- | --- | --- | --- | --- |
+| hidden rules `h` | gravity, mass, friction, delay, contacts, actuation limits | object structure, part composition, invariances, viewpoint rules, concept boundaries | grammar, lexicon, discourse regularities, stylistic conventions, latent world assumptions | same as text plus partner behavior, grounding rules, tool affordances |
+| observation `o_t` | state vector, pixels, contacts | image, crop, patch set, multi-view scene | token stream, sentence, paragraph, document context | utterance, response, external feedback |
+| action `a_t` | torque, force, control action | choose crop, mask patches, request view, change viewpoint, compare support examples | read next span, mask/reconstruct, reorder, query, continue, compress, paraphrase | ask question, clarify, propose action, use tool |
+| evidence window | short rollout | short sequence of views, crops, masks, or support examples | short text span plus local transformations or predictions | short interaction segment |
+| downstream solver | PPO, MPC, Dreamer actor | classifier, retriever, detector, segmenter, visual controller | generator, parser, QA system, reasoning policy | dialogue / tool-using policy |
 
 The important point is that the environment is not defined by being physical.
 It is defined by having hidden regularities that can be discovered through

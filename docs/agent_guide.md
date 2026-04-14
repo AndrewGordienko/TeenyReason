@@ -160,6 +160,18 @@ Typical symptoms:
 - muddy representation metrics
 - latent still not clearly mechanical
 
+### 6. Compression Of The Wrong Thing
+
+The belief becomes smaller, cheaper, or easier to transmit, but the compressed
+object mostly preserves nuisance structure or solver-specific shortcuts.
+
+Typical symptoms:
+
+- bitrate drops and benchmark still looks good
+- mechanics decode under compression is poor
+- compressed belief preserves reward hacks better than world knowledge
+- teams start celebrating compactness before checking sufficiency
+
 ## What Types Of Changes Are Good
 
 These are usually aligned with the project:
@@ -171,6 +183,7 @@ These are usually aligned with the project:
 - making the crawler choose more informative interventions
 - reducing probe leakage at the env-belief level
 - making the controller use the env belief more directly and honestly
+- testing whether the belief still works under meaningful compression
 
 ## What Types Of Changes Are Suspicious
 
@@ -182,6 +195,7 @@ These are not automatically bad, but they need strong justification:
 - optimizing reward-colored plots
 - mixing window-level and env-level metrics in the same readout
 - adding losses that do not map to a clear failure mode
+- celebrating bitrate reduction without checking what information survived
 
 ## The Coding Rules For This Repo
 
@@ -220,6 +234,7 @@ Every metric should answer a real question:
 - is it stable?
 - is uncertainty calibrated?
 - does it help downstream control?
+- is it a small sufficient message or only a large helpful one?
 
 If a metric does not change a real research decision, it probably does not
 belong.

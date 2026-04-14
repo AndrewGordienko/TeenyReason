@@ -11,9 +11,11 @@ If you are new to the project, read in this order:
 5. [paper_synthesis.md](./paper_synthesis.md)
 6. [language_domain_synthesis.md](./language_domain_synthesis.md)
 7. [language_belief_design.md](./language_belief_design.md)
-8. [architecture_and_training.md](./architecture_and_training.md)
-9. [evaluation_and_diagnostics.md](./evaluation_and_diagnostics.md)
-10. [agent_guide.md](./agent_guide.md)
+8. [image_domain_synthesis.md](./image_domain_synthesis.md)
+9. [image_belief_design.md](./image_belief_design.md)
+10. [architecture_and_training.md](./architecture_and_training.md)
+11. [evaluation_and_diagnostics.md](./evaluation_and_diagnostics.md)
+12. [agent_guide.md](./agent_guide.md)
 
 Each file has one job.
 
@@ -36,6 +38,12 @@ Each file has one job.
 - `language_belief_design.md`
   The concrete language-side design: latent factorization, crawler behavior,
   implementation phases, metrics, and module boundaries.
+- `image_domain_synthesis.md`
+  The image-side paper bridge: what the few-shot, self-supervised, and
+  object-centric vision papers imply for the repo's broader latent-belief idea.
+- `image_belief_design.md`
+  The concrete image-side design: visual latent factorization, crawler
+  behavior, implementation phases, metrics, and module boundaries.
 - `architecture_and_training.md`
   Concrete system design, module ownership, data flow, artifact flow, and
   training-stage responsibilities.

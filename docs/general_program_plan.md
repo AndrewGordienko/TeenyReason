@@ -71,12 +71,12 @@ Important rule:
 Do not destroy the current physical code to do this. Add clear abstractions and
 adapters rather than hiding everything behind one large generic layer.
 
-### Stage 3. Add a passive language testbed
+### Stage 3. Add a passive language or image testbed
 
 Goal:
 
-- test whether the same belief machinery can learn corpus-local structure from
-  small text datasets
+- test whether the same belief machinery can learn structure from small passive
+  datasets outside control
 
 Candidate tasks:
 
@@ -85,13 +85,16 @@ Candidate tasks:
 - discourse tracking
 - style adaptation
 - small-corpus continuation
+- one-shot image classification
+- support-set retrieval
+- object-centric consistency across views
 
 Why this stage matters:
 
-It tests whether the crawler-belief pattern works in a passive environment
-where intervention mostly means active hypothesis-testing over fixed text.
+It tests whether the crawler-belief pattern works in passive environments where
+intervention mostly means active hypothesis-testing over fixed evidence.
 
-### Stage 4. Add an interactive language or tool-using testbed
+### Stage 4. Add an interactive language, image, or tool-using testbed
 
 Goal:
 
@@ -103,10 +106,12 @@ Candidate tasks:
 - constrained dialogue with hidden partner rules
 - tool-augmented QA with hidden schemas
 - symbolic games with textual interfaces
+- moving-camera object recognition
+- controllable multi-view visual identification
 
 Why this stage matters:
 
-It is the true language-side analogue of active system identification.
+It is the true cross-domain analogue of active system identification.
 
 ### Stage 5. Unify solver-side evaluation
 
@@ -155,8 +160,74 @@ The same metric families should survive across domains.
 - belief improvement per intervention
 - early stopping quality
 
+### Communication value
+
+- mechanics fit versus belief bitrate
+- downstream solve quality versus belief bitrate
+- retrieval or neighbor quality versus belief bitrate
+- uncertainty quality versus belief bitrate
+
 If a metric does not fit one of these categories, it should need strong
 justification before being added.
+
+## Belief Communication Experiments
+
+The repo should explicitly treat `z_env` as a communication channel between the
+crawler and the downstream solver.
+
+That means we should eventually run experiments like:
+
+### 1. Fixed-bitrate belief handoff
+
+Procedure:
+
+- build `z_env`
+- rotate or normalize it if needed
+- quantize it to a chosen budget
+- feed only the compressed belief to the solver
+
+Question:
+
+- how many bits are needed before the solver still adapts quickly?
+
+### 2. Rate-distortion curves
+
+Measure:
+
+- mechanics decode versus bits
+- same-env agreement versus bits
+- local geometry versus bits
+- downstream task performance versus bits
+
+Question:
+
+- what structure survives compression, and what collapses first?
+
+### 3. Coarse belief plus residual sketch
+
+Procedure:
+
+- send a coarse compressed belief
+- add a tiny residual code for what the coarse code misses
+
+Question:
+
+- can the belief be decomposed into a cheap global world summary plus a tiny
+  correction?
+
+### 4. Adaptive bitrate by uncertainty
+
+Procedure:
+
+- use lower bitrates when the world is easy and belief is sharp
+- spend more bits when the world is still uncertain
+
+Question:
+
+- can uncertainty control communication cost intelligently?
+
+These experiments matter because they test whether the latent is truly a small
+sufficient message, not just a large helpful feature vector.
 
 ## What Counts As Success
 
@@ -167,6 +238,7 @@ The general success criteria are:
 - different-environment beliefs separate
 - hidden rules are decodable from the belief
 - uncertainty tracks unresolved structure
+- a compressed version of the belief still preserves most of that value
 - the downstream solver improves because the belief is informative
 
 Importantly, success is not domain-specific.

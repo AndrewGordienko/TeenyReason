@@ -379,14 +379,68 @@ Repo consequence:
 - always ask whether the latent really tracks mechanics
 - keep the dashboard grounded in mechanics readouts, not only geometry plots
 
+## 11. TurboQuant
+
+Paper:
+
+- TurboQuant
+
+Source:
+
+- https://arxiv.org/abs/2504.19874
+
+Core contribution:
+
+- treats vector compression as a rate-distortion problem rather than an ad hoc
+  storage trick
+- emphasizes online, data-oblivious compression
+- uses random rotation plus simple scalar quantization to preserve useful
+  geometry efficiently
+- for similarity-heavy use cases, uses a coarse code plus residual sketch
+  rather than assuming mean-squared error is the only quantity that matters
+
+Most relevant lesson for this repo:
+
+- the env belief should be treated as a communication object between crawler
+  and solver
+- we should ask how many bits are needed to preserve useful world knowledge
+- we should not assume that "good latent" and "good compressed latent" are the
+  same evaluation problem
+
+What to import into code:
+
+- explicit rate-limited bottlenecks for `z_env`
+- rate-distortion evaluation curves for belief quality
+- separate tests for:
+  - mechanics decode under compression
+  - geometry preservation under compression
+  - downstream control under compression
+- possible coarse belief plus residual belief sketch designs
+
+What not to over-import:
+
+- TurboQuant does not tell us how to learn the right semantics in the first
+  place
+- compressing a bad latent only preserves the wrong thing efficiently
+- quantization quality is not a substitute for mechanics alignment or
+  uncertainty calibration
+
+Repo consequence:
+
+- evaluate `z_env` as a minimal message from crawler to solver
+- add belief communication experiments, not just bigger latent experiments
+- use compression as a diagnostic for sufficiency, not just as an efficiency
+  trick
+
 ## What The Papers Say Together
 
-When combined, the ten papers point toward this design:
+When combined, the eleven papers point toward this design:
 
 - an active crawler
 - a local evidence encoder
 - an env-level belief over hidden mechanics
 - calibrated uncertainty
+- a rate-limited belief message that preserves what the solver actually needs
 - downstream control conditioned on that belief
 - evaluation based on mechanics capture, stability, and adaptation speed
 
@@ -396,6 +450,8 @@ They do not point toward:
 - probe-script memorization
 - optimizing whichever dashboard scalar improved this week
 - letting PPO hide representation failure
+- assuming a large latent is automatically better than a compressed sufficient
+  one
 
 ## The Most Important Practical Translation
 

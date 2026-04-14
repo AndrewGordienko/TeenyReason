@@ -109,6 +109,20 @@ Repo consequence:
 - the best latent is not the richest latent
 - we want a compact belief that preserves mechanics relevant for control
 
+### Belief as communication channel
+
+`TurboQuant` is a useful reminder that a latent is also a message passed from
+one subsystem to another. In this repo, that means the crawler and belief stack
+must send the solver a compact code that preserves what the solver actually
+needs.
+
+Repo consequence:
+
+- we should think in rate-distortion terms, not only embedding terms
+- `z_env` should eventually be evaluated under explicit bottlenecks
+- a good belief should survive meaningful compression without losing its core
+  mechanics information
+
 ### Active system identification
 
 `ASID` pushes the crawler toward actions that improve identification, not just
@@ -148,6 +162,11 @@ The repo thesis should be:
 Active probing can produce a stable, uncertainty-aware belief over hidden
 environment mechanics, and that belief can materially reduce downstream task
 learning cost by separating physics discovery from task optimization.
+
+An equivalent way to say the same thing is:
+
+the crawler should discover a small, information-dense message about the world
+that the downstream solver can use directly.
 
 That is the sentence all code paths should serve.
 
@@ -253,6 +272,18 @@ Purpose:
 
 - make `z_env` stable, mechanical, and reusable
 
+### Communication losses or constraints
+
+- explicit belief bottlenecks
+- compressed-belief consistency
+- coarse-plus-residual belief coding
+- distortion penalties targeted at mechanics decode and control usefulness
+
+Purpose:
+
+- make `z_env` small enough to test sufficiency
+- treat the belief as a message, not an unconstrained feature blob
+
 ### Uncertainty losses
 
 - subset disagreement calibration
@@ -287,6 +318,8 @@ The main metrics should reflect the thesis, not convenience.
 - probe leakage
 - uncertainty calibration against actual mechanics error
 - few-probe sufficiency: how many windows are needed before belief stabilizes
+- belief rate-distortion: how much performance survives when `z_env` is
+  aggressively compressed
 
 ### Downstream metrics
 
@@ -294,6 +327,7 @@ The main metrics should reflect the thesis, not convenience.
 - solve environment steps
 - success rate across seeds
 - performance as a function of probe budget
+- performance as a function of belief bitrate
 
 ### Combined metric
 
@@ -304,6 +338,7 @@ The best score is something like:
 - few probes
 - stable belief
 - strong mechanics decode
+- low required belief bitrate
 - fast downstream solve
 
 ## What We Are Not Doing
@@ -348,6 +383,7 @@ The next improvements should mostly tighten:
 - few-probe sufficiency
 - uncertainty calibration
 - active crawler objectives
+- belief communication efficiency
 
 Not add more unrelated benchmark machinery.
 

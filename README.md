@@ -26,7 +26,12 @@ Then read [docs/general_crawler_belief.md](docs/general_crawler_belief.md) and
 [docs/language_domain_synthesis.md](docs/language_domain_synthesis.md) for the
 broader cross-domain version of the idea. The current code is mostly an RL
 testbed, but the intended latent-belief mechanism is supposed to generalize to
-language and other structured environments too.
+language, images, and other structured environments too.
+
+Then read [docs/image_domain_synthesis.md](docs/image_domain_synthesis.md) and
+[docs/image_belief_design.md](docs/image_belief_design.md) for the image-side
+version of the same thesis: few-shot concept learning, object-centric visual
+beliefs, and support-set-efficient downstream solving.
 
 The latent in this repo is intended to be:
 
