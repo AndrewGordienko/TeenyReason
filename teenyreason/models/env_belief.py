@@ -27,6 +27,15 @@ def safe_normalize(values: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> to
     return sanitize_tensor(F.normalize(sanitize_tensor(values), dim=dim, eps=eps))
 
 
+def rescale_positive_features(feature_tensor: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
+    """Rescale positive disagreement features to preserve useful variation."""
+    positive = sanitize_tensor(feature_tensor).clamp_min(0.0)
+    feature_mean = positive.mean(dim=0, keepdim=True).detach()
+    feature_std = positive.std(dim=0, unbiased=False, keepdim=True).detach()
+    feature_scale = torch.clamp(feature_mean + feature_std, min=eps)
+    return positive / feature_scale
+
+
 UNCERTAINTY_FEATURE_NAMES = (
     "decoder_ensemble_std",
     "split_param_disagreement",
@@ -71,7 +80,7 @@ class MonotonicUncertaintyHead(nn.Module):
         self.bias = nn.Parameter(torch.zeros(()))
 
     def forward(self, feature_tensor: torch.Tensor) -> torch.Tensor:
-        positive_features = sanitize_tensor(feature_tensor).clamp_min(0.0)
+        positive_features = rescale_positive_features(feature_tensor).clamp_max(25.0)
         feature_scale = F.softplus(self.log_feature_scale).unsqueeze(0) + 1e-4
         feature_weight = F.softplus(self.log_feature_weight).unsqueeze(0)
         transformed = torch.log1p(positive_features * feature_scale)
@@ -106,15 +115,16 @@ class EnvBeliefAggregator(nn.Module):
         )
         self.mean_head = nn.Linear(hidden_dim, window_z_dim)
         self.logvar_head = nn.Linear(hidden_dim, window_z_dim)
+        self.delta_gate_logit = nn.Parameter(torch.tensor(-1.0))
         self.uncertainty_head = MonotonicUncertaintyHead(len(UNCERTAINTY_FEATURE_NAMES))
 
-    def forward(
+    def aggregate_stats(
         self,
         window_mean: torch.Tensor,
         window_logvar: torch.Tensor,
         mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Aggregate valid views for each env into an env posterior and spread."""
+    ) -> dict[str, torch.Tensor]:
+        """Aggregate valid views for each env into raw and normalized beliefs."""
         window_mean = sanitize_tensor(window_mean)
         window_logvar = sanitize_tensor(window_logvar)
         normalized_window_mean = safe_normalize(window_mean, dim=-1)
@@ -132,14 +142,33 @@ class EnvBeliefAggregator(nn.Module):
         mask_f = mask.float().unsqueeze(-1)
         denom = mask_f.sum(dim=1).clamp_min(1.0)
         pooled = (view_features * mask_f).sum(dim=1) / denom
+        pooled_window_mean = (window_mean * mask_f).sum(dim=1) / denom
         context = sanitize_tensor(self.fuse(torch.cat([attended.squeeze(1), pooled], dim=-1)))
-        env_mean = safe_normalize(self.mean_head(context), dim=-1)
+        residual_delta = sanitize_tensor(self.mean_head(context))
+        delta_gate = torch.sigmoid(self.delta_gate_logit)
+        env_mean_raw = sanitize_tensor(pooled_window_mean + delta_gate * residual_delta)
+        env_mean = safe_normalize(env_mean_raw, dim=-1)
         env_logvar = torch.clamp(sanitize_tensor(self.logvar_head(context)), -5.0, 2.0)
 
         centered = normalized_window_mean - env_mean.unsqueeze(1)
         view_var = (mask_f * centered.pow(2)).sum(dim=1) / denom
         view_spread = torch.sqrt(torch.clamp(view_var, min=1e-6))
-        return env_mean, env_logvar, view_spread
+        return {
+            "env_mean": env_mean,
+            "env_mean_raw": env_mean_raw,
+            "env_logvar": env_logvar,
+            "view_spread": view_spread,
+        }
+
+    def forward(
+        self,
+        window_mean: torch.Tensor,
+        window_logvar: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Aggregate valid views for each env into one normalized env belief."""
+        stats = self.aggregate_stats(window_mean=window_mean, window_logvar=window_logvar, mask=mask)
+        return stats["env_mean"], stats["env_logvar"], stats["view_spread"]
 
     def predict_uncertainty(self, feature_tensor: torch.Tensor) -> torch.Tensor:
         """Map belief disagreement features to an env-level uncertainty estimate."""
@@ -419,21 +448,24 @@ def compute_disjoint_support_splits(
 ) -> dict[str, torch.Tensor]:
     """Build two non-overlapping support-set beliefs for each env instance."""
     split_mask_a, split_mask_b = build_env_subset_masks(support_mask)
-    env_mean_a, env_logvar_a, view_spread_a = aggregator(
+    stats_a = aggregator.aggregate_stats(
         grouped_mean,
         grouped_logvar,
         split_mask_a,
     )
-    env_mean_b, env_logvar_b, view_spread_b = aggregator(
+    stats_b = aggregator.aggregate_stats(
         grouped_mean,
         grouped_logvar,
         split_mask_b,
     )
+    env_mean_a = stats_a["env_mean_raw"]
+    env_mean_b = stats_b["env_mean_raw"]
     payload = {
         "mask": torch.stack([split_mask_a, split_mask_b], dim=1),
         "env_mean": torch.stack([env_mean_a, env_mean_b], dim=1),
-        "env_logvar": torch.stack([env_logvar_a, env_logvar_b], dim=1),
-        "view_spread": torch.stack([view_spread_a, view_spread_b], dim=1),
+        "env_mean_unit": torch.stack([stats_a["env_mean"], stats_b["env_mean"]], dim=1),
+        "env_logvar": torch.stack([stats_a["env_logvar"], stats_b["env_logvar"]], dim=1),
+        "view_spread": torch.stack([stats_a["view_spread"], stats_b["view_spread"]], dim=1),
         "split_count": torch.stack(
             [
                 split_mask_a.sum(dim=1),
@@ -716,7 +748,11 @@ def aggregate_env_posteriors(
             support_mask=support_mask_t,
             group_ids=group_ids_t,
         )
-        env_mean_t, env_logvar_t, view_spread_t = aggregator(mean_t, logvar_t, support_mask_t)
+        env_stats_t = aggregator.aggregate_stats(mean_t, logvar_t, support_mask_t)
+        env_mean_t = env_stats_t["env_mean"]
+        env_mean_raw_t = env_stats_t["env_mean_raw"]
+        env_logvar_t = env_stats_t["env_logvar"]
+        view_spread_t = env_stats_t["view_spread"]
         split_payload = compute_disjoint_support_splits(
             aggregator=aggregator,
             grouped_mean=mean_t,
@@ -740,11 +776,12 @@ def aggregate_env_posteriors(
         if leaveout_masks_t.shape[1] > 0 and torch.any(leaveout_valid_t > 0):
             repeated_mean = mean_t[:, None, :, :].expand(-1, leaveout_masks_t.shape[1], -1, -1)
             repeated_logvar = logvar_t[:, None, :, :].expand(-1, leaveout_masks_t.shape[1], -1, -1)
-            leave_mean_t, _leave_logvar_t, _leave_spread_t = aggregator(
+            leave_stats_t = aggregator.aggregate_stats(
                 repeated_mean.reshape(leaveout_masks_t.shape[1], mean_t.shape[1], mean_t.shape[2]),
                 repeated_logvar.reshape(leaveout_masks_t.shape[1], logvar_t.shape[1], logvar_t.shape[2]),
                 leaveout_masks_t.reshape(leaveout_masks_t.shape[1], leaveout_masks_t.shape[2]),
             )
+            leave_mean_t = leave_stats_t["env_mean_raw"]
             valid_idx = torch.nonzero(leaveout_valid_t.reshape(-1) > 0, as_tuple=False).squeeze(-1)
             if valid_idx.numel() > 0:
                 leave_mean_t = leave_mean_t[valid_idx]
@@ -765,7 +802,7 @@ def aggregate_env_posteriors(
             split_param_disagreement = 0.0
         else:
             env_param_predictor.eval()
-            env_param_preds = env_param_predictor.predict_all(env_mean_t)
+            env_param_preds = env_param_predictor.predict_all(env_mean_raw_t)
             env_param_mean = env_param_preds.mean(dim=0).squeeze(0).cpu().numpy().astype(np.float32)
             env_param_std = env_param_preds.std(dim=0, unbiased=False).squeeze(0).cpu().numpy().astype(np.float32)
             subset_param_std = (
@@ -774,6 +811,7 @@ def aggregate_env_posteriors(
             split_param_disagreement = float(split_payload["env_param_disagreement"].mean().item())
 
     env_mean = env_mean_t.squeeze(0).cpu().numpy().astype(np.float32)
+    env_mean_raw = env_mean_raw_t.squeeze(0).cpu().numpy().astype(np.float32)
     env_logvar = env_logvar_t.squeeze(0).cpu().numpy().astype(np.float32)
     view_spread = view_spread_t.squeeze(0).cpu().numpy().astype(np.float32)
     uncertainty_vec = build_uncertainty_vector(
@@ -792,6 +830,7 @@ def aggregate_env_posteriors(
     return {
         "belief": belief,
         "env_mean": env_mean,
+        "env_mean_raw": env_mean_raw,
         "env_logvar": env_logvar,
         "view_spread": view_spread,
         "env_param_mean": env_param_mean.astype(np.float32),

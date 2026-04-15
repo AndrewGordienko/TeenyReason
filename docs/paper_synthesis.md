@@ -136,6 +136,8 @@ What to import into code:
 - representation pressure that says "same env, different probe -> similar
   belief"
 - less emphasis on generic compression and more emphasis on sufficiency
+- anti-collapse geometry pressure so the belief cloud keeps usable global scale
+  instead of turning into a tiny but decodable codebook
 
 What not to over-import:
 
@@ -147,6 +149,8 @@ Repo consequence:
 
 - use same-env positives
 - use probe-mode-invariant multi-view losses
+- if the belief cloud collapses globally, add explicit repulsion or uniformity
+  pressure instead of only tuning PCA plots or uncertainty heads
 - do not mistake a low reconstruction loss for a good env belief
 
 ## 4. DreamerV3

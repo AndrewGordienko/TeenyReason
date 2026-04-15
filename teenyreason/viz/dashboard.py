@@ -149,7 +149,13 @@ def compute_split_retrieval_stats(
 ) -> dict[str, float]:
     """Check whether one disjoint support half retrieves the matching other half."""
     if split_mean_a.shape[0] < 2 or split_mean_b.shape[0] != split_mean_a.shape[0]:
-        return {"top1": 0.0, "top5": 0.0, "mrr": 0.0, "median_rank": 0.0}
+        return {
+            "top1": 0.0,
+            "top5": 0.0,
+            "mrr": 0.0,
+            "median_rank": 0.0,
+            "ranks": np.zeros((0,), dtype=np.int32),
+        }
     a = split_mean_a.astype(np.float32)
     b = split_mean_b.astype(np.float32)
     a = a / np.clip(np.linalg.norm(a, axis=1, keepdims=True), 1e-6, None)
@@ -164,6 +170,7 @@ def compute_split_retrieval_stats(
         "top5": float(np.mean(rank_positions <= min(5, a.shape[0]))),
         "mrr": float(np.mean(1.0 / rank_positions)),
         "median_rank": float(np.median(rank_positions)),
+        "ranks": rank_positions.astype(np.int32),
     }
 
 
@@ -375,15 +382,28 @@ def build_latent_payload(path: Path) -> dict:
         np.ones_like(snapshot.get("env_support_count", snapshot["env_window_count"]), dtype=np.float32),
     )[indices]
     env_view_spread = snapshot.get("env_subset_latent_std", snapshot["env_view_spread"])[indices]
-    full_env_mean = snapshot["env_belief_mean"].astype(np.float32)
+    full_predictive_env_mean = snapshot["env_belief_mean"].astype(np.float32)
+    full_env_mean = snapshot.get("env_metric_mean", full_predictive_env_mean).astype(np.float32)
+    full_env_mean_unit = snapshot.get(
+        "env_metric_mean_unit",
+        snapshot.get("env_belief_mean_unit", full_env_mean),
+    ).astype(np.float32)
     full_env_params = snapshot["env_params"].astype(np.float32)
     full_uncertainty = snapshot["env_uncertainty"].astype(np.float32)
+    full_env_belief_norm = snapshot.get(
+        "env_belief_norm",
+        np.linalg.norm(full_predictive_env_mean, axis=1).astype(np.float32),
+    ).astype(np.float32)
     full_env_param_error = snapshot.get(
         "env_param_error_mean",
         np.zeros((full_env_mean.shape[0],), dtype=np.float32),
     ).astype(np.float32)
-    full_split_mean_a = snapshot.get("env_split_mean_a", full_env_mean).astype(np.float32)
-    full_split_mean_b = snapshot.get("env_split_mean_b", full_env_mean).astype(np.float32)
+    full_future_probe_error = snapshot.get(
+        "env_future_prediction_error",
+        np.zeros((full_env_mean.shape[0],), dtype=np.float32),
+    ).astype(np.float32)
+    full_split_mean_a = snapshot.get("env_metric_split_mean_a", snapshot.get("env_split_mean_a", full_env_mean)).astype(np.float32)
+    full_split_mean_b = snapshot.get("env_metric_split_mean_b", snapshot.get("env_split_mean_b", full_env_mean)).astype(np.float32)
     full_split_latent_disagreement = snapshot.get(
         "env_split_latent_disagreement",
         np.linalg.norm(full_split_mean_a - full_split_mean_b, axis=1).astype(np.float32),
@@ -400,6 +420,22 @@ def build_latent_payload(path: Path) -> dict:
         "env_split_retrieval_margin_deficit",
         np.zeros((full_env_mean.shape[0],), dtype=np.float32),
     ).astype(np.float32)
+    full_pairwise_between_distance = snapshot.get("env_pairwise_between_distance")
+    if full_pairwise_between_distance is None:
+        pairwise_between = np.linalg.norm(
+            full_env_mean[:, None, :] - full_env_mean[None, :, :],
+            axis=-1,
+        ).astype(np.float32)
+        full_pairwise_between_distance = pairwise_between[np.triu_indices(pairwise_between.shape[0], k=1)]
+    full_pairwise_between_distance = np.asarray(full_pairwise_between_distance, dtype=np.float32)
+    full_pairwise_between_distance_unit = snapshot.get("env_pairwise_between_distance_unit")
+    if full_pairwise_between_distance_unit is None:
+        pairwise_between_unit = np.linalg.norm(
+            full_env_mean_unit[:, None, :] - full_env_mean_unit[None, :, :],
+            axis=-1,
+        ).astype(np.float32)
+        full_pairwise_between_distance_unit = pairwise_between_unit[np.triu_indices(pairwise_between_unit.shape[0], k=1)]
+    full_pairwise_between_distance_unit = np.asarray(full_pairwise_between_distance_unit, dtype=np.float32)
     full_env_view_spread = snapshot.get("env_subset_latent_std", snapshot["env_view_spread"]).astype(np.float32)
     full_env_leaveout_latent_std = snapshot.get(
         "env_leaveout_latent_std",
@@ -444,10 +480,16 @@ def build_latent_payload(path: Path) -> dict:
         terminated=full_window_terminated,
     )
     split_retrieval = compute_split_retrieval_stats(full_split_mean_a, full_split_mean_b)
+    full_split_retrieval_rank = snapshot.get(
+        "env_split_retrieval_rank",
+        split_retrieval["ranks"],
+    )
+    full_split_retrieval_rank = np.asarray(full_split_retrieval_rank, dtype=np.int32)
     diagnostics = {
-        "linear_env_fit_r2": compute_linear_env_fit(full_env_mean, full_env_params),
-        "per_param_env_fit_r2": compute_per_param_env_fit(full_env_mean, full_env_params, full_param_names),
+        "linear_env_fit_r2": compute_linear_env_fit(full_predictive_env_mean, full_env_params),
+        "per_param_env_fit_r2": compute_per_param_env_fit(full_predictive_env_mean, full_env_params, full_param_names),
         "neighbor_env_alignment": compute_neighbor_env_alignment(full_env_mean, full_env_params),
+        "neighbor_env_alignment_unit": compute_neighbor_env_alignment(full_env_mean_unit, full_env_params),
         "split_retrieval_top1": split_retrieval["top1"],
         "split_retrieval_top5": split_retrieval["top5"],
         "split_retrieval_mrr": split_retrieval["mrr"],
@@ -479,6 +521,12 @@ def build_latent_payload(path: Path) -> dict:
             ).astype(np.float32)
         )),
         "env_param_error_mean": float(np.mean(full_env_param_error)),
+        "future_probe_error_mean": float(np.mean(full_future_probe_error)),
+        "pairwise_between_mean": float(np.mean(full_pairwise_between_distance)) if full_pairwise_between_distance.size else 0.0,
+        "pairwise_between_p10": float(np.quantile(full_pairwise_between_distance, 0.10)) if full_pairwise_between_distance.size else 0.0,
+        "pairwise_between_mean_unit": float(np.mean(full_pairwise_between_distance_unit)) if full_pairwise_between_distance_unit.size else 0.0,
+        "belief_norm_mean": float(np.mean(full_env_belief_norm)),
+        "belief_norm_std": float(np.std(full_env_belief_norm)),
         "uncertainty_feature_importance": [
             {
                 "name": str(name),
@@ -506,8 +554,10 @@ def build_latent_payload(path: Path) -> dict:
                 "terminated_numeric": float(terminated[idx]),
                 "env_param_mean": float(np.mean(env_params[idx])),
                 "env_error": float(full_env_param_error[indices[idx]]),
+                "future_probe_error": float(full_future_probe_error[indices[idx]]),
                 "gap_ratio": float(full_gap_ratio[indices[idx]]),
                 "nearest_between_distance": float(full_nearest_between_distance[indices[idx]]),
+                "belief_norm": float(full_env_belief_norm[indices[idx]]),
                 "split_retrieval_margin_deficit": float(full_split_retrieval_margin_deficit[indices[idx]]),
                 "same_env_spread": float(
                     full_split_latent_disagreement[indices[idx]]
@@ -541,6 +591,11 @@ def build_latent_payload(path: Path) -> dict:
             "sampled_points": int(len(points)),
         },
         "diagnostics": diagnostics,
+        "series": {
+            "pairwise_between_distance": full_pairwise_between_distance.astype(np.float32),
+            "pairwise_between_distance_unit": full_pairwise_between_distance_unit.astype(np.float32),
+            "split_retrieval_rank": full_split_retrieval_rank.astype(np.int32),
+        },
         "mode_counts": mode_counts,
         "points": points,
     }

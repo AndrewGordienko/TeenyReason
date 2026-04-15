@@ -42,10 +42,13 @@ Relevant metrics:
 - env-level mechanics fit
 - per-parameter `R²`
 - env-parameter prediction error
+- held-out probe prediction error
 
 Interpretation:
 
 - if these are weak, then the belief is not really learning the world
+- if mechanics decode is decent but held-out probe prediction is weak, the
+  belief may be acting more like a compressed control hint than a predictive map
 
 ### 2. Is the belief stable across different probes of the same world?
 
@@ -292,6 +295,8 @@ Preferred current implementation:
   uncertainty ingredients the model is actually using
 - if geometry-heavy features become anti-correlated with mechanics error, keep
   them as diagnostics but reduce their role inside the uncertainty object
+- inspect the raw uncertainty distribution too, because a nearly constant
+  uncertainty signal can still look acceptable under some normalized losses
 
 ### Split Retrieval
 
@@ -331,6 +336,15 @@ Current dashboard expectation:
 - show both raw same-world gap and nearest-between distance
 - plot these against each other so the ratio is visually obvious
 - treat gap ratio as more trustworthy than rounded same-env spread alone
+- also show nearest-between-distance distribution, because a tiny absolute
+  belief scale can make ratios look confusing until the collapse is visible
+- also show full pairwise different-world distance distribution, because
+  nearest-neighbor views alone can hide global codebook collapse
+- also show split retrieval-rank distribution, because median rank movement is
+  often more informative than noisy top-1 retrieval alone
+- also show belief-norm distribution and raw-vs-unit distance summaries, so we
+  can tell whether collapse lives in the raw belief or only in the normalized
+  comparison view
 
 ### Failure Lift
 

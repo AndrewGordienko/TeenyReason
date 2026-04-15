@@ -139,14 +139,23 @@ The belief should help answer:
 Implementation rule:
 
 - preserve local geometry only when it reflects predictive similarity
+- if one latent cannot simultaneously support forecasting and good geometry,
+  split it into a predictive belief plus a metric projector rather than forcing
+  one vector to do every job
 - use retrieval and neighbor metrics that are tied to hidden mechanics or
   successor-like prediction
+- do not let the world-belief collapse into a tiny codebook if the agent is
+  supposed to reuse it as a predictive map
+- inspect the raw pre-normalization belief as the main predictive-map object;
+  normalized copies are useful for comparison losses but should not be confused
+  with the whole belief
 
 This is why the repo should care about:
 
 - split retrieval
 - neighbor alignment
 - world-consistent local geometry
+- non-collapsed belief scale
 
 and not only:
 
@@ -169,6 +178,8 @@ Implementation rule:
 - uncertainty should be calibrated against actual mechanics prediction error
 - disjoint-support disagreement matters more than overlapping-subset agreement
 - leave-one-goal-out degradation matters more than decorative posterior spread
+- probe budgets should be allowed to stop early when uncertainty is already low
+  enough for the downstream solver
 
 Failure mode to avoid:
 

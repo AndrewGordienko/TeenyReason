@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from ..crawler import CrawlerModelBundle
 from ..envs import get_action_values, make_env
 from ..models.env_belief import EnvBeliefAggregator, EnvParamPredictorEnsemble
 from .ppo_core import (
@@ -169,19 +170,22 @@ def evaluate_probe_policy(
     action_high: np.ndarray,
     randomize_physics: bool,
     base_physics,
-    probe_count: int,
+    base_probe_episodes: int,
+    max_probe_episodes: int,
+    uncertainty_probe_threshold: float,
     online_z_update_alpha: float,
     online_z_update_freq: int,
     eval_episodes: int,
     seed: int,
     device: torch.device,
-) -> tuple[list[float], int]:
+) -> tuple[list[float], int, float]:
     """Run deterministic probe-conditioned eval episodes before declaring solved."""
     env = make_env(env_name)
     probe_env = make_env(env_name)
     rng = np.random.default_rng(seed)
     returns: list[float] = []
     total_steps = 0
+    total_probe_windows = 0
 
     for eval_episode in range(eval_episodes):
         episode_physics = select_episode_physics(rng, randomize_physics, base_physics)
@@ -192,7 +196,9 @@ def evaluate_probe_policy(
         if probe_planner is not None:
             probe_planner.begin_env_instance()
 
-        for _ in range(probe_count):
+        probe_target_count = max(1, int(base_probe_episodes))
+        probe_idx = 0
+        while probe_idx < probe_target_count:
             window_states, window_actions, window_rewards, probe_failed, probe_steps_used = collect_adaptive_probe_window(
                 env=probe_env,
                 encoder=encoder,
@@ -236,6 +242,14 @@ def evaluate_probe_policy(
                 device=device,
                 posterior_views=belief_posteriors,
             )
+            total_probe_windows += 1
+            if (
+                probe_idx + 1 >= probe_target_count
+                and belief_uncertainty(belief) >= uncertainty_probe_threshold
+                and probe_target_count < max_probe_episodes
+            ):
+                probe_target_count += 1
+            probe_idx += 1
 
         if belief is None:
             returns.append(0.0)
@@ -286,7 +300,8 @@ def evaluate_probe_policy(
 
     env.close()
     probe_env.close()
-    return returns, total_steps
+    avg_probe_windows = total_probe_windows / max(int(eval_episodes), 1)
+    return returns, total_steps, float(avg_probe_windows)
 
 
 def compute_sil_loss(
@@ -612,11 +627,12 @@ def train_plain_ppo(
 
 def train_probe_conditioned_ppo(
     env_name: str,
-    encoder: WorldEncoder,
-    belief_aggregator: EnvBeliefAggregator,
-    env_param_predictor: EnvParamPredictorEnsemble | None,
-    predictor: DeltaPredictorEnsemble | None,
-    device: torch.device,
+    crawler_bundle: CrawlerModelBundle | None = None,
+    encoder: WorldEncoder | None = None,
+    belief_aggregator: EnvBeliefAggregator | None = None,
+    env_param_predictor: EnvParamPredictorEnsemble | None = None,
+    predictor: DeltaPredictorEnsemble | None = None,
+    device: torch.device | None = None,
     num_episodes: int = 300,
     window_size: int = 8,
     action_bins: int = 9,
@@ -661,6 +677,15 @@ def train_probe_conditioned_ppo(
     peer_solved_episode: int | None = None,
 ) -> TrainingRunResult:
     """Train PPO with an extra belief vector built from active probe trajectories."""
+    if crawler_bundle is not None:
+        encoder = crawler_bundle.encoder
+        belief_aggregator = crawler_bundle.belief_aggregator
+        env_param_predictor = crawler_bundle.env_param_predictor
+        predictor = crawler_bundle.predictor
+        device = crawler_bundle.device
+    if encoder is None or belief_aggregator is None or device is None:
+        raise ValueError("Probe-conditioned PPO needs either a crawler bundle or explicit crawler models.")
+
     train_env = make_env(env_name)
     probe_env = make_env(env_name)
     action_low, action_high = validate_continuous_env(train_env)
@@ -1072,7 +1097,7 @@ def train_probe_conditioned_ppo(
             pending_steps = 0
 
         if episode_return >= solved_return:
-            eval_returns, eval_steps = evaluate_probe_policy(
+            eval_returns, eval_steps, eval_probe_count = evaluate_probe_policy(
                 policy=policy,
                 encoder=encoder,
                 belief_aggregator=belief_aggregator,
@@ -1086,7 +1111,9 @@ def train_probe_conditioned_ppo(
                 action_high=action_high,
                 randomize_physics=randomize_physics,
                 base_physics=base_physics,
-                probe_count=max_probe_episodes,
+                base_probe_episodes=base_probe_episodes,
+                max_probe_episodes=max_probe_episodes,
+                uncertainty_probe_threshold=uncertainty_probe_threshold,
                 online_z_update_alpha=online_z_update_alpha,
                 online_z_update_freq=online_z_update_freq,
                 eval_episodes=solve_eval_episodes,
@@ -1098,7 +1125,7 @@ def train_probe_conditioned_ppo(
             print(
                 f"[run {run_index}/{total_runs} | seed {seed} | {variant_label}] "
                 f"solve-check | eval_returns={np.round(eval_returns, 2).tolist()} | "
-                f"eval_avg={eval_avg:.2f} | eval_probes={max_probe_episodes}"
+                f"eval_avg={eval_avg:.2f} | eval_probes={eval_probe_count:.1f}"
             )
             if eval_avg >= solved_return:
                 solved_episode = episode
@@ -1106,7 +1133,7 @@ def train_probe_conditioned_ppo(
                 solve_policy_state_dict = snapshot_policy_state_dict(policy)
                 solve_state_normalizer_state = snapshot_normalizer_state(state_normalizer)
                 solve_eval_returns = list(eval_returns)
-                solve_probe_count = max_probe_episodes
+                solve_probe_count = int(round(eval_probe_count))
                 print(
                     f"[run {run_index}/{total_runs} | seed {seed} | {variant_label}] "
                     f"Solved environment at episode {episode:04d} "

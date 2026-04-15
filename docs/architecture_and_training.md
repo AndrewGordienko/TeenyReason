@@ -100,12 +100,27 @@ Why it matters:
 
 Canonical names:
 
-- `z_env`
+- `z_env_predictive`
+- `z_env_metric`
 - `u_env`
 
 ## Current Module Ownership
 
 The current repo should be mentally organized like this.
+
+### `teenyreason/crawler/`
+
+Owns:
+
+- the reusable crawler-side model bundle
+- held-out probe prediction helpers
+- the seam between representation learning and downstream algorithms
+
+Should not own:
+
+- PPO-specific rollout/update policy
+- dashboard rendering policy
+- environment-specific benchmark orchestration
 
 ### `teenyreason/probe/probe_data.py`
 
@@ -150,6 +165,13 @@ This file is the clearest boundary between:
 
 - local probe evidence
 - actual environment belief
+
+It should support a split between:
+
+- predictive belief content used for mechanics decode and held-out future-probe
+  prediction
+- metric-space projections used for retrieval, neighbor structure, and latent
+  geometry diagnostics
 
 ### `teenyreason/probe/probe_latent.py`
 
@@ -215,13 +237,19 @@ The intended data flow is:
    maps each probe window to local evidence
 4. `EnvBeliefAggregator`
    pools many windows from the same env into `z_env`
-5. `EnvParamPredictorEnsemble`
-   decodes hidden mechanics and disagreement
-6. `train_probe_conditioned_ppo(...)`
+5. `teenyreason/crawler/`
+   packages the crawler-side bundle so downstream algorithms can consume it as
+   a library instead of re-owning probe internals
+6. `EnvParamPredictorEnsemble` and held-out probe predictors
+   decode hidden mechanics and forecast what additional probe evidence would reveal
+7. `EnvMetricProjector`
+   maps the predictive belief into a geometry-friendly metric space for
+   retrieval and neighborhood diagnostics
+8. `train_probe_conditioned_ppo(...)`
    uses `z_env + u_env` during downstream control
-7. `build_latent_snapshot(...)`
+9. `build_latent_snapshot(...)`
    saves env-level and window-level diagnostics for analysis
-8. `dashboard.py`
+10. `dashboard.py`
    visualizes those artifacts
 
 That flow should stay easy to explain in one whiteboard sketch.
@@ -356,6 +384,9 @@ The preferred implementation is now:
 - train that head against actual mechanics error and support-ambiguity targets
 - seed the head with a mechanics-first prior so decoder and leave-one-goal-out
   signals matter more than decorative geometry by default
+- rescale disagreement features by batch-wise positive scales so tiny raw
+  magnitudes still preserve useful variation
+- check raw uncertainty spread directly, not only normalized calibration loss
 
 That is better than a fully hand-written uncertainty scalar because it lets the
 repo learn which disagreement signals really matter without pretending the
@@ -381,8 +412,31 @@ The dashboard should now make these failure modes visible directly:
 
 - uncertainty vs actual mechanics-error scatter
 - same-world gap vs nearest-between distance scatter
+- uncertainty distribution
+- nearest-between-distance distribution
+- pairwise different-world distance distribution
+- split retrieval-rank distribution
 - learned uncertainty-feature weights
 - outlier readouts for worst geometry, worst error, and highest uncertainty
+
+The env-belief itself should also resist geometric collapse.
+
+Current implementation rule:
+
+- add a modest spread floor on env beliefs so different sampled worlds do not
+  collapse into a microscopic patch on the unit sphere
+- add a stronger batch-level repulsion or uniformity pressure so the belief
+  cloud resists global collapse, not just nearest-neighbor collapse
+- inspect both the raw env belief and the unit-normalized view; the normalized
+  copy is useful for contrastive losses, but it should not silently replace the
+  actual world belief in diagnostics
+- add variance/covariance regularization on the raw env belief so dimensions do
+  not collapse into one redundant channel
+- add held-out probe prediction from the env belief so the representation is
+  forced to forecast what new evidence would reveal, not only decode static
+  mechanics labels after the fact
+- preserve local geometry through retrieval and gap-ratio losses, but also
+  preserve enough global scale that those metrics remain meaningful
 
 ## Current CartPole Failure Modes To Watch
 
@@ -587,6 +641,8 @@ Good geometry means:
 - same env subsets are near each other
 - nearby env beliefs correspond to nearby mechanics
 - distances have operational meaning for transfer and retrieval
+- the pre-normalization belief itself stays spread enough to behave like a
+  predictive map rather than a tiny codebook
 
 Bad geometry can still look nice:
 

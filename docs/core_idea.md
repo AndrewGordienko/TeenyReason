@@ -41,6 +41,13 @@ A good latent in this repo should be:
 - Reusable: it should transfer across downstream tasks in the same family of
   environments.
 
+In practice that can mean two closely related env-level representations:
+
+- a predictive belief that carries hidden mechanics and held-out probe
+  forecasting
+- a metric projection that is optimized for retrieval, neighborhood structure,
+  and geometry diagnostics
+
 ## Working Hypothesis
 
 The agent should have two phases:
@@ -59,12 +66,22 @@ The repo is moving toward a "latent environment belief lab" with these pieces:
   choose experiments that reduce uncertainty instead of replaying fixed scripts
 - Structured posterior:
   represent mean belief plus uncertainty, not only one point embedding
+- Factorized env belief:
+  separate predictive world-state content from metric / retrieval geometry when
+  one vector cannot do both jobs well
 - Task-relevant supervision:
   predict not just next state, but controllability, recoverability, risk, and
   return-relevant summaries
 - Belief evaluation:
   inspect calibration, identifiability, transfer value, and nearest-neighbor
   semantics instead of only raw PPO score
+- Predictive reuse:
+  require the env belief to predict what a held-out future probe would reveal,
+  not only decode hidden parameters after the fact
+- Library boundary:
+  treat the crawler and belief builder as a reusable library whose outputs can
+  feed RL, language, or vision downstream learners instead of living inside one
+  PPO-specific training loop
 - Visualization:
   make the latent space and belief trajectories visible during research
 
@@ -73,6 +90,9 @@ The repo is moving toward a "latent environment belief lab" with these pieces:
 - `teenyreason/representation/`
   The stable entrypoint for representation learning, latent analysis, and saved
   latent-space artifacts.
+- `teenyreason/crawler/`
+  Library-facing bundle and predictive-target helpers for training, loading,
+  and using the crawler-side representation stack.
 - `teenyreason/probe/`
   Probe collection and online belief update utilities.
 - `teenyreason/rl/`

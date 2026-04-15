@@ -43,6 +43,8 @@ Everything else is in service of that:
 - window-level evidence matters because it feeds the belief
 - controller quality matters because it tests whether the belief is useful
 - dashboard quality matters because it helps inspect the belief
+- library boundaries matter because RL should consume the belief system, not
+  quietly redefine it inside one downstream algorithm
 
 Do not confuse any of these helper systems with the belief itself.
 
@@ -73,6 +75,7 @@ Good uncertainty should mean:
 - the model is still unsure about hidden mechanics
 - different small evidence subsets produce meaningfully different beliefs
 - decoded mechanics vary because the world is not yet pinned down
+- held-out probe evidence would still be hard to predict from the current belief
 
 Bad uncertainty:
 
@@ -101,6 +104,8 @@ Before making any substantial change, answer these questions in your head:
 3. How would I know if the change improved the env belief itself?
 4. What metric should move if the change worked for the right reason?
 5. What shortcut or fake win could still produce an apparent improvement?
+6. Should this logic live in the crawler library or only in one downstream
+   learner?
 
 If you cannot answer those, stop and write the change down more clearly first.
 
@@ -354,6 +359,7 @@ At the current stage of the repo, agents should prioritize:
 3. calibrated uncertainty
 4. active crawler objectives
 5. controller usage of the belief
+6. raw-belief collapse checks before trusting normalized-latent geometry
 
 These priorities are more important than:
 

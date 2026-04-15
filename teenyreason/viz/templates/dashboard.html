@@ -606,7 +606,9 @@
               <option value="env_param_mean" selected>Env Param Mean</option>
               <option value="uncertainty">Uncertainty</option>
               <option value="same_env_spread">Same-env Spread</option>
+              <option value="belief_norm">Belief Norm</option>
               <option value="env_error">Env Error</option>
+              <option value="future_probe_error">Future Probe Error</option>
               <option value="gap_ratio">Gap Ratio</option>
               <option value="split_retrieval_margin_deficit">Retrieval Deficit</option>
               <option value="terminated">Termination</option>
@@ -665,6 +667,31 @@
         <div class="subsection">
           <div class="subhead">Where To Dig</div>
           <div id="outlierGuideWrap" class="summary-list"></div>
+        </div>
+
+        <div class="subsection">
+          <div class="subhead">Uncertainty Distribution</div>
+          <div class="plot-shell" id="uncertaintyDistPlotWrap"></div>
+        </div>
+
+        <div class="subsection">
+          <div class="subhead">Nearest Different-world Distance Distribution</div>
+          <div class="plot-shell" id="beliefScalePlotWrap"></div>
+        </div>
+
+        <div class="subsection">
+          <div class="subhead">Pairwise Different-world Distance Distribution</div>
+          <div class="plot-shell" id="pairwiseDistPlotWrap"></div>
+        </div>
+
+        <div class="subsection">
+          <div class="subhead">Split Retrieval Rank Distribution</div>
+          <div class="plot-shell" id="retrievalRankPlotWrap"></div>
+        </div>
+
+        <div class="subsection">
+          <div class="subhead">Belief Norm Distribution</div>
+          <div class="plot-shell" id="beliefNormPlotWrap"></div>
         </div>
       </div>
     </section>
@@ -831,6 +858,11 @@
       }
       const uncertainties = payload.points.map((point) => point.uncertainty);
       const envParamMeans = payload.points.map((point) => point.env_param_mean);
+      const series = payload.series || {};
+      const pairwiseBetween = (series.pairwise_between_distance || []).map(Number).filter((value) => Number.isFinite(value));
+      const pairwiseBetweenUnit = (series.pairwise_between_distance_unit || []).map(Number).filter((value) => Number.isFinite(value));
+      const splitRetrievalRanks = (series.split_retrieval_rank || []).map(Number).filter((value) => Number.isFinite(value));
+      const beliefNorms = payload.points.map((point) => Number(point.belief_norm ?? 0)).filter((value) => Number.isFinite(value));
       const totalModes = payload.mode_counts.reduce((sum, row) => sum + row.count, 0);
       const sortedModes = [...payload.mode_counts].sort((left, right) => right.count - left.count);
       const topMode = sortedModes[0] || null;
@@ -839,8 +871,14 @@
         uncertaintyP10: quantile(uncertainties, 0.10),
         uncertaintyMedian: quantile(uncertainties, 0.50),
         uncertaintyP90: quantile(uncertainties, 0.90),
+        uncertaintyStd: standardDeviation(uncertainties),
+        beliefNormStd: standardDeviation(beliefNorms),
         envMeanMin: Math.min(...envParamMeans),
         envMeanMax: Math.max(...envParamMeans),
+        nearestBetweenMedian: quantile(payload.points.map((point) => Number(point.nearest_between_distance ?? 0)), 0.50),
+        pairwiseBetweenMean: diagnostics.pairwise_between_mean ?? (pairwiseBetween.length ? pairwiseBetween.reduce((sum, value) => sum + value, 0) / pairwiseBetween.length : 0),
+        pairwiseBetweenP10: diagnostics.pairwise_between_p10 ?? (pairwiseBetween.length ? quantile(pairwiseBetween, 0.10) : 0),
+        pairwiseBetweenMeanUnit: diagnostics.pairwise_between_mean_unit ?? (pairwiseBetweenUnit.length ? pairwiseBetweenUnit.reduce((sum, value) => sum + value, 0) / pairwiseBetweenUnit.length : 0),
         pcaTotal: payload.summary.pca_explained.reduce((sum, value) => sum + value, 0),
         topModeName: topMode ? topMode.probe_mode : "n/a",
         topModeShare: topMode ? topMode.count / Math.max(totalModes, 1) : 0,
@@ -855,11 +893,15 @@
         splitRetrievalMedianRank: diagnostics.split_retrieval_median_rank ?? 0,
         sameEnvGapRatio: diagnostics.same_env_gap_ratio ?? {mean: 0, p90: 0},
         envParamUncertaintyMean: diagnostics.env_param_uncertainty_mean ?? 0,
+        futureProbeErrorMean: diagnostics.future_probe_error_mean ?? 0,
         supportGroupRatioMean: diagnostics.support_group_ratio_mean ?? payload.summary.support_group_ratio_mean ?? 0,
         envParamErrorMean: diagnostics.env_param_error_mean ?? 0,
         uncertaintyFeatureImportance: diagnostics.uncertainty_feature_importance ?? [],
         uncertaintyErrorAlignment: diagnostics.uncertainty_error_alignment || {correlation: 0, low_error: 0, high_error: 0, gap: 0},
         failureLift: diagnostics.failure_lift || {low_rate: 0, high_rate: 0, gap: 0, lift: 1},
+        pairwiseBetween,
+        pairwiseBetweenUnit,
+        splitRetrievalRanks,
       };
     }
 
@@ -954,6 +996,9 @@
       if (metric === "same_env_spread") {
         return "same_env_spread";
       }
+      if (metric === "belief_norm") {
+        return "belief_norm";
+      }
       if (metric === "env_error") {
         return "env_error";
       }
@@ -1011,6 +1056,15 @@
       });
     }
 
+    function standardDeviation(values) {
+      if (!values.length) {
+        return 0;
+      }
+      const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+      const variance = values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length;
+      return Math.sqrt(Math.max(variance, 0));
+    }
+
     function scatterShellSvg(points, xField, yField, xLabel, yLabel, colorField = null) {
       if (!points || !points.length) {
         return `<div class="empty">No diagnostic points are available yet.</div>`;
@@ -1058,6 +1112,46 @@
           ${circles}
           <text x="${pad}" y="${height - 12}" fill="#6e7685" font-size="12" letter-spacing="0.08em">${xLabel}</text>
           <text x="14" y="${pad - 10}" fill="#6e7685" font-size="12" letter-spacing="0.08em">${yLabel}</text>
+        </svg>
+      `;
+    }
+
+    function histogramSvg(values, label, color = "#2854d8", bins = 10) {
+      if (!values || !values.length) {
+        return `<div class="empty">No diagnostic distribution is available yet.</div>`;
+      }
+      const valid = values.filter((value) => Number.isFinite(Number(value))).map(Number);
+      if (!valid.length) {
+        return `<div class="empty">No finite diagnostic distribution is available yet.</div>`;
+      }
+      const width = 520;
+      const height = 240;
+      const pad = 40;
+      const min = Math.min(...valid);
+      const max = Math.max(...valid);
+      const span = Math.max(max - min, 1e-6);
+      const binCount = Math.min(Math.max(6, bins), 20);
+      const counts = Array.from({length: binCount}, () => 0);
+      for (const value of valid) {
+        const idx = Math.min(binCount - 1, Math.floor(((value - min) / span) * binCount));
+        counts[idx] += 1;
+      }
+      const maxCount = Math.max(...counts, 1);
+      const barWidth = (width - 2 * pad) / binCount;
+      const bars = counts.map((count, idx) => {
+        const barHeight = ((height - 2 * pad) * count) / maxCount;
+        const x = pad + idx * barWidth + 2;
+        const y = height - pad - barHeight;
+        return `<rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${Math.max(barWidth - 4, 2).toFixed(2)}" height="${barHeight.toFixed(2)}" fill="${color}" fill-opacity="0.80"></rect>`;
+      }).join("");
+      return `
+        <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${label} distribution">
+          <rect x="0" y="0" width="${width}" height="${height}" fill="#ffffff"></rect>
+          <line x1="${pad}" y1="${height - pad}" x2="${width - pad}" y2="${height - pad}" stroke="#d7dee8" stroke-width="1.25"></line>
+          <line x1="${pad}" y1="${pad}" x2="${pad}" y2="${height - pad}" stroke="#d7dee8" stroke-width="1.25"></line>
+          ${bars}
+          <text x="${pad}" y="${height - 10}" fill="#6e7685" font-size="12" letter-spacing="0.08em">${label}</text>
+          <text x="${pad}" y="${pad - 10}" fill="#6e7685" font-size="12">min ${min.toFixed(3)} · max ${max.toFixed(3)} · std ${standardDeviation(valid).toFixed(3)}</text>
         </svg>
       `;
     }
@@ -1124,6 +1218,11 @@
         matrixRow("Support Diversity", `${(100 * (summary.support_group_ratio_mean ?? 1)).toFixed(1)}%`, "share of support windows that come from distinct goal families rather than repeated copies of one experiment"),
         matrixRow("Env Param Mean Band", `${derived ? derived.envMeanMin.toFixed(3) : "n/a"} to ${derived ? derived.envMeanMax.toFixed(3) : "n/a"}`, "coarse span of hidden parameter settings covered by the aggregated env beliefs"),
         matrixRow("Uncertainty Mean", summary.uncertainty_mean.toFixed(3), "average disagreement across disjoint small support halves and their decoded mechanics"),
+        matrixRow("Uncertainty Std", derived ? derived.uncertaintyStd.toFixed(3) : "n/a", "spread of env-level uncertainty across sampled worlds; near-zero usually means confidence collapse"),
+        matrixRow("Belief Norm Std", derived ? derived.beliefNormStd.toFixed(3) : "n/a", "spread of pre-normalization belief magnitudes across sampled worlds; near-zero usually means raw belief collapse"),
+        matrixRow("Median Nearest-Between", derived ? derived.nearestBetweenMedian.toFixed(3) : "n/a", "typical distance to the nearest different-world belief; tiny values usually mean the belief cloud has collapsed"),
+        matrixRow("Pairwise Between Mean", derived ? derived.pairwiseBetweenMean.toFixed(3) : "n/a", "mean distance across different-world env beliefs; low values usually mean global geometry is still compressed"),
+        matrixRow("Unit Pairwise Mean", derived ? derived.pairwiseBetweenMeanUnit.toFixed(3) : "n/a", "mean distance after unit normalization; if raw and unit views disagree, normalization may be hiding useful belief scale"),
         matrixRow("PCA Explained", summary.pca_explained.map((value) => value.toFixed(2)).join(" / "), "variance captured by the first two PCA axes"),
       ].join("");
 
@@ -1162,6 +1261,11 @@
           "Env Param Disagreement",
           derived.envParamUncertaintyMean.toFixed(3),
           "Average decoded-mechanics spread across disjoint support halves and leave-one-goal-out beliefs. This is now the main uncertainty source, not the collapsed posterior std head."
+        ),
+        readoutRow(
+          "Held-out Probe Error",
+          derived.futureProbeErrorMean.toFixed(3),
+          "Average error when the env belief tries to predict held-out probe-summary evidence. Lower is better: the belief is forecasting what a new probe would reveal."
         ),
         readoutRow(
           "Support Diversity",
@@ -1244,9 +1348,11 @@
 
       const sortedByGap = [...payload.points].sort((left, right) => Number(right.gap_ratio) - Number(left.gap_ratio));
       const sortedByError = [...payload.points].sort((left, right) => Number(right.env_error) - Number(left.env_error));
+      const sortedByFutureProbeError = [...payload.points].sort((left, right) => Number(right.future_probe_error || 0) - Number(left.future_probe_error || 0));
       const sortedByUncertainty = [...payload.points].sort((left, right) => Number(right.uncertainty) - Number(left.uncertainty));
       const topGap = sortedByGap[0];
       const topError = sortedByError[0];
+      const topFutureProbeError = sortedByFutureProbeError[0];
       const topUncertainty = sortedByUncertainty[0];
       el("outlierGuideWrap").innerHTML = derived ? [
         readoutRow(
@@ -1258,6 +1364,11 @@
           "Worst Mechanics Error",
           topError ? topError.env_error.toFixed(3) : "n/a",
           "Largest env-parameter prediction error among saved env beliefs. Useful for finding brittle worlds even when median fit looks good."
+        ),
+        readoutRow(
+          "Worst Held-out Probe Error",
+          topFutureProbeError ? Number(topFutureProbeError.future_probe_error || 0).toFixed(3) : "n/a",
+          "Largest error when an env belief tries to predict held-out probe evidence. Useful when mechanics decode is decent but predictive reuse is weak."
         ),
         readoutRow(
           "Highest Uncertainty",
@@ -1282,6 +1393,11 @@
         el("gapRatioPlotWrap").innerHTML = `<div class="empty">No same-world gap diagnostics are available yet.</div>`;
         el("uncertaintyFeatureWrap").innerHTML = `<div class="empty">No learned uncertainty feature weights are available yet.</div>`;
         el("outlierGuideWrap").innerHTML = `<div class="empty">No outlier readout is available yet.</div>`;
+        el("uncertaintyDistPlotWrap").innerHTML = `<div class="empty">No uncertainty distribution is available yet.</div>`;
+        el("beliefScalePlotWrap").innerHTML = `<div class="empty">No belief-scale distribution is available yet.</div>`;
+        el("pairwiseDistPlotWrap").innerHTML = `<div class="empty">No pairwise-distance distribution is available yet.</div>`;
+        el("retrievalRankPlotWrap").innerHTML = `<div class="empty">No split-rank distribution is available yet.</div>`;
+        el("beliefNormPlotWrap").innerHTML = `<div class="empty">No belief-norm distribution is available yet.</div>`;
         return;
       }
 
@@ -1345,6 +1461,8 @@
                 ? "Darker teal points indicate larger hidden-parameter mean across the env-parameter vector."
                 : metric === "env_error"
                   ? "Darker indigo points indicate larger hidden-mechanics prediction error for the env belief."
+                  : metric === "future_probe_error"
+                    ? "Darker indigo points indicate larger held-out probe prediction error from the env belief."
                   : metric === "gap_ratio"
                   ? "Darker indigo points indicate same-world split halves that are too far apart relative to nearby different worlds."
                     : metric === "split_retrieval_margin_deficit"
@@ -1371,6 +1489,36 @@
         "SAME-WORLD GAP",
         "NEAREST DIFFERENT-WORLD",
         "env_error",
+      );
+      el("uncertaintyDistPlotWrap").innerHTML = histogramSvg(
+        payload.points.map((point) => Number(point.uncertainty)),
+        "UNCERTAINTY",
+        "#7f56d9",
+        10,
+      );
+      el("beliefScalePlotWrap").innerHTML = histogramSvg(
+        payload.points.map((point) => Number(point.nearest_between_distance)),
+        "NEAREST DIFFERENT-WORLD",
+        "#3d8d5e",
+        10,
+      );
+      el("pairwiseDistPlotWrap").innerHTML = histogramSvg(
+        (payload.series?.pairwise_between_distance || []).map((value) => Number(value)),
+        "PAIRWISE DIFFERENT-WORLD",
+        "#5b7cfa",
+        12,
+      );
+      el("retrievalRankPlotWrap").innerHTML = histogramSvg(
+        (payload.series?.split_retrieval_rank || []).map((value) => Number(value)),
+        "SPLIT RETRIEVAL RANK",
+        "#b85b6c",
+        10,
+      );
+      el("beliefNormPlotWrap").innerHTML = histogramSvg(
+        payload.points.map((point) => Number(point.belief_norm ?? 0)),
+        "BELIEF NORM",
+        "#0f8a84",
+        10,
       );
 
       const totalModeCount = payload.mode_counts.reduce((sum, row) => sum + row.count, 0);
@@ -1487,6 +1635,11 @@
         el("gapRatioPlotWrap").innerHTML = `<div class="empty">No same-world gap diagnostics are available yet.</div>`;
         el("uncertaintyFeatureWrap").innerHTML = `<div class="empty">No learned uncertainty feature weights are available yet.</div>`;
         el("outlierGuideWrap").innerHTML = `<div class="empty">No outlier readout is available yet.</div>`;
+        el("uncertaintyDistPlotWrap").innerHTML = `<div class="empty">No uncertainty distribution is available yet.</div>`;
+        el("beliefScalePlotWrap").innerHTML = `<div class="empty">No belief-scale distribution is available yet.</div>`;
+        el("pairwiseDistPlotWrap").innerHTML = `<div class="empty">No pairwise-distance distribution is available yet.</div>`;
+        el("retrievalRankPlotWrap").innerHTML = `<div class="empty">No split-rank distribution is available yet.</div>`;
+        el("beliefNormPlotWrap").innerHTML = `<div class="empty">No belief-norm distribution is available yet.</div>`;
         return;
       }
       renderLatent(await fetchJson(`/api/latent/${encodeURIComponent(name)}`));

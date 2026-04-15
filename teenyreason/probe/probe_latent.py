@@ -194,6 +194,8 @@ def aggregate_env_belief(
     )
     payload["belief"] = sanitize_belief_vector(payload["belief"])
     payload["env_mean"] = sanitize_array(payload["env_mean"])
+    if "env_mean_raw" in payload:
+        payload["env_mean_raw"] = sanitize_array(payload["env_mean_raw"])
     payload["env_logvar"] = sanitize_array(payload["env_logvar"])
     payload["view_spread"] = sanitize_array(payload["view_spread"], nan=0.0, posinf=1.0, neginf=0.0)
     payload["env_param_mean"] = sanitize_array(payload["env_param_mean"])

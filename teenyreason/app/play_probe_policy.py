@@ -6,8 +6,8 @@ import pickle
 import numpy as np
 import torch
 
+from ..crawler import load_crawler_bundle_from_checkpoint
 from ..envs import get_action_values, make_env
-from ..models.env_belief import EnvBeliefAggregator, EnvParamPredictorEnsemble
 from ..probe.cartpole_scientist import build_probe_planner
 from ..rl.ppo_core import (
     ProbeConditionedGaussianActorCritic,
@@ -18,16 +18,13 @@ from ..rl.ppo_core import (
 )
 from ..probe.probe_data import apply_env_params, default_env_params
 from ..probe.probe_latent import (
-    aggregate_env_belief,
     collect_adaptive_probe_window,
-    encode_window_posterior,
     init_recurrent_belief_hidden,
     maybe_update_online_belief,
     nearest_probe_action_idx,
     select_episode_physics,
     update_recurrent_belief_from_window,
 )
-from ..representation import DeltaPredictorEnsemble, WorldEncoder
 
 
 def load_normalizer(normalizer_state: dict) -> RunningNormalizer:
@@ -97,9 +94,6 @@ def main():
     base_probe_episodes = int(checkpoint["base_probe_episodes"])
     max_probe_episodes = int(checkpoint.get("max_probe_episodes", base_probe_episodes))
     randomize_physics = bool(checkpoint.get("randomize_physics", False))
-    predictor_ensemble_size = int(checkpoint.get("predictor_ensemble_size", 0))
-    env_param_dim = int(checkpoint.get("env_param_dim", 1))
-    env_param_predictor_ensemble_size = int(checkpoint.get("env_param_predictor_ensemble_size", predictor_ensemble_size))
     solve_probe_count = checkpoint.get("solve_probe_count")
 
     device = torch.device("cpu")
@@ -112,50 +106,16 @@ def main():
 
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-    encoder = WorldEncoder(
+    crawler_bundle = load_crawler_bundle_from_checkpoint(
+        checkpoint=checkpoint,
         state_dim=state_dim,
-        window_size=window_size,
         action_vocab_size=len(action_values),
-        z_dim=z_dim,
-    ).to(device)
-    try:
-        encoder.load_state_dict(checkpoint["encoder_state_dict"])
-    except RuntimeError as exc:
-        raise RuntimeError(
-            "This checkpoint was saved with an older probe-model architecture. "
-            "Please retrain with the current code before using play_probe_policy.py."
-        ) from exc
-    encoder.eval()
-
-    predictor = None
-    if "predictor_state_dict" in checkpoint:
-        predictor = DeltaPredictorEnsemble(
-            ensemble_size=predictor_ensemble_size,
-            state_dim=state_dim,
-            action_vocab_size=len(action_values),
-            z_dim=z_dim,
-        ).to(device)
-        predictor.load_state_dict(checkpoint["predictor_state_dict"])
-        predictor.eval()
-
-    if "belief_aggregator_state_dict" not in checkpoint:
-        raise RuntimeError(
-            "This checkpoint was saved before env-level belief aggregation was added. "
-            "Please retrain with the current code before using play_probe_policy.py."
-        )
-    belief_aggregator = EnvBeliefAggregator(window_z_dim=z_dim).to(device)
-    belief_aggregator.load_state_dict(checkpoint["belief_aggregator_state_dict"])
-    belief_aggregator.eval()
-
-    env_param_predictor = None
-    if "env_param_predictor_state_dict" in checkpoint:
-        env_param_predictor = EnvParamPredictorEnsemble(
-            ensemble_size=env_param_predictor_ensemble_size,
-            input_dim=z_dim,
-            output_dim=env_param_dim,
-        ).to(device)
-        env_param_predictor.load_state_dict(checkpoint["env_param_predictor_state_dict"])
-        env_param_predictor.eval()
+        device=device,
+    )
+    encoder = crawler_bundle.encoder
+    predictor = crawler_bundle.predictor
+    belief_aggregator = crawler_bundle.belief_aggregator
+    env_param_predictor = crawler_bundle.env_param_predictor
 
     policy = ProbeConditionedGaussianActorCritic(
         state_dim=state_dim,
@@ -231,9 +191,7 @@ def main():
             )
             if probe_failed:
                 raise RuntimeError("Could not collect a full probe window for playback.")
-            window_posterior = encode_window_posterior(
-                encoder=encoder,
-                device=device,
+            window_posterior = crawler_bundle.encode_probe_window(
                 window_states=window_states,
                 window_actions=window_actions,
                 window_rewards=window_rewards,
@@ -249,10 +207,7 @@ def main():
                 alpha=1.0,
             )
             belief_posteriors.append(window_posterior)
-            belief, _payload = aggregate_env_belief(
-                belief_aggregator=belief_aggregator,
-                env_param_predictor=env_param_predictor,
-                device=device,
+            belief, _payload = crawler_bundle.build_env_belief(
                 posterior_views=belief_posteriors,
             )
 

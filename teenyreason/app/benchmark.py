@@ -18,6 +18,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from ..crawler import CrawlerModelBundle, train_crawler_library
 from ..envs import (
     BIPEDAL_WALKER_NAME,
     CONTINUOUS_CARTPOLE_NAME,
@@ -25,7 +26,7 @@ from ..envs import (
     get_env_display_name,
 )
 from ..probe.probe_data import ProbeCrawler
-from ..representation import build_latent_snapshot, save_latent_snapshot, train_encoder_predictor
+from ..representation import build_latent_snapshot, save_latent_snapshot
 from ..rl.probe_ppo import train_plain_ppo, train_probe_conditioned_ppo
 
 
@@ -312,10 +313,7 @@ def serialize_normalizer_state(normalizer_state: dict[str, np.ndarray | float]) 
 
 
 def save_training_artifacts(
-    encoder,
-    predictor,
-    belief_aggregator,
-    env_param_predictor,
+    crawler_bundle: CrawlerModelBundle,
     baseline_result,
     probe_result,
     artifact_tag: str,
@@ -342,7 +340,7 @@ def save_training_artifacts(
     baseline_checkpoint_path = output_dir / f"{artifact_tag}_baseline_ppo_checkpoint.pt"
     probe_checkpoint_path = output_dir / f"{artifact_tag}_probe_ppo_checkpoint.pt"
 
-    torch.save(encoder.state_dict(), encoder_path)
+    torch.save(crawler_bundle.encoder.state_dict(), encoder_path)
     np.save(baseline_returns_path, np.asarray(baseline_result.returns, dtype=np.float32))
     np.save(probe_returns_path, np.asarray(probe_result.returns, dtype=np.float32))
     torch.save(
@@ -387,13 +385,25 @@ def save_training_artifacts(
             "online_z_update_freq": online_z_update_freq,
             "base_probe_episodes": base_probe_episodes,
             "max_probe_episodes": max_probe_episodes,
-            "encoder_state_dict": encoder.state_dict(),
-            "predictor_state_dict": predictor.state_dict(),
-            "predictor_ensemble_size": int(predictor.ensemble_size),
-            "belief_aggregator_state_dict": belief_aggregator.state_dict(),
-            "env_param_predictor_state_dict": env_param_predictor.state_dict(),
-            "env_param_predictor_ensemble_size": int(env_param_predictor.ensemble_size),
-            "env_param_dim": int(env_param_predictor.output_dim),
+            "encoder_state_dict": crawler_bundle.encoder.state_dict(),
+            "predictor_state_dict": crawler_bundle.predictor.state_dict(),
+            "predictor_ensemble_size": int(crawler_bundle.predictor.ensemble_size),
+            "belief_aggregator_state_dict": crawler_bundle.belief_aggregator.state_dict(),
+            "env_param_predictor_state_dict": crawler_bundle.env_param_predictor.state_dict(),
+            "env_param_predictor_ensemble_size": int(crawler_bundle.env_param_predictor.ensemble_size),
+            "env_param_dim": int(crawler_bundle.env_param_predictor.output_dim),
+            "env_future_predictor_state_dict": None
+            if crawler_bundle.env_future_predictor is None
+            else crawler_bundle.env_future_predictor.state_dict(),
+            "env_future_summary_dim": 0
+            if crawler_bundle.env_future_predictor is None
+            else int(crawler_bundle.env_future_predictor.net[-1].out_features),
+            "env_metric_projector_state_dict": None
+            if crawler_bundle.env_metric_projector is None
+            else crawler_bundle.env_metric_projector.state_dict(),
+            "env_metric_dim": 0
+            if crawler_bundle.env_metric_projector is None
+            else int(crawler_bundle.env_metric_projector.net[-1].out_features),
             "policy_state_dict": probe_result.policy.state_dict(),
             "state_normalizer": serialize_normalizer(probe_result.state_normalizer),
             "best_policy_state_dict": probe_result.best_policy_state_dict,
@@ -546,9 +556,11 @@ def run_single_seed(
 
     print("\nTraining encoder + delta predictor...")
     # Train the latent encoder before either PPO variant so both runs see the same probe model.
-    encoder, predictor, belief_aggregator, env_param_predictor, device = train_encoder_predictor(
+    crawler_bundle = train_crawler_library(
         windows=windows,
         z_dim=config.z_dim,
+        window_size=config.window_size,
+        action_vocab_size=crawler.action_dim,
         epochs=config.encoder_epochs,
         batch_size=config.encoder_batch_size,
         lr=config.encoder_lr,
@@ -568,17 +580,18 @@ def run_single_seed(
         belief_subset_size=config.encoder_belief_subset_size,
         contrastive_dim=config.encoder_contrastive_dim,
         ensemble_size=4,
-        action_vocab_size=crawler.action_dim,
         intervention_horizon=config.intervention_horizon,
         analytic_affordances=False,
         env_name=config.env_name,
     )
 
     latent_snapshot = build_latent_snapshot(
-        encoder=encoder,
-        belief_aggregator=belief_aggregator,
-        env_param_predictor=env_param_predictor,
-        device=device,
+        encoder=crawler_bundle.encoder,
+        belief_aggregator=crawler_bundle.belief_aggregator,
+        env_param_predictor=crawler_bundle.env_param_predictor,
+        env_future_predictor=crawler_bundle.env_future_predictor,
+        env_metric_projector=crawler_bundle.env_metric_projector,
+        device=crawler_bundle.device,
         windows=windows,
         env_name=config.env_name,
         benchmark_tag=config.benchmark_tag,
@@ -627,11 +640,7 @@ def run_single_seed(
     # Probe-conditioned PPO gets both state and the probe-derived belief vector.
     probe_result = train_probe_conditioned_ppo(
         env_name=config.env_name,
-        encoder=encoder,
-        predictor=predictor,
-        belief_aggregator=belief_aggregator,
-        env_param_predictor=env_param_predictor,
-        device=device,
+        crawler_bundle=crawler_bundle,
         num_episodes=config.num_episodes,
         window_size=config.window_size,
         action_bins=config.action_bins,
@@ -678,12 +687,9 @@ def run_single_seed(
     probe_returns = probe_result.returns
 
     save_training_artifacts(
-        encoder,
-        predictor,
-        belief_aggregator,
-        env_param_predictor,
-        baseline_result,
-        probe_result,
+        crawler_bundle=crawler_bundle,
+        baseline_result=baseline_result,
+        probe_result=probe_result,
         artifact_tag=artifact_tag,
         env_name=config.env_name,
         window_size=config.window_size,
