@@ -8,8 +8,8 @@ import torch
 
 from ..crawler import load_crawler_bundle_from_checkpoint
 from ..envs import get_action_values, make_env
-from ..probe.cartpole_scientist import build_probe_planner
-from ..rl.ppo_core import (
+from ..probe.explorer import build_probe_planner
+from ..rl.core import (
     ProbeConditionedGaussianActorCritic,
     RunningNormalizer,
     mean_to_continuous_action,
@@ -22,6 +22,7 @@ from ..probe.probe_latent import (
     init_recurrent_belief_hidden,
     maybe_update_online_belief,
     nearest_probe_action_idx,
+    probe_group_ids_from_families,
     select_episode_physics,
     update_recurrent_belief_from_window,
 )
@@ -49,6 +50,29 @@ def load_checkpoint(path: str) -> dict:
         # Older checkpoints in this repo stored NumPy arrays in the normalizer
         # state, which requires opting out of weights_only loading.
         return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def build_solver_belief_input(payload: dict[str, np.ndarray]) -> np.ndarray:
+    """Build the solver-facing env-expression vector stored in the crawler payload."""
+    message = np.asarray(
+        payload.get("env_expression", payload.get("belief_message", payload["belief"])),
+        dtype=np.float32,
+    ).reshape(-1)
+    confidence = np.asarray(
+        payload.get(
+            "env_expression_confidence",
+            payload.get("belief_message_confidence", np.asarray([1.0], dtype=np.float32)),
+        ),
+        dtype=np.float32,
+    ).reshape(-1)
+    uncertainty = np.asarray(
+        payload.get(
+            "env_expression_uncertainty",
+            payload.get("belief_message_uncertainty", np.asarray([0.0], dtype=np.float32)),
+        ),
+        dtype=np.float32,
+    ).reshape(-1)
+    return np.concatenate([message, confidence[:1], uncertainty[:1]], axis=0).astype(np.float32)
 
 
 def main():
@@ -86,7 +110,7 @@ def main():
     env_name = checkpoint["env_name"]
     window_size = int(checkpoint["window_size"])
     z_dim = int(checkpoint["z_dim"])
-    belief_dim = int(checkpoint.get("belief_dim", z_dim * 3))
+    belief_dim = int(checkpoint.get("belief_dim", z_dim + 2))
     action_bins = int(checkpoint["action_bins"])
     hidden_dim = int(checkpoint["hidden_dim"])
     online_z_update_alpha = float(checkpoint["online_z_update_alpha"])
@@ -138,14 +162,21 @@ def main():
     policy.eval()
 
     state_normalizer = load_normalizer(normalizer_state)
-    if selected_policy_label == "solve" and checkpoint.get("solve_eval_returns") is not None:
-        solve_eval_returns = np.asarray(checkpoint["solve_eval_returns"], dtype=np.float32)
-        print(
-            "Loaded solve-verified policy snapshot | "
-            f"episode={checkpoint.get('solved_episode')} | "
-            f"eval_returns={np.round(solve_eval_returns, 2).tolist()} | "
-            f"probe_count={solve_probe_count}"
-        )
+    if selected_policy_label == "solve":
+        if checkpoint.get("solve_eval_returns") is not None:
+            solve_eval_returns = np.asarray(checkpoint["solve_eval_returns"], dtype=np.float32)
+            print(
+                "Loaded solve policy snapshot | "
+                f"episode={checkpoint.get('solved_episode')} | "
+                f"eval_returns={np.round(solve_eval_returns, 2).tolist()} | "
+                f"probe_count={solve_probe_count}"
+            )
+        else:
+            print(
+                "Loaded solve policy snapshot | "
+                f"episode={checkpoint.get('solved_episode')} | "
+                f"probe_count={solve_probe_count}"
+            )
     elif selected_policy_label == "best" and checkpoint.get("best_episode") is not None:
         print(
             "Loaded best policy snapshot | "
@@ -171,7 +202,12 @@ def main():
         belief = None
         belief_hidden = init_recurrent_belief_hidden(encoder=encoder, device=device)
         belief_posteriors: list[tuple[np.ndarray, np.ndarray]] = []
-        probe_planner = build_probe_planner(env_name=env_name, action_values=action_values, rng=rng)
+        probe_families: list[str | None] = []
+        probe_planner = build_probe_planner(
+            action_space=env.action_space,
+            action_values=action_values,
+            rng=rng,
+        )
         if probe_planner is not None:
             probe_planner.begin_env_instance()
         for _ in range(probe_count):
@@ -207,9 +243,23 @@ def main():
                 alpha=1.0,
             )
             belief_posteriors.append(window_posterior)
-            belief, _payload = crawler_bundle.build_env_belief(
-                posterior_views=belief_posteriors,
+            observed_family = (
+                None
+                if probe_planner is None
+                else getattr(probe_planner, "current_goal", None)
             )
+            probe_families.append(observed_family)
+            probe_group_ids = probe_group_ids_from_families(
+                probe_families,
+                family_names=crawler_bundle.family_names,
+            )
+            belief, payload = crawler_bundle.build_env_belief(
+                posterior_views=belief_posteriors,
+                probe_group_ids=probe_group_ids,
+                bits_per_dim=int(checkpoint.get("belief_bits_per_dim", 0)),
+                use_residual_sketch=bool(checkpoint.get("belief_use_residual_sketch", False)),
+            )
+        episode_belief = build_solver_belief_input(payload)
 
         apply_env_params(env, episode_physics)
         raw_state, _info = env.reset()
@@ -222,7 +272,7 @@ def main():
             env.render()
             state = state_normalizer.normalize(raw_state)
             state_t = torch.tensor(state[None, :], dtype=torch.float32, device=device)
-            belief_t = torch.tensor(belief[None, :], dtype=torch.float32, device=device)
+            belief_t = torch.tensor(episode_belief[None, :], dtype=torch.float32, device=device)
             with torch.no_grad():
                 mean, _value = policy(state_t, belief_t)
             if args.stochastic:
@@ -255,6 +305,13 @@ def main():
                 online_z_update_freq=online_z_update_freq,
                 episode_step=episode_step,
             )
+            if episode_step % online_z_update_freq == 0:
+                belief, payload = crawler_bundle.build_env_belief(
+                    posterior_views=belief_posteriors,
+                    bits_per_dim=int(checkpoint.get("belief_bits_per_dim", 0)),
+                    use_residual_sketch=bool(checkpoint.get("belief_use_residual_sketch", False)),
+                )
+                episode_belief = build_solver_belief_input(payload)
             raw_state = next_raw_state
             episode_return += float(reward)
             done = bool(terminated or truncated)

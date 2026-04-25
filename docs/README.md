@@ -5,63 +5,79 @@ This folder is the operating manual for the repo.
 If you are new to the project, read in this order:
 
 1. [core_idea.md](./core_idea.md)
-2. [research_manifesto.md](./research_manifesto.md)
-3. [general_crawler_belief.md](./general_crawler_belief.md)
-4. [general_program_plan.md](./general_program_plan.md)
-5. [paper_synthesis.md](./paper_synthesis.md)
-6. [language_domain_synthesis.md](./language_domain_synthesis.md)
-7. [language_belief_design.md](./language_belief_design.md)
-8. [image_domain_synthesis.md](./image_domain_synthesis.md)
-9. [image_belief_design.md](./image_belief_design.md)
-10. [human_learning_synthesis.md](./human_learning_synthesis.md)
-11. [human_learning_design.md](./human_learning_design.md)
-12. [architecture_and_training.md](./architecture_and_training.md)
-13. [evaluation_and_diagnostics.md](./evaluation_and_diagnostics.md)
-14. [agent_guide.md](./agent_guide.md)
+2. [general_crawler_belief.md](./general_crawler_belief.md)
+3. [general_program_plan.md](./general_program_plan.md)
+4. [architecture_and_training.md](./architecture_and_training.md)
+5. [crawler_library_api.md](./crawler_library_api.md)
+6. [benchmark_harness.md](./benchmark_harness.md)
+7. [design_rules.md](./design_rules.md)
+8. [evaluation_and_diagnostics.md](./evaluation_and_diagnostics.md)
+9. [paper_synthesis.md](./paper_synthesis.md)
+10. [language_domain_synthesis.md](./language_domain_synthesis.md)
+11. [language_belief_design.md](./language_belief_design.md)
+12. [image_domain_synthesis.md](./image_domain_synthesis.md)
+13. [image_belief_design.md](./image_belief_design.md)
+14. [human_learning_synthesis.md](./human_learning_synthesis.md)
+15. [human_learning_design.md](./human_learning_design.md)
+16. [research_manifesto.md](./research_manifesto.md)
+17. [agent_guide.md](./agent_guide.md)
 
 Each file has one job.
 
 - `core_idea.md`
   Short framing for the research question.
-- `research_manifesto.md`
-  The thesis, intended architecture, target losses, and what the project is
-  explicitly not trying to do.
 - `general_crawler_belief.md`
   The cross-domain version of the thesis: how the crawler-belief-solver pattern
   should apply not just to physical RL but to language and other environments.
 - `general_program_plan.md`
-  The operational companion to the cross-domain thesis: staged rollout,
-  artifact expectations, metric families, and expansion rules.
+  The staged rollout and operating rules for turning the current code into a
+  real crawler library.
+- `architecture_and_training.md`
+  The intended library architecture, the current migration seams, and what
+  still belongs to the RL benchmark compatibility path.
+- `crawler_library_api.md`
+  The public crawler contract: generic runtime types, interfaces, recipes,
+  consumers, and compatibility adapters.
+- `benchmark_harness.md`
+  The app-layer benchmark runner, artifact flow, dashboard linkage, and what
+  still belongs to the RL harness instead of the crawler core.
+- `evaluation_and_diagnostics.md`
+  Which metrics matter, what they mean, and how to read the dashboard without
+  over-claiming what the latent has learned.
+- `design_rules.md`
+  The code-taste rules for keeping the public API small and the codebase
+  readable.
 - `paper_synthesis.md`
   Paper-by-paper extraction of ideas and what each one means for this repo.
 - `language_domain_synthesis.md`
-  The language-side paper bridge: what one-book or small-corpus learning can
-  and cannot mean, grounded in the cited language papers.
+  The language-side paper bridge.
 - `language_belief_design.md`
-  The concrete language-side design: latent factorization, crawler behavior,
-  implementation phases, metrics, and module boundaries.
+  The concrete language-side design.
 - `image_domain_synthesis.md`
-  The image-side paper bridge: what the few-shot, self-supervised, and
-  object-centric vision papers imply for the repo's broader latent-belief idea.
+  The image-side paper bridge.
 - `image_belief_design.md`
-  The concrete image-side design: visual latent factorization, crawler
-  behavior, implementation phases, metrics, and module boundaries.
+  The concrete image-side design.
 - `human_learning_synthesis.md`
-  The developmental-science and neuroscience bridge: what child learning,
-  surprise, causal exploration, and predictive maps imply for the repo.
+  The developmental-science and neuroscience bridge.
 - `human_learning_design.md`
-  The operational companion to the human-learning bridge: how to translate
-  those ideas into architecture, evidence collection, uncertainty, and module
-  design.
-- `architecture_and_training.md`
-  Concrete system design, module ownership, data flow, artifact flow, and
-  training-stage responsibilities.
-- `evaluation_and_diagnostics.md`
-  Which metrics matter, what they mean, what can go wrong, and how to read the
-  dashboard honestly.
+  The operational companion to the human-learning bridge.
+- `research_manifesto.md`
+  The wider thesis and the guardrails for what the project is not trying to
+  become.
 - `agent_guide.md`
-  The writing and coding guide for future agents so they push the same research
-  agenda instead of chasing whichever metric moved last.
+  The writing and coding guide for future agents.
+
+## The Four Reading Buckets
+
+- Thesis:
+  `core_idea.md`, `general_crawler_belief.md`, `general_program_plan.md`
+- Public API:
+  `architecture_and_training.md`, `crawler_library_api.md`, `design_rules.md`
+- Benchmark Harness:
+  `benchmark_harness.md`, `evaluation_and_diagnostics.md`
+- Research Background:
+  `paper_synthesis.md`, `language_domain_synthesis.md`,
+  `image_domain_synthesis.md`, `human_learning_synthesis.md`
 
 ## Why This Exists
 
@@ -72,15 +88,10 @@ implementation work to drift into:
 - over-reading PCA plots
 - optimizing metrics that can be gamed
 - letting the controller compensate for a weak latent
-- mixing together local probe evidence and env-level belief
+- mixing together local evidence, env-level belief, and benchmark-specific glue
 
-These docs are here to make the idea concrete enough that future edits can be
-judged against the actual thesis, not just against the latest run.
-
-The newer cross-domain docs also exist to keep the repo from accidentally
-shrinking its own idea. The current codebase is mostly a physical-control
-testbed, but the larger research question is about a general crawler that can
-infer hidden rules in many kinds of environments.
+These docs exist to keep the thesis, library boundary, and benchmark harness
+distinct from one another.
 
 The local paper library that backs these docs lives in
 [`papers/README.md`](../papers/README.md).
@@ -91,6 +102,7 @@ We are trying to build:
 
 - a crawler that actively experiments on a new environment
 - a belief model that infers hidden mechanics from a small amount of evidence
-- a controller that uses that belief to solve tasks much faster
+- a solver that consumes a compact belief message instead of rebuilding its own
+  world model from scratch
 
 The main object is the env-level belief, not the policy.

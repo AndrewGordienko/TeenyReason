@@ -54,6 +54,14 @@ The desired pipeline is:
 5. Use that belief for prediction and downstream control.
 6. Optionally refine the belief online as more task interaction arrives.
 
+In the current repo this is implemented as:
+
+1. the crawler scores probe families by expected belief improvement
+2. the predictive belief is trained to forecast held-out probe summaries
+3. a separate metric projector owns retrieval and local geometry
+4. an env-expression projector turns the predictive belief into the solver input
+5. the benchmark runs in explicit `fair` and `adaptive` modes
+
 The ideal behavior is:
 
 - a few probes are enough
@@ -133,6 +141,12 @@ Repo consequence:
 - the crawler is an experiment designer
 - probe reward should be about information gain, disagreement reduction, or
   mechanics-belief improvement
+- the unit of planning should be the probe family, not only the next
+  low-level action
+- each family should carry an explicit estimate of:
+  - predicted mechanics uncertainty reduction
+  - predicted held-out future-probe improvement
+  - predicted split-half mismatch reduction
 
 ### History as prompt / context
 
@@ -170,6 +184,17 @@ that the downstream solver can use directly.
 
 That is the sentence all code paths should serve.
 
+In the current fair CartPole path, that means the benchmark has to separate
+three stories:
+
+- a baseline controller that never sees the env belief
+- a probe-conditioned controller that does see the env expression
+- a matched probe-conditioned controller with the env expression muted
+
+If probing wins while the muted arm keeps most of the gain, that is still
+useful progress, but it is a protocol win rather than the intended child-like
+world-belief win.
+
 ## The Intended Architecture
 
 The system should have four explicit pieces.
@@ -187,6 +212,9 @@ Desired outputs:
 - windows of `(s, a, r, s')`
 - probe metadata
 - env-instance grouping during training
+- per-family expected information-gain estimates
+- per-family realized uncertainty reduction
+- a stop reason saying why the crawler handed off when it did
 
 ### 2. Window Evidence Encoder
 
@@ -237,7 +265,7 @@ The repo should map onto that architecture cleanly.
   Env-level belief aggregation, subset pooling, and uncertainty construction.
 - `teenyreason/probe/probe_latent.py`
   Online belief helpers and active probe action selection.
-- `teenyreason/rl/probe_ppo.py`
+- `teenyreason/rl/probe_policy/`
   Downstream control using the env-level belief.
 - `teenyreason/representation/analysis.py`
   Artifact construction for env-belief analysis.

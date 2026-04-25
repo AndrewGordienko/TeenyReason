@@ -478,6 +478,26 @@ Everything else is upstream or downstream of that.
 If a code change improves return but makes the env belief less mechanical, less
 stable, or less interpretable, then it is moving away from the core idea.
 
+## Current Implementation Translation
+
+The latest CartPole artifacts point to a few concrete paper-backed rules:
+
+- ASID: active identification is not just "more probes"; saved support windows
+  should be intervention-balanced. A stable center probe can be useful, but it
+  should not dominate the evidence used to infer mechanics.
+- ContraBAR: same-world positives are only meaningful when the two views come
+  from genuinely different probe families. Track split retrieval alongside
+  effective support-family count before increasing contrastive pressure.
+- Causal state abstraction: punish probe identity only after measuring where it
+  leaks. `window_mode_leakage` and `env_mode_leakage` answer different
+  questions and should not be collapsed into one score.
+- Dynamics-as-prompts and PEARL: a context message that is unused or harmful is
+  not yet a useful belief. Downstream wins should be paired with matched
+  zero/shuffled/stale/no-expression ablations.
+- TurboQuant: communication diagnostics are meaningful only after the message
+  clears the utility gate. Rate-distortion curves should not distract from a
+  negative env-expression delta.
+
 ## The Import Rules
 
 When future agents use these papers, they should follow these rules:

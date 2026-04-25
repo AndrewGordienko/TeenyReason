@@ -68,6 +68,27 @@ Future changes must preserve these distinctions.
 
 Never silently collapse those two concepts together.
 
+### Predictive belief is not metric belief
+
+The predictive belief and the metric projector are allowed to disagree.
+
+That is not automatically a bug.
+
+`PredictiveBelief` should be judged by:
+
+- mechanics decode
+- held-out future-probe prediction
+- communication sufficiency
+
+`MetricBelief` should be judged by:
+
+- split retrieval
+- neighbor alignment
+- same-world versus different-world geometry
+
+Do not optimize one and then claim the other improved unless the artifact
+actually shows it.
+
 ### Uncertainty is not generic variance
 
 Good uncertainty should mean:
@@ -94,6 +115,9 @@ A controller can improve because of:
 without the belief actually representing hidden mechanics well.
 
 Always check representation metrics first.
+
+Also check whether the benchmark was run in `fair` or `adaptive` mode before
+interpreting a controller win.
 
 ## The Questions To Ask Before Coding
 
@@ -181,6 +205,7 @@ Typical symptoms:
 - benchmark gains
 - muddy representation metrics
 - latent still not clearly mechanical
+- probe-conditioned policy has extra schedule help compared with baseline
 
 ### 6. Compression Of The Wrong Thing
 
@@ -209,14 +234,27 @@ These are usually aligned with the project:
 - replacing a hand-written uncertainty scalar with a learned but interpretable
   monotone calibration head when the fixed heuristic has flattened out
 - making the crawler choose more informative interventions
+- making the crawler explain which probe family it expects to be most useful
+- saving per-family expected gain and realized reduction so the dashboard can
+  check whether the crawler's probe logic is actually sensible
 - forcing the crawler support set to cover multiple experiment families
 - reducing the actual support budget so "few probes" is true in data, not only
   in analysis masking
 - reducing probe leakage at the env-belief level
 - making the controller use the env belief more directly and honestly
+- separating a fair matched benchmark from a fully adaptive system demo
+- using held-out future-probe prediction error as a real surprise signal for
+  adaptive probing rather than only a decorative dashboard metric
 - testing whether the belief still works under meaningful compression
 
 ## What Types Of Changes Are Suspicious
+
+- giving the probe-conditioned controller a larger or richer actor-critic than
+  baseline in the headline benchmark
+- changing entropy schedules or PPO epoch counts only for the probe branch
+  while still presenting the result as a clean belief comparison
+- relying on whole-episode concatenation when fixed-horizon rollout chunks would
+  give a fairer and less seed-fragile PPO update path
 
 These are not automatically bad, but they need strong justification:
 
@@ -226,6 +264,8 @@ These are not automatically bad, but they need strong justification:
 - optimizing reward-colored plots
 - letting one crawler experiment family dominate while calling the result a
   general world belief
+- letting the solver consume a larger hidden belief tensor when the public
+  contract says it should consume a compact belief message instead
 - using many windows per env and then claiming the belief comes from a few
   probes only because the support mask is small
 - mixing window-level and env-level metrics in the same readout

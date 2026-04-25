@@ -71,6 +71,17 @@ Important rule:
 Do not destroy the current physical code to do this. Add clear abstractions and
 adapters rather than hiding everything behind one large generic layer.
 
+Current status:
+
+- this stage is partially implemented through a new generic crawler core plus
+  compatibility adapters for the current RL benchmark
+- the canonical library objects are now `EvidenceSlice`, `BeliefState`,
+  `CrawlerMessage`, `CrawlerStep`, and `CrawlerRunResult`
+- the downstream fair benchmark still consumes a solver-facing compatibility
+  message while the app layer migrates
+- future image and language recipes should plug into the same crawler API
+  rather than invent a second belief contract
+
 ### Stage 3. Add a passive language or image testbed
 
 Goal:
@@ -166,6 +177,14 @@ The same metric families should survive across domains.
 - downstream solve quality versus belief bitrate
 - retrieval or neighbor quality versus belief bitrate
 - uncertainty quality versus belief bitrate
+
+For the current benchmark compatibility layer, the repo already saves:
+
+- mechanics-fit versus bits
+- split-retrieval versus bits
+- solver-message norm versus bits
+
+The next cross-artifact comparison step is downstream solve cost versus bits.
 
 If a metric does not fit one of these categories, it should need strong
 justification before being added.

@@ -1,13 +1,4 @@
-"""Environment helpers used by the rest of the repo.
-
-Two ideas live here:
-
-- how to build the environments the experiments train on
-- how to map a small discrete probe action index into a real environment action
-
-The latent/probe code wants a compact action vocabulary even for continuous
-control tasks, so this module defines a small library of representative actions.
-"""
+"""Environment helpers used by the rest of the repo."""
 
 import gymnasium as gym
 import numpy as np
@@ -45,6 +36,22 @@ def get_env_display_name(env_name: str) -> str:
     return ENV_DISPLAY_NAMES.get(env_name, env_name)
 
 
+def _center_box_action(action_space: gym.spaces.Box) -> np.ndarray:
+    low = np.asarray(action_space.low, dtype=np.float32).reshape(-1)
+    high = np.asarray(action_space.high, dtype=np.float32).reshape(-1)
+    return np.clip(np.zeros_like(low, dtype=np.float32), low, high)
+
+
+def _unique_action_rows(values: list[np.ndarray]) -> np.ndarray:
+    deduped: list[np.ndarray] = []
+    for value in values:
+        row = np.asarray(value, dtype=np.float32).reshape(-1)
+        if any(np.allclose(row, existing, atol=1e-6) for existing in deduped):
+            continue
+        deduped.append(row)
+    return np.stack(deduped, axis=0).astype(np.float32)
+
+
 def _build_scalar_action_values(action_space, action_bins: int) -> np.ndarray:
     """Evenly sample a 1-D continuous action range into a small probe grid."""
     low = float(action_space.low[0])
@@ -52,40 +59,41 @@ def _build_scalar_action_values(action_space, action_bins: int) -> np.ndarray:
     return np.linspace(low, high, action_bins, dtype=np.float32).reshape(-1, 1)
 
 
-def _build_lunar_lander_action_values() -> np.ndarray:
-    """Hand-picked probe actions for LunarLander's 2-D thruster controls."""
-    return np.asarray(
-        [
-            [-1.0, 0.0],   # idle
-            [0.0, 0.0],    # half main engine
-            [1.0, 0.0],    # full main engine
-            [-1.0, -1.0],  # left side engine
-            [-1.0, 1.0],   # right side engine
-            [0.0, -1.0],   # hover-left
-            [0.0, 1.0],    # hover-right
-            [1.0, -1.0],   # full-left
-            [1.0, 1.0],    # full-right
-        ],
-        dtype=np.float32,
-    )
+def _build_box_action_values(action_space: gym.spaces.Box, action_bins: int) -> np.ndarray:
+    """Derive a compact action vocabulary directly from Box bounds."""
+    flat_low = np.asarray(action_space.low, dtype=np.float32).reshape(-1)
+    flat_high = np.asarray(action_space.high, dtype=np.float32).reshape(-1)
+    center = _center_box_action(action_space)
+    midpoint = 0.5 * (flat_low + flat_high)
+    prototypes: list[np.ndarray] = [center]
+    if not np.allclose(midpoint, center, atol=1e-6):
+        prototypes.append(midpoint.astype(np.float32))
 
-
-def _build_bipedal_walker_action_values() -> np.ndarray:
-    """Small library of recognizable gait-like actions for BipedalWalker probes."""
-    return np.asarray(
-        [
-            [0.0, 0.0, 0.0, 0.0],      # neutral
-            [0.5, -0.5, -0.2, 0.2],    # small left stride
-            [-0.2, 0.2, 0.5, -0.5],    # small right stride
-            [1.0, -1.0, -0.5, 0.5],    # hard left stride
-            [-0.5, 0.5, 1.0, -1.0],    # hard right stride
-            [0.0, 1.0, 0.0, 1.0],      # crouch
-            [0.0, -1.0, 0.0, -1.0],    # extend
-            [1.0, 0.0, 1.0, 0.0],      # hips forward
-            [-1.0, 0.0, -1.0, 0.0],    # hips back
-        ],
-        dtype=np.float32,
+    axis_order = sorted(
+        range(flat_low.shape[0]),
+        key=lambda axis: float(abs(flat_high[axis] - flat_low[axis])),
+        reverse=True,
     )
+    for axis in axis_order:
+        low_action = center.copy()
+        high_action = center.copy()
+        low_action[axis] = flat_low[axis]
+        high_action[axis] = flat_high[axis]
+        prototypes.extend((low_action, high_action))
+        if len(prototypes) >= int(action_bins):
+            break
+
+    if len(prototypes) < int(action_bins):
+        prototypes.extend((flat_low.copy(), flat_high.copy()))
+    if len(prototypes) < int(action_bins) and flat_low.shape[0] > 1:
+        alternating = center.copy()
+        mirrored = center.copy()
+        for axis in range(flat_low.shape[0]):
+            alternating[axis] = flat_high[axis] if axis % 2 == 0 else flat_low[axis]
+            mirrored[axis] = flat_low[axis] if axis % 2 == 0 else flat_high[axis]
+        prototypes.extend((alternating, mirrored))
+
+    return _unique_action_rows(prototypes)[: max(1, int(action_bins))]
 
 
 def get_action_values(env, action_bins: int, env_name: str | None = None):
@@ -104,19 +112,8 @@ def get_action_values(env, action_bins: int, env_name: str | None = None):
 
     action_dim = int(np.prod(action_space.shape))
     if action_dim == 1:
-        # Scalar continuous control can share a simple evenly spaced probe grid.
         return _build_scalar_action_values(action_space, action_bins)
-
-    if env_name == CONTINUOUS_LUNAR_LANDER_NAME:
-        # Multi-axis environments use a hand-picked library of probe actions instead.
-        return _build_lunar_lander_action_values()
-
-    if env_name == BIPEDAL_WALKER_NAME:
-        return _build_bipedal_walker_action_values()
-
-    raise ValueError(
-        "Multi-dimensional continuous control requires an environment-specific action prototype set"
-    )
+    return _build_box_action_values(action_space, action_bins)
 
 
 def get_action_dim(env, action_bins: int, env_name: str | None = None) -> int:

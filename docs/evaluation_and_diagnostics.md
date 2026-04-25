@@ -263,6 +263,29 @@ What can fool it:
 - a crawler that repeats one safe experiment and only occasionally touches the
   rest
 
+Current support-mix diagnostics:
+
+- `center_window_share` asks whether a stable no-op style probe is still
+  dominating the saved evidence, even if online probe selection looks diverse.
+- `directional_window_share` and `effective_window_families` show whether the
+  support set is actually intervention-balanced or only nominally varied.
+- `window_mode_leakage` measures probe-family leakage before pooling, while
+  `env_mode_leakage` measures how much of that nuisance survives in the final
+  env belief.
+- `nearest_between_median`, `pairwise_between_mean`, and `belief_norm_std` keep
+  support diversity tied to geometry collapse instead of treating coverage as a
+  separate checkbox.
+
+Interpretation:
+
+- if online probe choice is directional but `center_window_share` stays high,
+  the offline support collector is retrying or retaining the wrong evidence
+- if `window_mode_leakage` is high but `env_mode_leakage` is low, aggregation is
+  helping but the window encoder still carries probe script identity
+- if both leakage values are high, increase probe-invariance pressure only
+  after checking support balance, because leakage penalties can otherwise erase
+  useful mechanics signal from an undercovered support set
+
 ### Uncertainty vs Actual Mechanics Error
 
 Question:
@@ -367,6 +390,29 @@ Important caution:
 
 These are necessary, but secondary to the representation story.
 
+For the current fair CartPole benchmark, downstream evaluation should always
+track three matched arms:
+
+- baseline PPO
+- probe plus env expression
+- probe plus no env expression
+
+Why this matters:
+
+- if probe plus env expression beats baseline and also beats the matched
+  no-expression arm, that is the intended latent-driven win
+- if probe plus env expression beats baseline but not the no-expression arm,
+  that is a protocol win rather than proof that the env belief itself is doing
+  the work
+- if the probe arm wins overall while the no-expression arm is just as good or
+  better, the controller or schedule is compensating for a weak latent
+
+The current artifact language should use:
+
+- `latent_win`
+- `protocol_win`
+- `controller_compensation`
+
 ### Solve Episodes
 
 Question:
@@ -395,6 +441,112 @@ Limit:
 
 - on some research questions, probe cost is intentional and part of the design
 
+### Post-Expression Latency
+
+Question:
+
+- once the crawler has handed off an env expression, how many control-only
+  episodes or env steps does the controller still need to solve?
+
+Why it matters:
+
+- this is the cleanest check on the actual value of the env expression itself
+- it separates "the controller used the expression well" from "probing was
+  cheap enough overall"
+
+Interpretation:
+
+- if post-expression latency is good but total env steps are bad, the
+  expression may still be useful while the budget policy is overpaying
+- if post-expression latency is also bad, the expression handoff itself is not
+  strong enough yet
+
+### No-Expression Matched Arm
+
+Question:
+
+- if we keep the same probe schedule and same downstream PPO but mute the env
+  expression, how much performance disappears?
+
+Why it matters:
+
+- this is the cleanest current check on whether the env belief itself is
+  driving the benchmark win
+
+Interpretation:
+
+- if probe plus env expression clearly beats probe plus no env expression, the
+  latent is contributing real downstream value
+- if the two are similar, the run is mostly a protocol win
+- if no-expression wins, the controller is still being helped more by the
+  schedule than by the env belief
+
+### Probe Budget Honesty
+
+Question:
+
+- why did probing stop, and how often is the system still buying a third probe?
+
+Why it matters:
+
+- episode speed can improve while env-step cost still regresses if probe three
+  is too cheap
+- a fair-mode run should now end through `expression_ready`,
+  `fair_two_probe_handoff`, or `probe_failure` rather than through economic
+  stop reasons
+
+Relevant diagnostics:
+
+- final stop reason
+- episode-level stop-reason counts
+- probe-count distribution
+- probe cost split: encoder vs online probing vs downstream control
+
+Interpretation:
+
+- if probe wins on episodes but loses badly on env steps, inspect probe-count
+  and stop-reason traces before blaming the belief itself
+- if fair mode rarely reaches `expression_ready`, the latent still is not
+  earning early trust
+- if `fair_two_probe_handoff` dominates and the env expression is then muted by
+  policy, the protocol may be working while the latent still is not
+- if third probes are common while next-family value is only barely positive,
+  the controller is still paying for weak evidence
+
+### Controller Robustness
+
+Question:
+
+- does the downstream solver still behave sensibly when the belief is weak,
+  misleading, or absent?
+
+Why it matters:
+
+- a belief can contain some mechanics signal globally while still having bad
+  local geometry
+- negative env-expression ablations usually mean the controller trusts the
+  wrong latent too much, not just that probing spent too much
+
+Relevant diagnostics:
+
+- env-expression ablation delta
+- expression-scale trace
+- median expression scale during control
+- fraction of control episodes with expression scale above `0.1`
+- fraction of fair handoffs that were force-muted by policy
+- solve behavior on seeds with weak neighbor alignment or poor split retrieval
+
+Interpretation:
+
+- if env-expression ablation turns negative on multiple seeds, fix controller trust
+  before adding more encoder complexity
+- if expression scale stays high while local geometry metrics are weak, trust
+  gating is too permissive
+- if expression scale stays near zero on winning runs, the benchmark is
+  probably a protocol win instead of a latent win
+- if the controller fully collapses when the expression is ablated, it has not
+  learned a healthy state-only fallback yet
+
 ### Success Rate
 
 Question:
@@ -414,12 +566,19 @@ When looking at one run, use this order:
 2. same-env spread
 3. neighbor alignment
 4. uncertainty calibration
-5. downstream benchmark
+5. probe plus env expression versus probe plus no env expression
+6. downstream benchmark
+7. probe-budget honesty
+8. controller robustness
 
 Do not start with benchmark score.
 
 If the benchmark looks strong but the first four items look weak, then the
 controller is probably compensating for a weak belief.
+
+If the benchmark looks strong and the no-expression matched arm is nearly as
+strong, classify the run as a protocol win rather than a thesis-complete
+latent win.
 
 ## The Dashboard Rules
 

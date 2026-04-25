@@ -51,29 +51,73 @@ More generally, the repo is trying to study a reusable
 constraints of a new environment quickly and the solver then focuses on the
 task instead of first having to infer the world from scratch.
 
+## Progress Metrics
+
+There are now two explicit progress targets instead of a vague “this run feels
+better” heuristic.
+
+- `Belief Progress Index (BPI)`
+  `0.30*mechanics_fit + 0.20*neighbor_alignment + 0.15*split_retrieval + 0.15*(1-heldout_probe_error) + 0.10*max(uncert_error_corr, 0) + 0.10*(1-probe_leakage)`
+- `Latent Win Gate`
+  The benchmark only counts as cracked on the `full` 5-seed run when the probe
+  path beats the baseline and the matched no-expression arm, clears the
+  representation floors, and the full-system learned context materially beats
+  the context ablations.
+
+If downstream return rises while `BPI` falls, treat that run as suspect. The
+representation is the primary object of study, and the controller only gets to
+win if the latent-sensitive ablations agree.
+
 ## Repo Layout
 
 - `main.py`
-  Root benchmark entrypoint. Pick the environment and seeds here.
+  Small composition entrypoint. Pick a recipe and a downstream consumer here.
 - `serve_latent_dashboard.py`
   Root wrapper for the local Flask dashboard.
+- `teenyreason/crawler/`
+  Canonical world-agnostic crawler interfaces, runtime types, and compatibility
+  adapters for the current RL stack.
+- `teenyreason/recipes/`
+  Concrete recipe compositions such as CartPole, MNIST, and language. These
+  choose capabilities without making them part of the crawler core.
+- `teenyreason/algos/`
+  Downstream consumers such as the current PPO benchmark and the sample-
+  efficiency benchmark wrappers.
 - `teenyreason/representation/`
   Stable entrypoint for the current latent-belief system and latent snapshot
   analysis helpers.
 - `teenyreason/probe/`
   Probe data collection, active probing, belief aggregation, and online belief
-  updates.
+  updates. See [teenyreason/probe/README.md](teenyreason/probe/README.md).
 - `teenyreason/rl/`
-  PPO code that consumes the learned belief.
+  Downstream control code. The first reorg pass now splits this into:
+  `rl/core/`, `rl/probe_policy/`, and `rl/full_system/`. See
+  [teenyreason/rl/README.md](teenyreason/rl/README.md).
 - `teenyreason/viz/`
   Local dashboard for latent snapshots and benchmark summaries.
-- `teenyreason/models/belief_world_model.py`
-  Current recurrent posterior encoder and structured latent supervision.
-- `teenyreason/models/world_model.py`
-  Older simpler prototype kept around as a reference point.
+- `teenyreason/models/belief/`
+  Belief encoder stack. The first reorg pass now splits this into `core/`,
+  `objectives/`, and `training/`. See
+  [teenyreason/models/belief/README.md](teenyreason/models/belief/README.md).
+- `tests/`
+  Subsystem-oriented unit tests. See [tests/README.md](tests/README.md).
 - `papers/`
   Local paper library for the repo. See [papers/README.md](papers/README.md)
   for the categorized reading map.
+
+## Maintainer Notes
+
+- New imports should prefer the organized subpackages under `teenyreason/rl/`
+  and `teenyreason/models/belief/`.
+- Old flat module paths are still kept alive as compatibility shims during the
+  first pass.
+- Conservative dead-file review now lives in:
+
+```bash
+python3 scripts/audit_python_files.py
+```
+
+That script reports orphan candidates, but it does not delete anything.
 
 ## Current Flow
 
@@ -84,6 +128,37 @@ task instead of first having to infer the world from scratch.
 5. Train a baseline PPO agent and a probe-conditioned PPO agent.
 6. Compare not just return, but solve speed and environment-step cost.
 
+The current fair-mode controller contract is intentionally small and explicit:
+
+- the crawler gathers a short support set first
+- it hands PPO one compact `EnvExpression` for the episode
+- PPO consumes `state + env_expression.vector + confidence + uncertainty`
+- the actor/value heads use a plain state backbone plus a small
+  confidence-scaled env-expression residual
+- fair mode freezes the env expression for the whole control episode
+- fair mode never buys a third probe; it either hands off early when the
+  expression is ready or hands off after probe two with the env expression
+  muted if it still has not earned trust
+- fair mode always starts with a passive identification probe and uses a
+  deterministic second active probe when one more world-identification step is
+  needed
+- probe-conditioned PPO is trained with occasional env-expression muting so it
+  keeps a healthy state-only fallback instead of becoming brittle; after the
+  early warmup that muting becomes scale jitter instead of hard zeroing
+- any factorized latent machinery is now considered internal training support,
+  not the public controller contract
+
+The benchmark now records three matched downstream arms:
+
+- baseline PPO
+- probe + env expression
+- probe + no env expression
+
+That is intentional. A benchmark win only counts as a thesis win when the
+env-expression arm beats both the baseline and the matched no-expression arm.
+If probing helps but muting the env expression leaves the result mostly
+unchanged, the artifact should be read as a protocol win, not a latent win.
+
 ## Run Training
 
 From the repo root:
@@ -92,13 +167,25 @@ From the repo root:
 python3 main.py
 ```
 
-That will:
+`main.py` now reads like a tiny library example:
+
+```python
+from teenyreason import ppo, run
+
+run("ContinuousCartPole-v0", ppo(), seeds=2, profile="fast")
+```
+
+Use `seeds=2` for local iteration. Save `5`-seed runs for confirmation once the
+message path is actually live.
+
+The default composition still runs the existing PPO benchmark harness, so it
+will:
 
 - collect probe data
 - train the current latent encoder
 - save checkpoint artifacts
 - save a latent snapshot under `artifacts/*_latent_snapshot.npz`
-- run the baseline/probe benchmark
+- run the baseline/probe/probe-no-expression benchmark
 
 ## Run Playback
 

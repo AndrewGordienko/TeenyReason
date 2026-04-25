@@ -108,6 +108,11 @@ Canonical names:
 
 The current repo should be mentally organized like this.
 
+The active implementation is now package-oriented. Several older flat files
+remain as compatibility facades because tests and notebooks may still import
+them. Do not delete those facades unless the public import compatibility tests
+and docs are intentionally updated together.
+
 ### `teenyreason/crawler/`
 
 Owns:
@@ -122,7 +127,7 @@ Should not own:
 - dashboard rendering policy
 - environment-specific benchmark orchestration
 
-### `teenyreason/probe/probe_data.py`
+### `teenyreason/probe/data/`
 
 Owns:
 
@@ -131,13 +136,17 @@ Owns:
 - collection of transitions and windows
 - probe mode metadata
 
+Compatibility facade:
+
+- `teenyreason/probe/probe_data.py`
+
 Should not own:
 
 - env-level belief aggregation
 - downstream control logic
 - dashboard interpretation logic
 
-### `teenyreason/models/belief_world_model.py`
+### `teenyreason/models/belief/`
 
 Owns:
 
@@ -152,7 +161,11 @@ Should not own:
 - benchmark orchestration
 - broad repo-level evaluation policy
 
-### `teenyreason/models/env_belief.py`
+Compatibility facade:
+
+- `teenyreason/models/belief_world_model.py`
+
+### `teenyreason/models/envbelief/`
 
 Owns:
 
@@ -173,7 +186,11 @@ It should support a split between:
 - metric-space projections used for retrieval, neighbor structure, and latent
   geometry diagnostics
 
-### `teenyreason/probe/probe_latent.py`
+Compatibility facade:
+
+- `teenyreason/models/env_belief.py`
+
+### `teenyreason/probe/latent/`
 
 Owns:
 
@@ -187,18 +204,218 @@ Should not own:
 - long training loops
 - benchmark summary policy
 
-### `teenyreason/rl/probe_ppo.py`
+Compatibility facade:
+
+- `teenyreason/probe/probe_latent.py`
+
+### `teenyreason/rl/probe_policy/`
 
 Owns:
 
 - downstream task training
 - how the controller consumes the belief
-- solve checks and benchmark-side training behavior
+- benchmark-side solve behavior
+- the distinction between fair benchmark mode and full adaptive-system mode
 
 Should not redefine:
 
 - what the env belief means
 - which representation metrics count as success
+
+Public package:
+
+- `teenyreason/rl/probe_policy/`
+
+### `teenyreason/rl/probe_policy/messages.py`
+
+Owns:
+
+- compact env-expression construction
+- env-expression stop-readiness scoring
+- env-expression confidence scaling
+- robustness helpers that keep PPO usable when the expression is muted or
+  locally unreliable
+- the controller-side `state + env_expression + confidence + uncertainty`
+  contract
+
+Important semantic split:
+
+- `EnvExpression.ready` means the crawler has enough evidence to stop probing
+- `EnvExpression.confidence` means how much downstream control should trust the
+  handoff
+- readiness should be blocked by the weakest major evidence axis rather than by
+  a soft average
+- controller trust may still stay low even after probing stops, so the solver
+  can fall back toward state-only control when the env belief is locally shaky
+
+Should not own:
+
+- probe-budget policy
+- PPO rollout/update logic
+- benchmark artifact summaries
+
+### `teenyreason/rl/probe_policy/reporting.py`
+
+Owns:
+
+- probe-family bookkeeping
+- stable run-summary averaging
+- policy and normalizer snapshot helpers
+- compact log-format helpers
+
+### `teenyreason/app/`
+
+Owns:
+
+- benchmark orchestration and saved artifact format
+- dashboard payload construction and local serving
+- live trace writing
+- summary diagnostics that compare representation, support, and downstream use
+
+Current cleanup rule:
+
+- keep new benchmark interpretation logic in small files such as
+  `benchmark_diagnostics.py`
+- split large app files only by cohesive ownership, not as a broad style pass
+
+Should not own:
+
+- controller decision logic
+- representation semantics
+- crawler-side family scoring
+
+## Downstream Benchmark Modes
+
+There should be two explicit downstream comparison modes.
+
+### Fair Benchmark Mode
+
+Use this mode for headline representation comparisons.
+
+Requirements:
+
+- baseline and probe-conditioned policies use the same actor-critic body
+- the baseline gets a zero or masked belief input rather than a smaller model
+- PPO uses the same entropy coefficient schedule and epoch schedule on both
+  sides
+- probe-conditioned runs do not quietly get extra adaptive probe budget in the
+  benchmark headline
+- fair-mode probing may stop early when the env expression is already ready
+- fair mode is capped at two probes total; probe three belongs only to
+  adaptive/demo modes
+- fair mode uses a deterministic two-stage identification policy:
+  - probe 1 is always `passive_decay`
+  - probe 2 is the best unseen active family by entropy reduction, predicted
+    future-probe gain, hypothesis separation, and then probe cost
+- the learned family-value head should not decide fair-mode probe choice or
+  fair-mode handoff
+- PPO updates run on fixed-horizon rollout chunks rather than only on
+  concatenated whole episodes
+- the solver-facing env expression is frozen per episode in fair mode and only
+  refreshed online in adaptive/demo modes
+- the controller should treat the env expression like a trusted hint, not a
+  second policy: weak local geometry or poor held-out prediction should scale
+  confidence down hard
+- in fair mode, a non-ready env expression is now force-muted instead of being
+  softly downweighted; the uncertainty slot stays visible but the solver does
+  not get partial latent influence unless the handoff has earned trust
+- probe-conditioned PPO should occasionally train with the expression muted
+  while keeping the uncertainty slot, so plain state control remains a healthy
+  fallback when the belief is wrong; after the early warmup this should become
+  scale jitter rather than hard zeroing
+
+This is the mode that answers:
+
+- does the crawler-produced belief actually help a matched learner
+
+### Full Adaptive System Mode
+
+Use this mode for system demonstrations, not the canonical fairness claim.
+
+Allowed extras:
+
+- adaptive probe count
+- adaptive entropy or update-budget schedules
+- uncertainty- or surprise-triggered extra probing
+
+This mode answers:
+
+- how good is the whole crawler-plus-controller stack when everything is turned
+  on
+
+## Public Crawler API
+
+The public crawler boundary is now centered on the generic types in
+`teenyreason/crawler/types.py` and the generic interfaces in
+`teenyreason/crawler/core.py`.
+
+Canonical library-facing objects:
+
+- `EvidenceSlice`
+- `BeliefState`
+- `CrawlerMessage`
+- `CrawlerStep`
+- `CrawlerRunResult`
+- `Crawler`
+- `WorldAdapter`
+- `BeliefBackend`
+- `QueryPolicy`
+- `StopPolicy`
+- `MessageProjector`
+
+Canonical composition layers:
+
+- `teenyreason/recipes/`
+  user-facing recipes such as CartPole, MNIST, and language
+- `teenyreason/algos/`
+  downstream consumers such as the current PPO benchmark and sample-efficiency
+  wrappers
+
+The older RL-shaped objects still exist as compatibility adapters so the
+benchmark and dashboard stack can keep working during migration, but they are
+no longer the primary library surface.
+
+## Predictive Belief Versus Metric Belief
+
+The current implementation now treats these as different jobs.
+
+`z_env_predictive_raw` owns:
+
+- hidden-mechanics decode
+- held-out future-probe prediction
+- family-conditioned future-probe prediction
+- family-conditioned posterior-style updates from evidence windows
+- factor-level means and uncertainty used for experiment design
+- env-expression projection
+- rate-distortion analysis
+
+`z_env_metric` owns:
+
+- split retrieval
+- nearest-neighbor structure
+- gap-ratio diagnostics
+- geometry visualization
+
+If one vector cannot do both jobs well, we prefer a clean split over pretending
+one embedding is serving every objective equally well.
+
+## Env Expression And Compression
+
+The solver-facing object is now intentionally treated as a compact env
+expression rather than an arbitrary latent.
+
+Current behavior:
+
+- build a deterministic env expression from `PredictiveBelief + UncertaintyEstimate`
+- optionally apply deterministic rotation + scalar quantization
+- optionally add a tiny residual sketch in adaptive mode
+- evaluate mechanics fit and retrieval quality under several bit budgets
+- keep stop-reason and family-value accounting at the final run level so the
+  benchmark does not confuse repeated episode bookkeeping with one final
+  crawler decision
+
+Compression is diagnostic by default. The fair benchmark does not secretly
+benefit from an adaptive communication path.
 
 ### `teenyreason/representation/analysis.py`
 
@@ -321,6 +538,9 @@ The practical rule is:
 
 - each sampled CartPole world should be identified from a small, diverse set of
   named experiments, not from many nearly interchangeable windows
+- if probe three is still being bought regularly in fair mode, it should be
+  because one family still clears a strong marginal-value bar, not because
+  quota or barely-positive economics kept the episode alive
 
 ## Current CartPole Belief Budget
 

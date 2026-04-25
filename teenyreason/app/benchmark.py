@@ -11,268 +11,53 @@ This file wires the whole benchmark together:
 
 import json
 import random
-import statistics
-from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import torch
 
+from .artifacts import (
+    save_dashboard_context,
+    save_training_artifacts,
+)
+from .benchmark_reporting import finalize_benchmark_run
+from .benchmark_support import (
+    benchmark_profile_flags,
+    classify_probe_run,
+    compute_belief_progress_index,
+    default_seeds_for_profile,
+    full_system_display_label,
+    matched_eval_summary_dict,
+    print_matched_eval_summary,
+    print_solve_summary,
+    print_return_summary,
+    probe_strict_usage_status,
+    resolve_benchmark_profile,
+    solve_eval_episodes_for_profile,
+)
+from .config import ExperimentConfig, build_experiment_config
+from .benchmark_diagnostics import build_latent_support_diagnostics
+from .live_trace import LiveTrainingTraceWriter
 from ..crawler import CrawlerModelBundle, train_crawler_library
 from ..envs import (
     BIPEDAL_WALKER_NAME,
     CONTINUOUS_CARTPOLE_NAME,
-    CONTINUOUS_LUNAR_LANDER_NAME,
-    get_env_display_name,
 )
 from ..probe.probe_data import ProbeCrawler
 from ..representation import build_latent_snapshot, save_latent_snapshot
-from ..rl.probe_ppo import train_plain_ppo, train_probe_conditioned_ppo
-
-
-@dataclass(frozen=True)
-class ExperimentConfig:
-    env_name: str
-    benchmark_tag: str
-    window_size: int
-    z_dim: int
-    action_bins: int
-    randomize_physics: bool
-    physics_loss_weight: float
-    affordance_loss_weight: float
-    intervention_horizon: int
-    probe_episodes_per_mode: int
-    probe_max_steps: int
-    encoder_epochs: int
-    encoder_batch_size: int
-    encoder_lr: float
-    encoder_kl_loss_weight: float
-    encoder_contrastive_loss_weight: float
-    encoder_contrastive_dim: int
-    encoder_env_consistency_loss_weight: float
-    encoder_env_geometry_loss_weight: float
-    encoder_mode_adversary_loss_weight: float
-    encoder_latent_rollout_loss_weight: float
-    encoder_env_within_between_loss_weight: float
-    encoder_belief_subset_count: int
-    encoder_belief_subset_size: int
-    latent_memory_capacity: int
-    base_probe_episodes: int
-    max_probe_episodes: int
-    novelty_probe_threshold: float
-    low_return_probe_threshold: float
-    exploit_return_threshold: float
-    uncertainty_probe_threshold: float
-    uncertainty_focus_threshold: float
-    online_z_update_alpha: float
-    online_z_update_freq: int
-    sil_batch_size: int
-    sil_policy_weight: float
-    sil_value_weight: float
-    min_elite_return: float
-    elite_warmup_episodes: int
-    elite_threshold_std_scale: float
-    solved_return: float
-    solve_eval_episodes: int
-    gamma: float
-    gae_lambda: float
-    lr: float
-    clip_ratio: float
-    ppo_epochs: int
-    minibatch_size: int
-    value_loss_weight: float
-    entropy_coef: float
-    max_grad_norm: float
-    target_kl: float
-    min_rollout_steps: int
-    hidden_dim: int
-    normalize_rewards: bool
-    num_episodes: int
-
-
-def build_experiment_config(env_name: str) -> ExperimentConfig:
-    """Return a sensible per-environment benchmark config."""
-    if env_name == BIPEDAL_WALKER_NAME:
-        return ExperimentConfig(
-            env_name=env_name,
-            benchmark_tag="bipedal_walker_ppo",
-            window_size=24,
-            z_dim=24,
-            action_bins=9,
-            randomize_physics=False,
-            physics_loss_weight=0.0,
-            affordance_loss_weight=1.25,
-            intervention_horizon=12,
-            probe_episodes_per_mode=80,
-            probe_max_steps=400,
-            encoder_epochs=80,
-            encoder_batch_size=128,
-            encoder_lr=1e-3,
-            encoder_kl_loss_weight=2e-3,
-            encoder_contrastive_loss_weight=0.30,
-            encoder_contrastive_dim=64,
-            encoder_env_consistency_loss_weight=0.45,
-            encoder_env_geometry_loss_weight=0.25,
-            encoder_mode_adversary_loss_weight=0.15,
-            encoder_latent_rollout_loss_weight=0.20,
-            encoder_env_within_between_loss_weight=0.30,
-            encoder_belief_subset_count=4,
-            encoder_belief_subset_size=6,
-            latent_memory_capacity=512,
-            base_probe_episodes=2,
-            max_probe_episodes=3,
-            novelty_probe_threshold=0.15,
-            low_return_probe_threshold=75.0,
-            exploit_return_threshold=160.0,
-            uncertainty_probe_threshold=0.24,
-            uncertainty_focus_threshold=0.20,
-            online_z_update_alpha=0.30,
-            online_z_update_freq=4,
-            sil_batch_size=64,
-            sil_policy_weight=0.10,
-            sil_value_weight=0.10,
-            min_elite_return=100.0,
-            elite_warmup_episodes=25,
-            elite_threshold_std_scale=1.5,
-            solved_return=300.0,
-            solve_eval_episodes=3,
-            gamma=0.99,
-            gae_lambda=0.95,
-            lr=2.5e-4,
-            clip_ratio=0.2,
-            ppo_epochs=10,
-            minibatch_size=256,
-            value_loss_weight=0.5,
-            entropy_coef=2e-3,
-            max_grad_norm=0.5,
-            target_kl=0.02,
-            min_rollout_steps=1024,
-            hidden_dim=256,
-            normalize_rewards=True,
-            num_episodes=2000,
-        )
-
-    if env_name == CONTINUOUS_LUNAR_LANDER_NAME:
-        return ExperimentConfig(
-            env_name=env_name,
-            benchmark_tag="continuous_lunar_lander_ppo",
-            window_size=24,
-            z_dim=24,
-            action_bins=9,
-            randomize_physics=False,
-            physics_loss_weight=0.05,
-            affordance_loss_weight=1.0,
-            intervention_horizon=12,
-            probe_episodes_per_mode=60,
-            probe_max_steps=300,
-            encoder_epochs=60,
-            encoder_batch_size=128,
-            encoder_lr=1e-3,
-            encoder_kl_loss_weight=2e-3,
-            encoder_contrastive_loss_weight=0.25,
-            encoder_contrastive_dim=64,
-            encoder_env_consistency_loss_weight=0.40,
-            encoder_env_geometry_loss_weight=0.20,
-            encoder_mode_adversary_loss_weight=0.10,
-            encoder_latent_rollout_loss_weight=0.15,
-            encoder_env_within_between_loss_weight=0.25,
-            encoder_belief_subset_count=4,
-            encoder_belief_subset_size=6,
-            latent_memory_capacity=512,
-            base_probe_episodes=2,
-            max_probe_episodes=3,
-            novelty_probe_threshold=0.12,
-            low_return_probe_threshold=80.0,
-            exploit_return_threshold=180.0,
-            uncertainty_probe_threshold=0.20,
-            uncertainty_focus_threshold=0.16,
-            online_z_update_alpha=0.25,
-            online_z_update_freq=4,
-            sil_batch_size=64,
-            sil_policy_weight=0.10,
-            sil_value_weight=0.10,
-            min_elite_return=120.0,
-            elite_warmup_episodes=25,
-            elite_threshold_std_scale=1.5,
-            solved_return=200.0,
-            solve_eval_episodes=3,
-            gamma=0.99,
-            gae_lambda=0.95,
-            lr=3e-4,
-            clip_ratio=0.2,
-            ppo_epochs=10,
-            minibatch_size=256,
-            value_loss_weight=0.5,
-            entropy_coef=3e-3,
-            max_grad_norm=0.5,
-            target_kl=0.02,
-            min_rollout_steps=1024,
-            hidden_dim=256,
-            normalize_rewards=True,
-            num_episodes=1500,
-        )
-
-    if env_name == CONTINUOUS_CARTPOLE_NAME:
-        return ExperimentConfig(
-            env_name=env_name,
-            benchmark_tag="continuous_cartpole_ppo",
-            window_size=16,
-            z_dim=16,
-            action_bins=9,
-            randomize_physics=True,
-            physics_loss_weight=0.10,
-            affordance_loss_weight=1.0,
-            intervention_horizon=12,
-            probe_episodes_per_mode=50,
-            probe_max_steps=250,
-            encoder_epochs=40,
-            encoder_batch_size=128,
-            encoder_lr=3e-4,
-            encoder_kl_loss_weight=2e-3,
-            encoder_contrastive_loss_weight=0.20,
-            encoder_contrastive_dim=64,
-            encoder_env_consistency_loss_weight=0.55,
-            encoder_env_geometry_loss_weight=0.35,
-            encoder_mode_adversary_loss_weight=0.20,
-            encoder_latent_rollout_loss_weight=0.20,
-            encoder_env_within_between_loss_weight=0.35,
-            encoder_belief_subset_count=6,
-            encoder_belief_subset_size=4,
-            latent_memory_capacity=256,
-            base_probe_episodes=2,
-            max_probe_episodes=3,
-            novelty_probe_threshold=0.10,
-            low_return_probe_threshold=150.0,
-            exploit_return_threshold=300.0,
-            uncertainty_probe_threshold=0.18,
-            uncertainty_focus_threshold=0.12,
-            online_z_update_alpha=0.25,
-            online_z_update_freq=3,
-            sil_batch_size=64,
-            sil_policy_weight=0.10,
-            sil_value_weight=0.10,
-            min_elite_return=150.0,
-            elite_warmup_episodes=20,
-            elite_threshold_std_scale=1.5,
-            solved_return=500.0,
-            solve_eval_episodes=3,
-            gamma=0.99,
-            gae_lambda=0.95,
-            lr=3e-4,
-            clip_ratio=0.2,
-            ppo_epochs=10,
-            minibatch_size=256,
-            value_loss_weight=0.5,
-            entropy_coef=2e-3,
-            max_grad_norm=0.5,
-            target_kl=0.02,
-            min_rollout_steps=512,
-            hidden_dim=128,
-            normalize_rewards=False,
-            num_episodes=1000,
-        )
-
-    raise ValueError(f"Unsupported benchmark environment: {env_name}")
+from ..rl.full_system.affordance_train import train_belief_affordance_controller
+from ..rl.full_system.planner_train import train_belief_planner
+from ..rl.probe_policy.train_plain import train_plain_ppo
+from ..rl.probe_policy.train_probe import train_probe_conditioned_ppo
+from ..viz.diagnostics import (
+    compute_linear_env_fit,
+    compute_mode_leakage,
+    compute_neighbor_env_alignment,
+    compute_same_env_gap_ratio,
+    compute_split_retrieval_stats,
+    compute_uncertainty_error_alignment,
+)
 
 
 def set_seed(seed: int):
@@ -290,251 +75,25 @@ def print_array_shapes(title: str, arrays: dict[str, np.ndarray]):
             print(f"  {key}: {value.shape}")
 
 
-def serialize_normalizer(normalizer) -> dict[str, float | torch.Tensor]:
-    """Save enough running-normalizer state to reproduce evaluation preprocessing."""
-    return {
-        # Store tensors rather than NumPy arrays so checkpoints remain compatible
-        # with PyTorch's safer weights-only loading path.
-        "mean": torch.tensor(normalizer.mean, dtype=torch.float32),
-        "var": torch.tensor(normalizer.var, dtype=torch.float32),
-        "count": float(normalizer.count),
-        "clip": float(normalizer.clip),
-    }
-
-
-def serialize_normalizer_state(normalizer_state: dict[str, np.ndarray | float]) -> dict[str, float | torch.Tensor]:
-    """Serialize a cloned normalizer snapshot into a checkpoint-safe payload."""
-    return {
-        "mean": torch.tensor(normalizer_state["mean"], dtype=torch.float32),
-        "var": torch.tensor(normalizer_state["var"], dtype=torch.float32),
-        "count": float(normalizer_state["count"]),
-        "clip": float(normalizer_state["clip"]),
-    }
-
-
-def save_training_artifacts(
-    crawler_bundle: CrawlerModelBundle,
-    baseline_result,
-    probe_result,
-    artifact_tag: str,
-    env_name: str,
-    window_size: int,
-    z_dim: int,
-    action_bins: int,
-    hidden_dim: int,
-    online_z_update_alpha: float,
-    online_z_update_freq: int,
-    base_probe_episodes: int,
-    max_probe_episodes: int,
-    randomize_physics: bool,
-    solve_eval_episodes: int,
-    solved_return: float,
-):
-    """Persist the main outputs from one benchmark configuration."""
-    output_dir = Path("artifacts")
-    output_dir.mkdir(exist_ok=True)
-
-    encoder_path = output_dir / f"{artifact_tag}_encoder_state_dict.pt"
-    baseline_returns_path = output_dir / f"{artifact_tag}_baseline_ppo_returns.npy"
-    probe_returns_path = output_dir / f"{artifact_tag}_probe_ppo_returns.npy"
-    baseline_checkpoint_path = output_dir / f"{artifact_tag}_baseline_ppo_checkpoint.pt"
-    probe_checkpoint_path = output_dir / f"{artifact_tag}_probe_ppo_checkpoint.pt"
-
-    torch.save(crawler_bundle.encoder.state_dict(), encoder_path)
-    np.save(baseline_returns_path, np.asarray(baseline_result.returns, dtype=np.float32))
-    np.save(probe_returns_path, np.asarray(probe_result.returns, dtype=np.float32))
-    torch.save(
-        {
-            "env_name": env_name,
-            "hidden_dim": hidden_dim,
-            "action_bins": action_bins,
-            "policy_state_dict": baseline_result.policy.state_dict(),
-            "state_normalizer": serialize_normalizer(baseline_result.state_normalizer),
-            "best_policy_state_dict": baseline_result.best_policy_state_dict,
-            "best_state_normalizer": serialize_normalizer_state(
-                baseline_result.best_state_normalizer_state
-            ),
-            "best_return": float(baseline_result.best_return),
-            "best_episode": baseline_result.best_episode,
-            "solve_policy_state_dict": baseline_result.solve_policy_state_dict,
-            "solve_state_normalizer": None
-            if baseline_result.solve_state_normalizer_state is None
-            else serialize_normalizer_state(baseline_result.solve_state_normalizer_state),
-            "solve_eval_returns": None
-            if baseline_result.solve_eval_returns is None
-            else torch.tensor(baseline_result.solve_eval_returns, dtype=torch.float32),
-            "solved_episode": baseline_result.solved_episode,
-            "solved_env_steps": baseline_result.solved_env_steps,
-            "total_env_steps": baseline_result.total_env_steps,
-            "randomize_physics": randomize_physics,
-            "solve_eval_episodes": solve_eval_episodes,
-            "solved_return": solved_return,
-        },
-        baseline_checkpoint_path,
-    )
-    torch.save(
-        {
-            "env_name": env_name,
-            "window_size": window_size,
-            "z_dim": z_dim,
-            "belief_dim": z_dim * 2,
-            "belief_style": "posterior_mean_std",
-            "action_bins": action_bins,
-            "hidden_dim": hidden_dim,
-            "online_z_update_alpha": online_z_update_alpha,
-            "online_z_update_freq": online_z_update_freq,
-            "base_probe_episodes": base_probe_episodes,
-            "max_probe_episodes": max_probe_episodes,
-            "encoder_state_dict": crawler_bundle.encoder.state_dict(),
-            "predictor_state_dict": crawler_bundle.predictor.state_dict(),
-            "predictor_ensemble_size": int(crawler_bundle.predictor.ensemble_size),
-            "belief_aggregator_state_dict": crawler_bundle.belief_aggregator.state_dict(),
-            "env_param_predictor_state_dict": crawler_bundle.env_param_predictor.state_dict(),
-            "env_param_predictor_ensemble_size": int(crawler_bundle.env_param_predictor.ensemble_size),
-            "env_param_dim": int(crawler_bundle.env_param_predictor.output_dim),
-            "env_future_predictor_state_dict": None
-            if crawler_bundle.env_future_predictor is None
-            else crawler_bundle.env_future_predictor.state_dict(),
-            "env_future_summary_dim": 0
-            if crawler_bundle.env_future_predictor is None
-            else int(crawler_bundle.env_future_predictor.net[-1].out_features),
-            "env_metric_projector_state_dict": None
-            if crawler_bundle.env_metric_projector is None
-            else crawler_bundle.env_metric_projector.state_dict(),
-            "env_metric_dim": 0
-            if crawler_bundle.env_metric_projector is None
-            else int(crawler_bundle.env_metric_projector.net[-1].out_features),
-            "policy_state_dict": probe_result.policy.state_dict(),
-            "state_normalizer": serialize_normalizer(probe_result.state_normalizer),
-            "best_policy_state_dict": probe_result.best_policy_state_dict,
-            "best_state_normalizer": serialize_normalizer_state(
-                probe_result.best_state_normalizer_state
-            ),
-            "best_return": float(probe_result.best_return),
-            "best_episode": probe_result.best_episode,
-            "solve_policy_state_dict": probe_result.solve_policy_state_dict,
-            "solve_state_normalizer": None
-            if probe_result.solve_state_normalizer_state is None
-            else serialize_normalizer_state(probe_result.solve_state_normalizer_state),
-            "solve_eval_returns": None
-            if probe_result.solve_eval_returns is None
-            else torch.tensor(probe_result.solve_eval_returns, dtype=torch.float32),
-            "solve_probe_count": probe_result.solve_probe_count,
-            "solved_episode": probe_result.solved_episode,
-            "solved_env_steps": probe_result.solved_env_steps,
-            "total_env_steps": probe_result.total_env_steps,
-            "randomize_physics": randomize_physics,
-            "solve_eval_episodes": solve_eval_episodes,
-            "solved_return": solved_return,
-        },
-        probe_checkpoint_path,
-    )
-
-    print(f"Saved encoder to {encoder_path}")
-    print(f"Saved baseline returns to {baseline_returns_path}")
-    print(f"Saved probe-conditioned returns to {probe_returns_path}")
-    print(f"Saved baseline PPO checkpoint to {baseline_checkpoint_path}")
-    print(f"Saved probe-conditioned PPO checkpoint to {probe_checkpoint_path}")
-
-
-def save_benchmark_results(
-    env_name: str,
-    benchmark_tag: str,
-    seeds,
-    baseline_episode_solves,
-    probe_episode_solves,
-    baseline_step_solves,
-    probe_step_solves,
-    baseline_total_env_steps,
-    probe_total_env_steps,
-    baseline_completed_episodes,
-    probe_completed_episodes,
-    probe_encoder_steps,
-):
-    """Save the cross-seed solve summary in one compact file."""
-    output_dir = Path("artifacts")
-    output_dir.mkdir(exist_ok=True)
-
-    benchmark_path = output_dir / f"{benchmark_tag}_solve_benchmark.npz"
-    np.savez(
-        benchmark_path,
-        env_name=np.asarray(env_name),
-        seeds=np.asarray(seeds, dtype=np.int64),
-        baseline_solves=np.asarray(baseline_episode_solves, dtype=np.int64),
-        probe_solves=np.asarray(probe_episode_solves, dtype=np.int64),
-        baseline_episode_solves=np.asarray(baseline_episode_solves, dtype=np.int64),
-        probe_episode_solves=np.asarray(probe_episode_solves, dtype=np.int64),
-        baseline_step_solves=np.asarray(baseline_step_solves, dtype=np.int64),
-        probe_step_solves=np.asarray(probe_step_solves, dtype=np.int64),
-        baseline_total_env_steps=np.asarray(baseline_total_env_steps, dtype=np.int64),
-        probe_total_env_steps=np.asarray(probe_total_env_steps, dtype=np.int64),
-        baseline_completed_episodes=np.asarray(baseline_completed_episodes, dtype=np.int64),
-        probe_completed_episodes=np.asarray(probe_completed_episodes, dtype=np.int64),
-        probe_encoder_steps=np.asarray(probe_encoder_steps, dtype=np.int64),
-    )
-    print(f"Saved benchmark results to {benchmark_path}")
-
-
-def save_dashboard_context(
-    env_name: str,
-    benchmark_tag: str,
-    seeds: list[int],
-    artifact_dir: Path,
-):
-    """Persist the current training selection so the dashboard can default to it."""
-    artifact_dir.mkdir(exist_ok=True)
-    context_path = artifact_dir / "dashboard_context.json"
-    context = {
-        "env_name": env_name,
-        "env_display_name": get_env_display_name(env_name),
-        "benchmark_tag": benchmark_tag,
-        "default_benchmark_summary": f"{benchmark_tag}_solve_benchmark.npz",
-        "default_latent_snapshot": f"{benchmark_tag}_seed_{seeds[-1]}_latent_snapshot.npz",
-        "seeds": list(seeds),
-    }
-    context_path.write_text(json.dumps(context, indent=2), encoding="utf-8")
-    print(f"Saved dashboard context to {context_path}")
-
-
-def print_return_summary(name: str, returns):
-    """Report short-horizon and medium-horizon return averages."""
-    print(
-        f"{name}: "
-        f"avg10={np.mean(returns[-10:]):.2f} | "
-        f"avg50={np.mean(returns[-50:]):.2f}"
-    )
-
-
-def print_solve_summary(name: str, solves, unsolved_caps):
-    """Summarize solve speed with an explicit per-run cap for unsolved seeds."""
-    success_count = sum(1 for value in solves if value is not None)
-    capped_solves = [
-        value if value is not None else cap
-        for value, cap in zip(solves, unsolved_caps)
-    ]
-    display_solves = [value if value is not None else -1 for value in solves]
-    print(
-        f"{name}: "
-        f"success_rate={success_count}/{len(solves)} | "
-        f"capped_median={statistics.median(capped_solves):.2f} | "
-        f"capped_mean={sum(capped_solves) / len(capped_solves):.2f} | "
-        f"solves={display_solves}"
-    )
-
-
 def run_single_seed(
     seed: int,
     config: ExperimentConfig,
     run_index: int = 1,
     total_runs: int = 1,
+    live_trace: LiveTrainingTraceWriter | None = None,
 ):
     """Run the full benchmark pipeline for one seed."""
     set_seed(seed)
+    benchmark_profile = resolve_benchmark_profile(config)
+    profile_flags = benchmark_profile_flags(benchmark_profile)
+    solve_eval_episodes = solve_eval_episodes_for_profile(config)
 
     artifact_tag = f"{config.benchmark_tag}_seed_{seed}"
 
     print(f"\n=== Seed {seed} | env={config.env_name} ===")
     print(f"Collecting probe data for {config.env_name}...")
+    if live_trace is not None:
+        live_trace.begin_seed(run_index=run_index, total_runs=total_runs, seed=seed)
     # First collect short probe rollouts that the encoder will learn from.
     crawler = ProbeCrawler(
         env_name=config.env_name,
@@ -542,6 +101,7 @@ def run_single_seed(
         seed=seed,
         randomize_physics=config.randomize_physics,
         action_bins=config.action_bins,
+        trace_writer=live_trace,
     )
     crawler.collect(episodes_per_mode=config.probe_episodes_per_mode, max_steps=config.probe_max_steps)
 
@@ -555,12 +115,22 @@ def run_single_seed(
     print(f"\nProbe encoder data collection steps: {encoder_probe_steps}")
 
     print("\nTraining encoder + delta predictor...")
+    if live_trace is not None:
+        live_trace.set_stage(
+            "encoder_training",
+            "Belief Formation",
+            "Compressing the support windows into an environment belief and message channel.",
+            run_index=run_index,
+            total_runs=total_runs,
+            seed=seed,
+        )
     # Train the latent encoder before either PPO variant so both runs see the same probe model.
     crawler_bundle = train_crawler_library(
         windows=windows,
         z_dim=config.z_dim,
         window_size=config.window_size,
         action_vocab_size=crawler.action_dim,
+        progress_callback=None if live_trace is None else live_trace.record_encoder_epoch,
         epochs=config.encoder_epochs,
         batch_size=config.encoder_batch_size,
         lr=config.encoder_lr,
@@ -591,6 +161,7 @@ def run_single_seed(
         env_param_predictor=crawler_bundle.env_param_predictor,
         env_future_predictor=crawler_bundle.env_future_predictor,
         env_metric_projector=crawler_bundle.env_metric_projector,
+        belief_message_projector=crawler_bundle.env_expression_projector,
         device=crawler_bundle.device,
         windows=windows,
         env_name=config.env_name,
@@ -601,6 +172,76 @@ def run_single_seed(
     latent_snapshot_path = Path("artifacts") / f"{artifact_tag}_latent_snapshot.npz"
     save_latent_snapshot(latent_snapshot_path, latent_snapshot)
     print(f"Saved latent snapshot to {latent_snapshot_path}")
+    latent_predictive_mean = latent_snapshot["env_belief_mean"].astype(np.float32)
+    latent_metric_mean = latent_snapshot.get(
+        "env_metric_mean",
+        latent_predictive_mean,
+    ).astype(np.float32)
+    latent_split_mean_a = latent_snapshot.get(
+        "env_metric_split_mean_a",
+        latent_snapshot["env_split_mean_a"],
+    ).astype(np.float32)
+    latent_split_mean_b = latent_snapshot.get(
+        "env_metric_split_mean_b",
+        latent_snapshot["env_split_mean_b"],
+    ).astype(np.float32)
+    latent_env_params = latent_snapshot["env_params"].astype(np.float32)
+    latent_env_uncertainty = latent_snapshot.get(
+        "env_uncertainty",
+        np.zeros((latent_metric_mean.shape[0],), dtype=np.float32),
+    ).astype(np.float32)
+    latent_env_param_error = latent_snapshot.get(
+        "env_param_error_mean",
+        np.zeros((latent_metric_mean.shape[0],), dtype=np.float32),
+    ).astype(np.float32)
+    latent_future_probe_error = latent_snapshot.get(
+        "env_future_prediction_error",
+        np.zeros((latent_metric_mean.shape[0],), dtype=np.float32),
+    ).astype(np.float32)
+    latent_dominant_probe_mode = latent_snapshot.get(
+        "env_dominant_probe_mode",
+        np.asarray([], dtype="U"),
+    ).astype("U")
+    latent_split_stats = compute_split_retrieval_stats(
+        latent_split_mean_a,
+        latent_split_mean_b,
+    )
+    latent_neighbor_alignment = compute_neighbor_env_alignment(
+        latent_metric_mean,
+        latent_env_params,
+    )
+    latent_mechanics_fit = compute_linear_env_fit(
+        latent_predictive_mean,
+        latent_env_params,
+    )
+    latent_gap_ratio = compute_same_env_gap_ratio(
+        latent_metric_mean,
+        latent_split_mean_a,
+        latent_split_mean_b,
+    )
+    latent_uncertainty_alignment = compute_uncertainty_error_alignment(
+        latent_env_uncertainty,
+        latent_env_param_error,
+    )
+    latent_probe_leakage = (
+        0.0
+        if latent_dominant_probe_mode.size == 0
+        else compute_mode_leakage(latent_predictive_mean, latent_dominant_probe_mode)
+    )
+    latent_heldout_probe_error = (
+        float(np.mean(latent_future_probe_error))
+        if latent_future_probe_error.size
+        else 0.0
+    )
+    latent_belief_progress_index = compute_belief_progress_index(
+        mechanics_fit=latent_mechanics_fit,
+        neighbor_alignment=latent_neighbor_alignment,
+        split_retrieval=float(latent_split_stats["top1"]),
+        heldout_probe_error=latent_heldout_probe_error,
+        uncert_error_corr=float(latent_uncertainty_alignment["correlation"]),
+        probe_leakage=latent_probe_leakage,
+    )
+    latent_support_diagnostics = build_latent_support_diagnostics(latent_snapshot)
 
     crawler.close()
 
@@ -609,10 +250,12 @@ def run_single_seed(
     baseline_result = train_plain_ppo(
         env_name=config.env_name,
         num_episodes=config.num_episodes,
+        belief_dim=crawler_bundle.env_expression_dim + 2,
         gamma=config.gamma,
         gae_lambda=config.gae_lambda,
         lr=config.lr,
         clip_ratio=config.clip_ratio,
+        value_clip_ratio=config.value_clip_ratio,
         ppo_epochs=config.ppo_epochs,
         minibatch_size=config.minibatch_size,
         value_loss_weight=config.value_loss_weight,
@@ -620,24 +263,26 @@ def run_single_seed(
         max_grad_norm=config.max_grad_norm,
         target_kl=config.target_kl,
         min_rollout_steps=config.min_rollout_steps,
+        lr_anneal=config.lr_anneal,
         hidden_dim=config.hidden_dim,
         normalize_rewards=config.normalize_rewards,
         seed=seed,
         randomize_physics=config.randomize_physics,
         solved_return=config.solved_return,
-        solve_eval_episodes=config.solve_eval_episodes,
+        solve_eval_episodes=solve_eval_episodes,
         run_index=run_index,
         total_runs=total_runs,
         variant_label="baseline",
         peer_variant_label="probe",
         peer_solved_episode=None,
+        trace_writer=live_trace,
     )
 
     baseline_returns = baseline_result.returns
     baseline_solve = baseline_result.solved_episode
 
     print("\nTraining probe-conditioned PPO...")
-    # Probe-conditioned PPO gets both state and the probe-derived belief vector.
+    # Probe-conditioned PPO gets both state and the probe-derived env expression.
     probe_result = train_probe_conditioned_ppo(
         env_name=config.env_name,
         crawler_bundle=crawler_bundle,
@@ -648,6 +293,7 @@ def run_single_seed(
         gae_lambda=config.gae_lambda,
         lr=config.lr,
         clip_ratio=config.clip_ratio,
+        value_clip_ratio=config.value_clip_ratio,
         ppo_epochs=config.ppo_epochs,
         minibatch_size=config.minibatch_size,
         value_loss_weight=config.value_loss_weight,
@@ -655,6 +301,7 @@ def run_single_seed(
         max_grad_norm=config.max_grad_norm,
         target_kl=config.target_kl,
         min_rollout_steps=config.min_rollout_steps,
+        lr_anneal=config.lr_anneal,
         hidden_dim=config.hidden_dim,
         normalize_rewards=config.normalize_rewards,
         seed=seed,
@@ -662,11 +309,18 @@ def run_single_seed(
         latent_memory_capacity=config.latent_memory_capacity,
         base_probe_episodes=config.base_probe_episodes,
         max_probe_episodes=config.max_probe_episodes,
+        benchmark_mode=config.benchmark_mode,
+        probe_budget_mode=config.probe_budget_mode,
+        probe_adaptive_budget=config.probe_adaptive_budget,
+        probe_adaptive_policy_schedule=config.probe_adaptive_policy_schedule,
+        belief_bits_per_dim=config.belief_bits_per_dim,
+        belief_use_residual_sketch=config.belief_use_residual_sketch,
         novelty_probe_threshold=config.novelty_probe_threshold,
         low_return_probe_threshold=config.low_return_probe_threshold,
         exploit_return_threshold=config.exploit_return_threshold,
         uncertainty_probe_threshold=config.uncertainty_probe_threshold,
         uncertainty_focus_threshold=config.uncertainty_focus_threshold,
+        surprise_probe_threshold=config.surprise_probe_threshold,
         online_z_update_alpha=config.online_z_update_alpha,
         online_z_update_freq=config.online_z_update_freq,
         sil_batch_size=config.sil_batch_size,
@@ -676,15 +330,378 @@ def run_single_seed(
         elite_warmup_episodes=config.elite_warmup_episodes,
         elite_threshold_std_scale=config.elite_threshold_std_scale,
         solved_return=config.solved_return,
-        solve_eval_episodes=config.solve_eval_episodes,
+        solve_eval_episodes=solve_eval_episodes,
         run_index=run_index,
         total_runs=total_runs,
         variant_label="probe",
         peer_variant_label="baseline",
         peer_solved_episode=baseline_solve,
+        trace_writer=live_trace,
     )
 
     probe_returns = probe_result.returns
+
+    probe_shadow_result = None
+    probe_shadow_returns: list[float] = []
+    if profile_flags["run_probe_shadow"]:
+        print("\nTraining probe-conditioned PPO with shadow env expression...")
+        probe_shadow_result = train_probe_conditioned_ppo(
+            env_name=config.env_name,
+            crawler_bundle=crawler_bundle,
+            num_episodes=config.num_episodes,
+            window_size=config.window_size,
+            action_bins=config.action_bins,
+            gamma=config.gamma,
+            gae_lambda=config.gae_lambda,
+            lr=config.lr,
+            clip_ratio=config.clip_ratio,
+            value_clip_ratio=config.value_clip_ratio,
+            ppo_epochs=config.ppo_epochs,
+            minibatch_size=config.minibatch_size,
+            value_loss_weight=config.value_loss_weight,
+            entropy_coef=config.entropy_coef,
+            max_grad_norm=config.max_grad_norm,
+            target_kl=config.target_kl,
+            min_rollout_steps=config.min_rollout_steps,
+            lr_anneal=config.lr_anneal,
+            hidden_dim=config.hidden_dim,
+            normalize_rewards=config.normalize_rewards,
+            seed=seed,
+            randomize_physics=config.randomize_physics,
+            latent_memory_capacity=config.latent_memory_capacity,
+            base_probe_episodes=config.base_probe_episodes,
+            max_probe_episodes=config.max_probe_episodes,
+            benchmark_mode=config.benchmark_mode,
+            probe_budget_mode=config.probe_budget_mode,
+            probe_adaptive_budget=config.probe_adaptive_budget,
+            probe_adaptive_policy_schedule=config.probe_adaptive_policy_schedule,
+            belief_bits_per_dim=config.belief_bits_per_dim,
+            belief_use_residual_sketch=config.belief_use_residual_sketch,
+            novelty_probe_threshold=config.novelty_probe_threshold,
+            low_return_probe_threshold=config.low_return_probe_threshold,
+            exploit_return_threshold=config.exploit_return_threshold,
+            uncertainty_probe_threshold=config.uncertainty_probe_threshold,
+            uncertainty_focus_threshold=config.uncertainty_focus_threshold,
+            surprise_probe_threshold=config.surprise_probe_threshold,
+            online_z_update_alpha=config.online_z_update_alpha,
+            online_z_update_freq=config.online_z_update_freq,
+            sil_batch_size=config.sil_batch_size,
+            sil_policy_weight=config.sil_policy_weight,
+            sil_value_weight=config.sil_value_weight,
+            min_elite_return=config.min_elite_return,
+            elite_warmup_episodes=config.elite_warmup_episodes,
+            elite_threshold_std_scale=config.elite_threshold_std_scale,
+            solved_return=config.solved_return,
+            solve_eval_episodes=solve_eval_episodes,
+            run_index=run_index,
+            total_runs=total_runs,
+            variant_label="probe-shadowexpr",
+            peer_variant_label="probe",
+            peer_solved_episode=probe_result.solved_episode,
+            shadow_env_expression=True,
+            trace_writer=live_trace,
+        )
+        probe_shadow_returns = probe_shadow_result.returns
+
+    probe_no_expression_result = None
+    probe_no_expression_returns: list[float] = []
+    if profile_flags["run_probe_no_expression_training"]:
+        print("\nTraining probe-conditioned PPO without env expression...")
+        probe_no_expression_result = train_probe_conditioned_ppo(
+            env_name=config.env_name,
+            crawler_bundle=crawler_bundle,
+            num_episodes=config.num_episodes,
+            window_size=config.window_size,
+            action_bins=config.action_bins,
+            gamma=config.gamma,
+            gae_lambda=config.gae_lambda,
+            lr=config.lr,
+            clip_ratio=config.clip_ratio,
+            value_clip_ratio=config.value_clip_ratio,
+            ppo_epochs=config.ppo_epochs,
+            minibatch_size=config.minibatch_size,
+            value_loss_weight=config.value_loss_weight,
+            entropy_coef=config.entropy_coef,
+            max_grad_norm=config.max_grad_norm,
+            target_kl=config.target_kl,
+            min_rollout_steps=config.min_rollout_steps,
+            lr_anneal=config.lr_anneal,
+            hidden_dim=config.hidden_dim,
+            normalize_rewards=config.normalize_rewards,
+            seed=seed,
+            randomize_physics=config.randomize_physics,
+            latent_memory_capacity=config.latent_memory_capacity,
+            base_probe_episodes=config.base_probe_episodes,
+            max_probe_episodes=config.max_probe_episodes,
+            benchmark_mode=config.benchmark_mode,
+            probe_budget_mode=config.probe_budget_mode,
+            probe_adaptive_budget=config.probe_adaptive_budget,
+            probe_adaptive_policy_schedule=config.probe_adaptive_policy_schedule,
+            belief_bits_per_dim=config.belief_bits_per_dim,
+            belief_use_residual_sketch=config.belief_use_residual_sketch,
+            novelty_probe_threshold=config.novelty_probe_threshold,
+            low_return_probe_threshold=config.low_return_probe_threshold,
+            exploit_return_threshold=config.exploit_return_threshold,
+            uncertainty_probe_threshold=config.uncertainty_probe_threshold,
+            uncertainty_focus_threshold=config.uncertainty_focus_threshold,
+            surprise_probe_threshold=config.surprise_probe_threshold,
+            online_z_update_alpha=config.online_z_update_alpha,
+            online_z_update_freq=config.online_z_update_freq,
+            sil_batch_size=config.sil_batch_size,
+            sil_policy_weight=config.sil_policy_weight,
+            sil_value_weight=config.sil_value_weight,
+            min_elite_return=config.min_elite_return,
+            elite_warmup_episodes=config.elite_warmup_episodes,
+            elite_threshold_std_scale=config.elite_threshold_std_scale,
+            solved_return=config.solved_return,
+            solve_eval_episodes=solve_eval_episodes,
+            run_index=run_index,
+            total_runs=total_runs,
+            variant_label="probe-noexpr",
+            peer_variant_label="probe",
+            peer_solved_episode=probe_result.solved_episode,
+            disable_env_expression=True,
+            trace_writer=live_trace,
+        )
+        probe_no_expression_returns = probe_no_expression_result.returns
+    else:
+        print(
+            "\nSkipping separate probe-noexpr training in this profile; "
+            "using matched env-expression eval-off instead."
+        )
+
+    full_system_result = None
+    full_system_returns: list[float] = []
+    full_system_oracle_result = None
+    full_system_oracle_returns: list[float] = []
+    sim_fanout_result = None
+    sim_fanout_returns: list[float] = []
+    if config.full_system_enabled:
+        if profile_flags["run_belief_controller"]:
+            print("\nTraining belief-controller...")
+            full_system_result = train_belief_affordance_controller(
+                env_name=config.env_name,
+                crawler_bundle=crawler_bundle,
+                num_episodes=config.num_episodes,
+                window_size=config.window_size,
+                gamma=config.gamma,
+                lr=config.lr,
+                max_grad_norm=config.max_grad_norm,
+                hidden_dim=config.hidden_dim,
+                normalize_rewards=config.normalize_rewards,
+                seed=seed,
+                randomize_physics=config.randomize_physics,
+                base_probe_episodes=config.base_probe_episodes,
+                max_probe_episodes=config.max_probe_episodes,
+                probe_adaptive_budget=config.probe_adaptive_budget,
+                uncertainty_probe_threshold=config.uncertainty_probe_threshold,
+                surprise_probe_threshold=config.surprise_probe_threshold,
+                online_z_update_alpha=config.online_z_update_alpha,
+                online_z_update_freq=config.online_z_update_freq,
+                solved_return=config.solved_return,
+                solve_eval_episodes=solve_eval_episodes,
+                run_index=run_index,
+                total_runs=total_runs,
+                variant_label="belief-controller",
+                peer_variant_label="probe",
+                peer_solved_episode=probe_result.solved_episode,
+                full_system_online_refinement=config.full_system_online_refinement,
+                full_system_surprise_refresh_threshold=config.full_system_surprise_refresh_threshold,
+                full_system_context_source=config.full_system_context_source,
+                full_system_context_chunk_len=config.full_system_context_chunk_len,
+                full_system_curriculum_schedule=config.full_system_curriculum_schedule,
+                full_system_plateau_warmup_episodes=config.full_system_plateau_warmup_episodes,
+                full_system_plateau_patience=config.full_system_plateau_patience,
+                full_system_plateau_best_return_delta=config.full_system_plateau_best_return_delta,
+                full_system_plateau_avg50_delta=config.full_system_plateau_avg50_delta,
+                full_system_ablation_eval_episodes=config.full_system_ablation_eval_episodes,
+                belief_controller_eval_interval=config.belief_controller_eval_interval,
+                evaluation_profile=benchmark_profile,
+                gae_lambda=config.gae_lambda,
+                ppo_epochs=config.ppo_epochs,
+                minibatch_size=config.minibatch_size,
+                use_context=True,
+                selector_mode="learned_heads",
+                trace_writer=live_trace,
+            )
+            full_system_returns = full_system_result.returns
+        if profile_flags["run_belief_controller_oracle"]:
+            print("\nTraining oracle belief-controller...")
+            full_system_oracle_result = train_belief_affordance_controller(
+                env_name=config.env_name,
+                crawler_bundle=crawler_bundle,
+                num_episodes=config.num_episodes,
+                window_size=config.window_size,
+                gamma=config.gamma,
+                lr=config.lr,
+                max_grad_norm=config.max_grad_norm,
+                hidden_dim=config.hidden_dim,
+                normalize_rewards=config.normalize_rewards,
+                seed=seed,
+                randomize_physics=config.randomize_physics,
+                base_probe_episodes=config.base_probe_episodes,
+                max_probe_episodes=config.max_probe_episodes,
+                probe_adaptive_budget=config.probe_adaptive_budget,
+                uncertainty_probe_threshold=config.uncertainty_probe_threshold,
+                surprise_probe_threshold=config.surprise_probe_threshold,
+                online_z_update_alpha=config.online_z_update_alpha,
+                online_z_update_freq=config.online_z_update_freq,
+                solved_return=config.solved_return,
+                solve_eval_episodes=solve_eval_episodes,
+                run_index=run_index,
+                total_runs=total_runs,
+                variant_label="belief-controller-oracle",
+                peer_variant_label="belief-controller",
+                peer_solved_episode=None if full_system_result is None else full_system_result.solved_episode,
+                full_system_online_refinement=config.full_system_online_refinement,
+                full_system_surprise_refresh_threshold=config.full_system_surprise_refresh_threshold,
+                full_system_context_source="oracle",
+                full_system_context_chunk_len=config.full_system_context_chunk_len,
+                full_system_curriculum_schedule=config.full_system_curriculum_schedule,
+                full_system_plateau_warmup_episodes=config.full_system_plateau_warmup_episodes,
+                full_system_plateau_patience=config.full_system_plateau_patience,
+                full_system_plateau_best_return_delta=config.full_system_plateau_best_return_delta,
+                full_system_plateau_avg50_delta=config.full_system_plateau_avg50_delta,
+                full_system_ablation_eval_episodes=config.full_system_ablation_eval_episodes,
+                belief_controller_eval_interval=config.belief_controller_eval_interval,
+                evaluation_profile=benchmark_profile,
+                gae_lambda=config.gae_lambda,
+                ppo_epochs=config.ppo_epochs,
+                minibatch_size=config.minibatch_size,
+                use_context=True,
+                selector_mode="learned_heads",
+                trace_writer=live_trace,
+            )
+            full_system_oracle_returns = full_system_oracle_result.returns
+        if profile_flags["run_sim_fanout"]:
+            print("\nTraining simulator fan-out baseline...")
+            sim_fanout_result = train_belief_affordance_controller(
+                env_name=config.env_name,
+                crawler_bundle=crawler_bundle,
+                num_episodes=config.num_episodes,
+                window_size=config.window_size,
+                gamma=config.gamma,
+                lr=config.lr,
+                max_grad_norm=config.max_grad_norm,
+                hidden_dim=config.hidden_dim,
+                normalize_rewards=config.normalize_rewards,
+                seed=seed,
+                randomize_physics=config.randomize_physics,
+                base_probe_episodes=config.base_probe_episodes,
+                max_probe_episodes=config.max_probe_episodes,
+                probe_adaptive_budget=config.probe_adaptive_budget,
+                uncertainty_probe_threshold=config.uncertainty_probe_threshold,
+                surprise_probe_threshold=config.surprise_probe_threshold,
+                online_z_update_alpha=config.online_z_update_alpha,
+                online_z_update_freq=config.online_z_update_freq,
+                solved_return=config.solved_return,
+                solve_eval_episodes=solve_eval_episodes,
+                run_index=run_index,
+                total_runs=total_runs,
+                variant_label="sim-fanout",
+                peer_variant_label="belief-controller",
+                peer_solved_episode=None if full_system_result is None else full_system_result.solved_episode,
+                full_system_online_refinement=False,
+                full_system_surprise_refresh_threshold=config.full_system_surprise_refresh_threshold,
+                full_system_context_source="learned",
+                full_system_context_chunk_len=config.full_system_context_chunk_len,
+                full_system_curriculum_schedule=config.full_system_curriculum_schedule,
+                full_system_plateau_warmup_episodes=config.full_system_plateau_warmup_episodes,
+                full_system_plateau_patience=config.full_system_plateau_patience,
+                full_system_plateau_best_return_delta=config.full_system_plateau_best_return_delta,
+                full_system_plateau_avg50_delta=config.full_system_plateau_avg50_delta,
+                full_system_ablation_eval_episodes=config.full_system_ablation_eval_episodes,
+                belief_controller_eval_interval=config.belief_controller_eval_interval,
+                evaluation_profile=benchmark_profile,
+                gae_lambda=config.gae_lambda,
+                ppo_epochs=config.ppo_epochs,
+                minibatch_size=config.minibatch_size,
+                use_context=False,
+                selector_mode="sim_fanout",
+                trace_writer=live_trace,
+            )
+            sim_fanout_returns = sim_fanout_result.returns
+        if profile_flags["run_archived_planner"]:
+            print("\nTraining belief-planner controller...")
+            full_system_result = train_belief_planner(
+                env_name=config.env_name,
+                crawler_bundle=crawler_bundle,
+                planner_windows=windows,
+                num_episodes=config.num_episodes,
+                window_size=config.window_size,
+                gamma=config.gamma,
+                lr=config.lr,
+                max_grad_norm=config.max_grad_norm,
+                hidden_dim=config.hidden_dim,
+                normalize_rewards=config.normalize_rewards,
+                seed=seed,
+                randomize_physics=config.randomize_physics,
+                base_probe_episodes=config.base_probe_episodes,
+                max_probe_episodes=config.max_probe_episodes,
+                probe_adaptive_budget=config.probe_adaptive_budget,
+                uncertainty_probe_threshold=config.uncertainty_probe_threshold,
+                surprise_probe_threshold=config.surprise_probe_threshold,
+                online_z_update_alpha=config.online_z_update_alpha,
+                online_z_update_freq=config.online_z_update_freq,
+                solved_return=config.solved_return,
+                solve_eval_episodes=solve_eval_episodes,
+                run_index=run_index,
+                total_runs=total_runs,
+                variant_label="belief-planner",
+                peer_variant_label="probe",
+                peer_solved_episode=probe_result.solved_episode,
+                full_system_online_refinement=config.full_system_online_refinement,
+                full_system_surprise_refresh_threshold=config.full_system_surprise_refresh_threshold,
+                full_system_context_source=config.full_system_context_source,
+                full_system_context_chunk_len=config.full_system_context_chunk_len,
+                full_system_curriculum_schedule=config.full_system_curriculum_schedule,
+                full_system_plateau_warmup_episodes=config.full_system_plateau_warmup_episodes,
+                full_system_plateau_patience=config.full_system_plateau_patience,
+                full_system_plateau_best_return_delta=config.full_system_plateau_best_return_delta,
+                full_system_plateau_avg50_delta=config.full_system_plateau_avg50_delta,
+                trace_writer=live_trace,
+            )
+            full_system_returns = full_system_result.returns
+            print("\nTraining oracle belief-planner controller...")
+            full_system_oracle_result = train_belief_planner(
+                env_name=config.env_name,
+                crawler_bundle=crawler_bundle,
+                planner_windows=windows,
+                num_episodes=config.num_episodes,
+                window_size=config.window_size,
+                gamma=config.gamma,
+                lr=config.lr,
+                max_grad_norm=config.max_grad_norm,
+                hidden_dim=config.hidden_dim,
+                normalize_rewards=config.normalize_rewards,
+                seed=seed,
+                randomize_physics=config.randomize_physics,
+                base_probe_episodes=config.base_probe_episodes,
+                max_probe_episodes=config.max_probe_episodes,
+                probe_adaptive_budget=config.probe_adaptive_budget,
+                uncertainty_probe_threshold=config.uncertainty_probe_threshold,
+                surprise_probe_threshold=config.surprise_probe_threshold,
+                online_z_update_alpha=config.online_z_update_alpha,
+                online_z_update_freq=config.online_z_update_freq,
+                solved_return=config.solved_return,
+                solve_eval_episodes=solve_eval_episodes,
+                run_index=run_index,
+                total_runs=total_runs,
+                variant_label="belief-planner-oracle",
+                peer_variant_label="belief-planner",
+                peer_solved_episode=full_system_result.solved_episode,
+                full_system_online_refinement=config.full_system_online_refinement,
+                full_system_surprise_refresh_threshold=config.full_system_surprise_refresh_threshold,
+                full_system_context_source="oracle",
+                full_system_context_chunk_len=config.full_system_context_chunk_len,
+                full_system_curriculum_schedule=config.full_system_curriculum_schedule,
+                full_system_plateau_warmup_episodes=config.full_system_plateau_warmup_episodes,
+                full_system_plateau_patience=config.full_system_plateau_patience,
+                full_system_plateau_best_return_delta=config.full_system_plateau_best_return_delta,
+                full_system_plateau_avg50_delta=config.full_system_plateau_avg50_delta,
+                trace_writer=live_trace,
+            )
+            full_system_oracle_returns = full_system_oracle_result.returns
 
     save_training_artifacts(
         crawler_bundle=crawler_bundle,
@@ -692,68 +709,662 @@ def run_single_seed(
         probe_result=probe_result,
         artifact_tag=artifact_tag,
         env_name=config.env_name,
+        benchmark_profile=benchmark_profile,
+        benchmark_mode=config.benchmark_mode,
+        probe_budget_mode=config.probe_budget_mode,
         window_size=config.window_size,
         z_dim=config.z_dim,
         action_bins=config.action_bins,
         hidden_dim=config.hidden_dim,
+        belief_bits_per_dim=config.belief_bits_per_dim,
+        belief_use_residual_sketch=config.belief_use_residual_sketch,
         online_z_update_alpha=config.online_z_update_alpha,
         online_z_update_freq=config.online_z_update_freq,
         base_probe_episodes=config.base_probe_episodes,
         max_probe_episodes=config.max_probe_episodes,
+        probe_adaptive_budget=config.probe_adaptive_budget,
+        probe_adaptive_policy_schedule=config.probe_adaptive_policy_schedule,
         randomize_physics=config.randomize_physics,
-        solve_eval_episodes=config.solve_eval_episodes,
+        solve_eval_episodes=solve_eval_episodes,
         solved_return=config.solved_return,
+        value_clip_ratio=config.value_clip_ratio,
+        lr_anneal=config.lr_anneal,
+        full_system_result=full_system_result,
+        full_system_oracle_result=full_system_oracle_result,
+        sim_fanout_result=sim_fanout_result,
     )
 
     probe_solve = probe_result.solved_episode
+    probe_shadow_solve = None if probe_shadow_result is None else probe_shadow_result.solved_episode
+    probe_no_expression_solve = (
+        None
+        if probe_no_expression_result is None
+        else probe_no_expression_result.solved_episode
+    )
+    full_system_solve = None if full_system_result is None else full_system_result.solved_episode
+    full_system_state_only_solve = (
+        None
+        if full_system_result is None
+        else full_system_result.state_only_solved_episode
+    )
+    full_system_oracle_solve = (
+        None
+        if full_system_oracle_result is None
+        else full_system_oracle_result.solved_episode
+    )
+    sim_fanout_solve = None if sim_fanout_result is None else sim_fanout_result.solved_episode
     probe_solve_env_steps = (
         None
         if probe_result.solved_env_steps is None
         else probe_result.solved_env_steps + encoder_probe_steps
     )
+    probe_shadow_solve_env_steps = (
+        None
+        if probe_shadow_result is None or probe_shadow_result.solved_env_steps is None
+        else probe_shadow_result.solved_env_steps + encoder_probe_steps
+    )
+    probe_no_expression_solve_env_steps = (
+        None
+        if probe_no_expression_result is None or probe_no_expression_result.solved_env_steps is None
+        else probe_no_expression_result.solved_env_steps + encoder_probe_steps
+    )
+    full_system_solve_env_steps = (
+        None
+        if full_system_result is None or full_system_result.solved_env_steps is None
+        else full_system_result.solved_env_steps + encoder_probe_steps
+    )
+    full_system_state_only_solve_env_steps = (
+        None
+        if full_system_result is None or full_system_result.state_only_solved_env_steps is None
+        else full_system_result.state_only_solved_env_steps + encoder_probe_steps
+    )
+    full_system_oracle_solve_env_steps = (
+        None
+        if full_system_oracle_result is None or full_system_oracle_result.solved_env_steps is None
+        else full_system_oracle_result.solved_env_steps + encoder_probe_steps
+    )
+    sim_fanout_solve_env_steps = (
+        None
+        if sim_fanout_result is None or sim_fanout_result.solved_env_steps is None
+        else sim_fanout_result.solved_env_steps + encoder_probe_steps
+    )
     probe_total_env_steps = probe_result.total_env_steps + encoder_probe_steps
+    probe_shadow_total_env_steps = (
+        0
+        if probe_shadow_result is None
+        else probe_shadow_result.total_env_steps + encoder_probe_steps
+    )
+    probe_no_expression_total_env_steps = (
+        -1
+        if probe_no_expression_result is None
+        else probe_no_expression_result.total_env_steps + encoder_probe_steps
+    )
+    full_system_total_env_steps = (
+        0
+        if full_system_result is None
+        else full_system_result.total_env_steps + encoder_probe_steps
+    )
+    full_system_state_only_total_env_steps = (
+        0
+        if full_system_result is None or full_system_result.state_only_total_env_steps is None
+        else full_system_result.state_only_total_env_steps + encoder_probe_steps
+    )
+    full_system_oracle_total_env_steps = (
+        0
+        if full_system_oracle_result is None
+        else full_system_oracle_result.total_env_steps + encoder_probe_steps
+    )
+    sim_fanout_total_env_steps = (
+        0
+        if sim_fanout_result is None
+        else sim_fanout_result.total_env_steps + encoder_probe_steps
+    )
+    full_system_learned_eval_summary = (
+        None
+        if full_system_result is None
+        else matched_eval_summary_dict(full_system_result.learned_eval_summary)
+    )
+    full_system_state_only_eval_summary = (
+        None
+        if full_system_result is None
+        else matched_eval_summary_dict(full_system_result.state_only_eval_summary)
+    )
+    full_system_zero_context_eval_summary = (
+        None
+        if full_system_result is None
+        else matched_eval_summary_dict(full_system_result.zero_context_eval_summary)
+    )
+    full_system_shuffled_context_eval_summary = (
+        None
+        if full_system_result is None
+        else matched_eval_summary_dict(full_system_result.shuffled_context_eval_summary)
+    )
+    full_system_stale_context_eval_summary = (
+        None
+        if full_system_result is None
+        else matched_eval_summary_dict(full_system_result.stale_context_eval_summary)
+    )
+    full_system_online_refinement_eval_summary = (
+        None
+        if full_system_result is None
+        else matched_eval_summary_dict(full_system_result.no_online_refinement_eval_summary)
+    )
+    full_system_frozen_context_eval_summary = (
+        None
+        if full_system_result is None
+        else matched_eval_summary_dict(full_system_result.frozen_context_eval_summary)
+    )
+    full_system_actor_only_eval_summary = (
+        None
+        if full_system_result is None
+        else matched_eval_summary_dict(full_system_result.actor_only_eval_summary)
+    )
+    full_system_oracle_learned_eval_summary = (
+        None
+        if full_system_oracle_result is None
+        else matched_eval_summary_dict(full_system_oracle_result.learned_eval_summary)
+    )
+    full_system_oracle_zero_context_eval_summary = (
+        None
+        if full_system_oracle_result is None
+        else matched_eval_summary_dict(full_system_oracle_result.zero_context_eval_summary)
+    )
+    full_system_oracle_shuffled_context_eval_summary = (
+        None
+        if full_system_oracle_result is None
+        else matched_eval_summary_dict(full_system_oracle_result.shuffled_context_eval_summary)
+    )
+    full_system_oracle_stale_context_eval_summary = (
+        None
+        if full_system_oracle_result is None
+        else matched_eval_summary_dict(full_system_oracle_result.stale_context_eval_summary)
+    )
+    full_system_oracle_online_refinement_eval_summary = (
+        None
+        if full_system_oracle_result is None
+        else matched_eval_summary_dict(full_system_oracle_result.no_online_refinement_eval_summary)
+    )
+    full_system_oracle_frozen_context_eval_summary = (
+        None
+        if full_system_oracle_result is None
+        else matched_eval_summary_dict(full_system_oracle_result.frozen_context_eval_summary)
+    )
+    full_system_oracle_actor_only_eval_summary = (
+        None
+        if full_system_oracle_result is None
+        else matched_eval_summary_dict(full_system_oracle_result.actor_only_eval_summary)
+    )
+    probe_run_classification = classify_probe_run(
+        baseline_episode=baseline_solve,
+        baseline_steps=baseline_result.solved_env_steps,
+        probe_episode=probe_solve,
+        probe_steps=probe_solve_env_steps,
+        probe_no_expression_episode=probe_no_expression_solve,
+        probe_no_expression_steps=probe_no_expression_solve_env_steps,
+        probe_env_expression_delta=probe_result.env_expression_ablation_delta,
+        probe_fair_ready_handoff_fraction=probe_result.fair_ready_handoff_fraction,
+        probe_fair_expression_enabled_fraction=probe_result.fair_expression_enabled_fraction,
+    )
+    probe_usage_status = probe_strict_usage_status(
+        probe_result.fair_expression_enabled_fraction
+    )
+    dominant_readiness_blocker = max(
+        (probe_result.readiness_reason_counts or {}).items(),
+        key=lambda item: (int(item[1]), str(item[0])),
+        default=("none", 0),
+    )[0]
+    mean_leaveout_stability = float(
+        (probe_result.readiness_component_means or {}).get("leaveout_stability", 0.0)
+    )
 
     print_return_summary("Baseline PPO", baseline_returns)
     print_return_summary("Probe-conditioned PPO", probe_returns)
+    if probe_shadow_result is not None:
+        print_return_summary("Probe + shadow env expression PPO", probe_shadow_returns)
+    if probe_no_expression_result is not None:
+        print_return_summary("Probe + no env expression PPO", probe_no_expression_returns)
+    elif probe_result.no_env_expression_eval_returns is not None:
+        print(
+            "Probe + no env expression training: not run | "
+            f"matched_eval_off={np.mean(probe_result.no_env_expression_eval_returns):.2f}"
+        )
+    if full_system_result is not None:
+        print_return_summary(f"{full_system_display_label(full_system_result)} controller", full_system_returns)
+        if full_system_result.state_only_eval_returns is not None:
+            print_return_summary(
+                f"{full_system_display_label(full_system_result)} state-only eval",
+                full_system_result.state_only_eval_returns,
+            )
+    if full_system_oracle_result is not None:
+        print_return_summary(
+            f"{full_system_display_label(full_system_oracle_result)} oracle controller",
+            full_system_oracle_returns,
+        )
+    if sim_fanout_result is not None:
+        print_return_summary("Sim-fanout baseline", sim_fanout_returns)
     print(
         "Solve episodes: "
         f"baseline={baseline_solve} | "
-        f"probe-conditioned={probe_solve}"
+        f"probe-conditioned={probe_solve} | "
+        f"probe-shadowexpr={probe_shadow_solve} | "
+        f"probe-noexpr={probe_no_expression_solve} | "
+        f"full-system={full_system_solve} | "
+        f"full-system-oracle={full_system_oracle_solve} | "
+        f"sim-fanout={sim_fanout_solve}"
     )
     print(
         "Solve env steps (end-to-end): "
         f"baseline={baseline_result.solved_env_steps} | "
-        f"probe-conditioned={probe_solve_env_steps}"
+        f"probe-conditioned={probe_solve_env_steps} | "
+        f"probe-shadowexpr={probe_shadow_solve_env_steps} | "
+        f"probe-noexpr={probe_no_expression_solve_env_steps} | "
+        f"full-system={full_system_solve_env_steps} | "
+        f"full-system-oracle={full_system_oracle_solve_env_steps} | "
+        f"sim-fanout={sim_fanout_solve_env_steps}"
+    )
+    if probe_result.env_expression_ablation_delta is not None:
+        print(
+            "Env-expression eval delta: "
+            f"probe-conditioned={probe_result.env_expression_ablation_delta:.2f} | "
+            f"forced={float(probe_result.forced_env_expression_ablation_delta or 0.0):.2f}"
+        )
+        print(
+            "Strict env-expression usage: "
+            f"status={probe_usage_status} | "
+            f"blocker={dominant_readiness_blocker} | "
+            f"leaveout={mean_leaveout_stability:.2f} | "
+            f"forced_scale={float(probe_result.forced_env_expression_scale or 0.0):.2f}"
+        )
+    if full_system_result is not None and full_system_result.state_only_ablation_delta is not None:
+        print(
+            "Full-system eval delta: "
+            f"state-only={full_system_result.state_only_ablation_delta:.2f} | "
+            f"zero={float(full_system_result.zero_context_ablation_delta or 0.0):.2f} | "
+            f"shuffled={float(full_system_result.shuffled_context_ablation_delta or 0.0):.2f} | "
+            f"stale={float(full_system_result.stale_context_ablation_delta or 0.0):.2f} | "
+            f"no-refresh={float(full_system_result.online_refinement_ablation_delta or 0.0):.2f} | "
+            f"frozen={float(full_system_result.frozen_context_ablation_delta or 0.0):.2f} | "
+            f"actor={float(full_system_result.actor_only_ablation_delta or 0.0):.2f}"
+        )
+        print_matched_eval_summary(
+            f"{full_system_display_label(full_system_result)} matched learned eval",
+            full_system_learned_eval_summary,
+        )
+        print_matched_eval_summary(
+            f"{full_system_display_label(full_system_result)} matched state-only eval",
+            full_system_state_only_eval_summary,
+        )
+        print_matched_eval_summary(
+            f"{full_system_display_label(full_system_result)} matched zero-context eval",
+            full_system_zero_context_eval_summary,
+        )
+        print_matched_eval_summary(
+            f"{full_system_display_label(full_system_result)} matched shuffled-context eval",
+            full_system_shuffled_context_eval_summary,
+        )
+        print_matched_eval_summary(
+            f"{full_system_display_label(full_system_result)} matched stale-context eval",
+            full_system_stale_context_eval_summary,
+        )
+        print_matched_eval_summary(
+            f"{full_system_display_label(full_system_result)} matched no-refresh eval",
+            full_system_online_refinement_eval_summary,
+        )
+        print_matched_eval_summary(
+            f"{full_system_display_label(full_system_result)} matched frozen-context eval",
+            full_system_frozen_context_eval_summary,
+        )
+    print(
+        "Belief progress: "
+        f"bpi={latent_belief_progress_index:.3f} | "
+        f"fit={latent_mechanics_fit:.3f} | "
+        f"neighbor={latent_neighbor_alignment:.3f} | "
+        f"split-top1={float(latent_split_stats['top1']):.3f} | "
+        f"gap={float(latent_gap_ratio['mean']):.3f} | "
+        f"leak={latent_probe_leakage:.3f} | "
+        f"uncert-corr={float(latent_uncertainty_alignment['correlation']):.3f}"
+    )
+    print(
+        "Belief support: "
+        f"center={float(latent_support_diagnostics['center_window_share']):.3f} | "
+        f"directional={float(latent_support_diagnostics['directional_window_share']):.3f} | "
+        f"eff-family={float(latent_support_diagnostics['effective_window_families']):.2f} | "
+        f"support/env={float(latent_support_diagnostics['support_count_mean']):.1f} | "
+        f"split-overlap={float(latent_support_diagnostics['split_group_overlap_mean']):.3f} | "
+        f"window-leak={float(latent_support_diagnostics['window_mode_leakage']):.3f} | "
+        f"nearest={float(latent_support_diagnostics['nearest_between_median']):.4f}"
     )
 
     return {
         "seed": seed,
+        "benchmark_profile": benchmark_profile,
         "baseline_solve_episode": baseline_solve,
         "probe_solve_episode": probe_solve,
+        "probe_shadow_solve_episode": probe_shadow_solve,
+        "probe_no_expression_solve_episode": probe_no_expression_solve,
+        "full_system_solve_episode": full_system_solve,
+        "full_system_state_only_solve_episode": full_system_state_only_solve,
+        "full_system_oracle_solve_episode": full_system_oracle_solve,
+        "sim_fanout_solve_episode": sim_fanout_solve,
         "baseline_solve_env_steps": baseline_result.solved_env_steps,
         "probe_solve_env_steps": probe_solve_env_steps,
+        "probe_shadow_solve_env_steps": probe_shadow_solve_env_steps,
+        "probe_no_expression_solve_env_steps": probe_no_expression_solve_env_steps,
+        "full_system_solve_env_steps": full_system_solve_env_steps,
+        "full_system_state_only_solve_env_steps": full_system_state_only_solve_env_steps,
+        "full_system_oracle_solve_env_steps": full_system_oracle_solve_env_steps,
+        "sim_fanout_solve_env_steps": sim_fanout_solve_env_steps,
         "baseline_total_env_steps": baseline_result.total_env_steps,
         "probe_total_env_steps": probe_total_env_steps,
+        "probe_shadow_total_env_steps": probe_shadow_total_env_steps,
+        "probe_no_expression_total_env_steps": probe_no_expression_total_env_steps,
+        "full_system_total_env_steps": full_system_total_env_steps,
+        "full_system_state_only_total_env_steps": full_system_state_only_total_env_steps,
+        "full_system_oracle_total_env_steps": full_system_oracle_total_env_steps,
+        "sim_fanout_total_env_steps": sim_fanout_total_env_steps,
+        "baseline_control_env_steps": baseline_result.control_env_steps_total,
+        "probe_probe_env_steps": probe_result.probe_env_steps_total + encoder_probe_steps,
+        "probe_control_env_steps": probe_result.control_env_steps_total,
+        "probe_shadow_probe_env_steps": 0
+        if probe_shadow_result is None
+        else probe_shadow_result.probe_env_steps_total + encoder_probe_steps,
+        "probe_shadow_control_env_steps": 0
+        if probe_shadow_result is None
+        else probe_shadow_result.control_env_steps_total,
+        "probe_no_expression_probe_env_steps": (
+            -1
+            if probe_no_expression_result is None
+            else probe_no_expression_result.probe_env_steps_total + encoder_probe_steps
+        ),
+        "probe_no_expression_control_env_steps": (
+            -1
+            if probe_no_expression_result is None
+            else probe_no_expression_result.control_env_steps_total
+        ),
+        "full_system_probe_env_steps": 0
+        if full_system_result is None
+        else full_system_result.probe_env_steps_total + encoder_probe_steps,
+        "full_system_control_env_steps": 0
+        if full_system_result is None
+        else full_system_result.control_env_steps_total,
+        "full_system_oracle_probe_env_steps": 0
+        if full_system_oracle_result is None
+        else full_system_oracle_result.probe_env_steps_total + encoder_probe_steps,
+        "full_system_oracle_control_env_steps": 0
+        if full_system_oracle_result is None
+        else full_system_oracle_result.control_env_steps_total,
+        "sim_fanout_probe_env_steps": 0
+        if sim_fanout_result is None
+        else sim_fanout_result.probe_env_steps_total + encoder_probe_steps,
+        "sim_fanout_control_env_steps": 0
+        if sim_fanout_result is None
+        else sim_fanout_result.control_env_steps_total,
+        "probe_post_expression_env_steps": probe_result.post_expression_env_steps_total,
+        "probe_post_expression_episodes": probe_result.post_expression_episode_count,
+        "probe_shadow_post_expression_env_steps": (
+            -1
+            if probe_shadow_result is None or probe_shadow_result.post_expression_env_steps_total is None
+            else int(probe_shadow_result.post_expression_env_steps_total)
+        ),
+        "probe_shadow_post_expression_episodes": (
+            -1
+            if probe_shadow_result is None or probe_shadow_result.post_expression_episode_count is None
+            else int(probe_shadow_result.post_expression_episode_count)
+        ),
+        "probe_no_expression_post_expression_env_steps": (
+            -1
+            if probe_no_expression_result is None
+            or probe_no_expression_result.post_expression_env_steps_total is None
+            else int(probe_no_expression_result.post_expression_env_steps_total)
+        ),
+        "probe_no_expression_post_expression_episodes": (
+            -1
+            if probe_no_expression_result is None
+            or probe_no_expression_result.post_expression_episode_count is None
+            else int(probe_no_expression_result.post_expression_episode_count)
+        ),
+        "full_system_post_context_env_steps": (
+            -1
+            if full_system_result is None or full_system_result.post_expression_env_steps_total is None
+            else int(full_system_result.post_expression_env_steps_total)
+        ),
+        "full_system_post_context_episodes": (
+            -1
+            if full_system_result is None or full_system_result.post_expression_episode_count is None
+            else int(full_system_result.post_expression_episode_count)
+        ),
+        "full_system_oracle_post_context_env_steps": (
+            -1
+            if full_system_oracle_result is None or full_system_oracle_result.post_expression_env_steps_total is None
+            else int(full_system_oracle_result.post_expression_env_steps_total)
+        ),
+        "full_system_oracle_post_context_episodes": (
+            -1
+            if full_system_oracle_result is None or full_system_oracle_result.post_expression_episode_count is None
+            else int(full_system_oracle_result.post_expression_episode_count)
+        ),
+        "sim_fanout_post_context_env_steps": (
+            -1
+            if sim_fanout_result is None or sim_fanout_result.post_expression_env_steps_total is None
+            else int(sim_fanout_result.post_expression_env_steps_total)
+        ),
+        "sim_fanout_post_context_episodes": (
+            -1
+            if sim_fanout_result is None or sim_fanout_result.post_expression_episode_count is None
+            else int(sim_fanout_result.post_expression_episode_count)
+        ),
         "baseline_completed_episodes": len(baseline_returns),
         "probe_completed_episodes": len(probe_returns),
+        "probe_shadow_completed_episodes": len(probe_shadow_returns),
+        "probe_no_expression_completed_episodes": len(probe_no_expression_returns),
+        "full_system_completed_episodes": len(full_system_returns),
+        "full_system_state_only_completed_episodes": (
+            0
+            if full_system_result is None or full_system_result.state_only_completed_episodes is None
+            else int(full_system_result.state_only_completed_episodes)
+        ),
+        "full_system_oracle_completed_episodes": len(full_system_oracle_returns),
+        "sim_fanout_completed_episodes": len(sim_fanout_returns),
+        "full_system_controller_style": (
+            None if full_system_result is None else full_system_result.controller_style
+        ),
+        "full_system_oracle_controller_style": (
+            None if full_system_oracle_result is None else full_system_oracle_result.controller_style
+        ),
+        "sim_fanout_controller_style": (
+            None if sim_fanout_result is None else sim_fanout_result.controller_style
+        ),
         "probe_encoder_steps": encoder_probe_steps,
+        "probe_windows_total": probe_result.probe_windows_total,
+        "probe_stop_reasons": probe_result.probe_stop_reasons,
+        "probe_final_stop_reason": (
+            probe_result.solve_probe_stop_reason
+            if probe_result.solve_probe_stop_reason is not None
+            else probe_result.last_probe_stop_reason
+        ),
+        "probe_family_expected_gain": probe_result.probe_family_expected_gain,
+        "probe_family_realized_gain": probe_result.probe_family_realized_gain,
+        "probe_family_future_error": probe_result.probe_family_future_error,
+        "probe_family_selection_count": probe_result.probe_family_selection_count,
+        "probe_env_expression_delta": probe_result.env_expression_ablation_delta,
+        "probe_forced_env_expression_delta": probe_result.forced_env_expression_ablation_delta,
+        "probe_forced_env_expression_scale": probe_result.forced_env_expression_scale,
+        "probe_strict_usage_status": probe_usage_status,
+        "probe_expression_scale_median": probe_result.expression_scale_median,
+        "probe_expression_scale_active_fraction": probe_result.expression_scale_active_fraction,
+        "probe_fair_ready_handoff_fraction": probe_result.fair_ready_handoff_fraction,
+        "probe_fair_expression_enabled_fraction": probe_result.fair_expression_enabled_fraction,
+        "probe_fair_expression_force_muted_fraction": probe_result.fair_expression_force_muted_fraction,
+        "probe_fair_ready_confidence_median": probe_result.fair_ready_confidence_median,
+        "probe_fair_muted_confidence_median": probe_result.fair_muted_confidence_median,
+        "probe_expression_ready_but_muted_fraction": probe_result.expression_ready_but_muted_fraction,
+        "probe_shadow_expression_enabled_fraction": (
+            None if probe_shadow_result is None else probe_shadow_result.shadow_expression_enabled_fraction
+        ),
+        "probe_shadow_expression_scale_median": (
+            None if probe_shadow_result is None else probe_shadow_result.shadow_expression_scale_median
+        ),
+        "probe_shadow_confidence_median": (
+            None if probe_shadow_result is None else probe_shadow_result.shadow_confidence_median
+        ),
+        "probe_shadow_strict_miss_fraction": (
+            None if probe_shadow_result is None else probe_shadow_result.shadow_strict_miss_fraction
+        ),
+        "probe_readiness_reason_counts": probe_result.readiness_reason_counts,
+        "probe_readiness_component_means": probe_result.readiness_component_means,
+        "probe_fair_stop_blocker_counts": probe_result.fair_stop_blocker_counts,
+        "probe_shadow_blocker_counts": (
+            None if probe_shadow_result is None else probe_shadow_result.shadow_blocker_counts
+        ),
+        "probe_second_probe_selection_count": probe_result.second_probe_family_selection_count,
+        "probe_second_probe_raw_future_gain_mean": probe_result.second_probe_raw_future_gain_mean,
+        "probe_second_probe_future_estimate_mean": probe_result.second_probe_future_estimate_mean,
+        "probe_second_probe_choice_future_gain_mean": probe_result.second_probe_choice_future_gain_mean,
+        "probe_family_coverage_satisfied_fraction": probe_result.family_coverage_satisfied_fraction,
+        "probe_second_probe_value_driven_fraction": probe_result.second_probe_value_driven_fraction,
+        "probe_uniformity_pressure_active_fraction": probe_result.uniformity_pressure_active_fraction,
+        "probe_fair_handoff_probe_families": probe_result.fair_handoff_probe_families,
+        "probe_readiness_component_timeline": probe_result.readiness_component_timeline,
+        "probe_online_future_quality_trace": probe_result.online_future_quality_trace,
+        "probe_online_subset_stability_trace": probe_result.online_subset_stability_trace,
+        "probe_online_offline_gap_trace": probe_result.online_offline_gap_trace,
+        "probe_online_subset_stability_mean": (
+            0.0
+            if not probe_result.online_subset_stability_trace
+            else float(np.mean(np.asarray(probe_result.online_subset_stability_trace, dtype=np.float32)))
+        ),
+        "probe_online_offline_gap_mean": probe_result.online_offline_gap_mean,
+        "probe_online_geometry_complete_fraction": probe_result.online_geometry_complete_fraction,
+        "probe_online_split_latent_disagreement_mean": probe_result.online_split_latent_disagreement_mean,
+        "probe_online_split_retrieval_margin_deficit_mean": probe_result.online_split_retrieval_margin_deficit_mean,
+        "probe_online_leaveout_shift_mean": probe_result.online_leaveout_shift_mean,
+        "probe_message_input_delta_mean": probe_result.message_input_delta_mean,
+        "probe_message_input_delta_max": probe_result.message_input_delta_max,
+        "probe_muted_message_input_delta_mean": probe_result.muted_message_input_delta_mean,
+        "probe_muted_message_input_delta_max": probe_result.muted_message_input_delta_max,
+        "probe_actor_message_norm_mean": probe_result.actor_message_norm_mean,
+        "probe_actor_message_nonzero_fraction": probe_result.actor_message_nonzero_fraction,
+        "probe_muted_actor_message_nonzero_fraction": probe_result.muted_actor_message_nonzero_fraction,
+        "probe_matched_mute_parity_fraction": probe_result.matched_mute_parity_fraction,
+        "probe_message_off_fraction": probe_result.message_off_fraction,
+        "probe_message_diag_fraction": probe_result.message_diag_fraction,
+        "probe_message_on_fraction": probe_result.message_on_fraction,
+        "probe_message_ablation_config_diff": probe_result.message_ablation_config_diff,
+        "probe_teacher_action_agreement": probe_result.teacher_action_agreement,
+        "latent_mechanics_fit": float(latent_mechanics_fit),
+        "latent_split_mrr": float(latent_split_stats["mrr"]),
+        "latent_split_top1": float(latent_split_stats["top1"]),
+        "latent_neighbor_alignment": float(latent_neighbor_alignment),
+        "latent_gap_ratio": float(latent_gap_ratio["mean"]),
+        "latent_heldout_probe_error": float(latent_heldout_probe_error),
+        "latent_probe_leakage": float(latent_probe_leakage),
+        "latent_uncert_error_corr": float(latent_uncertainty_alignment["correlation"]),
+        "latent_support_diagnostics": latent_support_diagnostics,
+        "belief_progress_index": float(latent_belief_progress_index),
+        "probe_run_classification": probe_run_classification,
+        "full_system_learned_eval_summary": full_system_learned_eval_summary,
+        "full_system_state_only_eval_summary": full_system_state_only_eval_summary,
+        "full_system_zero_context_eval_summary": full_system_zero_context_eval_summary,
+        "full_system_shuffled_context_eval_summary": full_system_shuffled_context_eval_summary,
+        "full_system_stale_context_eval_summary": full_system_stale_context_eval_summary,
+        "full_system_online_refinement_eval_summary": full_system_online_refinement_eval_summary,
+        "full_system_frozen_context_eval_summary": full_system_frozen_context_eval_summary,
+        "full_system_actor_only_eval_summary": full_system_actor_only_eval_summary,
+        "full_system_state_only_eval_returns": (
+            None
+            if full_system_result is None or full_system_result.state_only_eval_returns is None
+            else [float(value) for value in full_system_result.state_only_eval_returns]
+        ),
+        "full_system_state_only_ablation_delta": (
+            None if full_system_result is None else full_system_result.state_only_ablation_delta
+        ),
+        "full_system_zero_context_ablation_delta": (
+            None if full_system_result is None else full_system_result.zero_context_ablation_delta
+        ),
+        "full_system_shuffled_context_ablation_delta": (
+            None if full_system_result is None else full_system_result.shuffled_context_ablation_delta
+        ),
+        "full_system_stale_context_ablation_delta": (
+            None if full_system_result is None else full_system_result.stale_context_ablation_delta
+        ),
+        "full_system_online_refinement_ablation_delta": (
+            None if full_system_result is None else full_system_result.online_refinement_ablation_delta
+        ),
+        "full_system_frozen_context_ablation_delta": (
+            None if full_system_result is None else full_system_result.frozen_context_ablation_delta
+        ),
+        "full_system_actor_only_ablation_delta": (
+            None if full_system_result is None else full_system_result.actor_only_ablation_delta
+        ),
+        "full_system_oracle_zero_context_ablation_delta": (
+            None
+            if full_system_oracle_result is None
+            else full_system_oracle_result.zero_context_ablation_delta
+        ),
+        "full_system_oracle_shuffled_context_ablation_delta": (
+            None
+            if full_system_oracle_result is None
+            else full_system_oracle_result.shuffled_context_ablation_delta
+        ),
+        "full_system_oracle_stale_context_ablation_delta": (
+            None
+            if full_system_oracle_result is None
+            else full_system_oracle_result.stale_context_ablation_delta
+        ),
+        "full_system_oracle_online_refinement_ablation_delta": (
+            None
+            if full_system_oracle_result is None
+            else full_system_oracle_result.online_refinement_ablation_delta
+        ),
+        "full_system_oracle_frozen_context_ablation_delta": (
+            None
+            if full_system_oracle_result is None
+            else full_system_oracle_result.frozen_context_ablation_delta
+        ),
+        "full_system_oracle_actor_only_ablation_delta": (
+            None
+            if full_system_oracle_result is None
+            else full_system_oracle_result.actor_only_ablation_delta
+        ),
+        "full_system_oracle_learned_eval_summary": full_system_oracle_learned_eval_summary,
+        "full_system_oracle_zero_context_eval_summary": full_system_oracle_zero_context_eval_summary,
+        "full_system_oracle_shuffled_context_eval_summary": full_system_oracle_shuffled_context_eval_summary,
+        "full_system_oracle_stale_context_eval_summary": full_system_oracle_stale_context_eval_summary,
+        "full_system_oracle_online_refinement_eval_summary": full_system_oracle_online_refinement_eval_summary,
+        "full_system_oracle_frozen_context_eval_summary": full_system_oracle_frozen_context_eval_summary,
+        "full_system_oracle_actor_only_eval_summary": full_system_oracle_actor_only_eval_summary,
     }
 
 
 def run_training_pipeline(
     env_name: str = BIPEDAL_WALKER_NAME,
     seeds: list[int] | None = None,
+    config_override: dict | None = None,
 ):
     """Benchmark the current setup across a small fixed seed set."""
     config = build_experiment_config(env_name)
+    if config_override:
+        config = replace(config, **config_override)
+    benchmark_profile = resolve_benchmark_profile(config)
     if seeds is None:
-        seeds = [0, 1, 2, 3, 4]
+        seeds = default_seeds_for_profile(benchmark_profile)
     artifact_dir = Path("artifacts")
     save_dashboard_context(
         env_name=config.env_name,
         benchmark_tag=config.benchmark_tag,
         seeds=seeds,
         artifact_dir=artifact_dir,
+        benchmark_profile=benchmark_profile,
+    )
+    live_trace = LiveTrainingTraceWriter(
+        artifact_dir=artifact_dir,
+        enabled=(config.env_name == CONTINUOUS_CARTPOLE_NAME),
+    )
+    live_trace.reset_session(
+        env_name=config.env_name,
+        benchmark_tag=config.benchmark_tag,
+        seeds=seeds,
+        total_runs=len(seeds),
     )
     results = []
 
@@ -766,63 +1377,15 @@ def run_training_pipeline(
                 config=config,
                 run_index=run_index,
                 total_runs=total_runs,
+                live_trace=live_trace,
             )
         )
-
-    baseline_episode_solves = [item["baseline_solve_episode"] for item in results]
-    probe_episode_solves = [item["probe_solve_episode"] for item in results]
-    baseline_step_solves = [item["baseline_solve_env_steps"] for item in results]
-    probe_step_solves = [item["probe_solve_env_steps"] for item in results]
-    baseline_total_env_steps = [item["baseline_total_env_steps"] for item in results]
-    probe_total_env_steps = [item["probe_total_env_steps"] for item in results]
-    baseline_completed_episodes = [item["baseline_completed_episodes"] for item in results]
-    probe_completed_episodes = [item["probe_completed_episodes"] for item in results]
-    probe_encoder_steps = [item["probe_encoder_steps"] for item in results]
-
-    print("\n=== Benchmark Summary ===")
-    for item in results:
-        print(
-            f"seed={item['seed']} | "
-            f"baseline_ep={item['baseline_solve_episode']} | "
-            f"baseline_steps={item['baseline_solve_env_steps']} | "
-            f"probe_ep={item['probe_solve_episode']} | "
-            f"probe_steps={item['probe_solve_env_steps']} | "
-            f"probe_encoder_steps={item['probe_encoder_steps']}"
-        )
-
-    print_solve_summary(
-        "Baseline PPO solve episode",
-        baseline_episode_solves,
-        baseline_completed_episodes,
-    )
-    print_solve_summary(
-        "Probe-conditioned PPO solve episode",
-        probe_episode_solves,
-        probe_completed_episodes,
-    )
-    print_solve_summary(
-        "Baseline PPO solve env steps",
-        baseline_step_solves,
-        baseline_total_env_steps,
-    )
-    print_solve_summary(
-        "Probe-conditioned PPO solve env steps",
-        probe_step_solves,
-        probe_total_env_steps,
-    )
-    save_benchmark_results(
-        config.env_name,
-        config.benchmark_tag,
-        seeds,
-        [value if value is not None else -1 for value in baseline_episode_solves],
-        [value if value is not None else -1 for value in probe_episode_solves],
-        [value if value is not None else -1 for value in baseline_step_solves],
-        [value if value is not None else -1 for value in probe_step_solves],
-        baseline_total_env_steps,
-        probe_total_env_steps,
-        baseline_completed_episodes,
-        probe_completed_episodes,
-        probe_encoder_steps,
+    return finalize_benchmark_run(
+        config=config,
+        benchmark_profile=benchmark_profile,
+        seeds=seeds,
+        results=results,
+        live_trace=live_trace,
     )
 
 

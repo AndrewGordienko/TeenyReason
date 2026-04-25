@@ -4,8 +4,6 @@ These helpers save env-level belief artifacts for the dashboard while keeping
 the raw window coverage around for probe-distribution diagnostics.
 """
 
-from pathlib import Path
-
 import numpy as np
 import torch
 
@@ -16,71 +14,26 @@ from ..crawler.predictive import (
 )
 from ..models.belief_world_model import (
     ContrastiveProjector,
-    WorldEncoder,
     build_future_summary_targets,
     encode_probe_modes,
 )
 from ..models.env_belief import (
-    build_diverse_support_mask,
     EnvBeliefAggregator,
     EnvParamPredictorEnsemble,
     build_leave_one_group_out_masks,
+    build_support_budget_mask,
     build_env_group_tensors,
     build_uncertainty_feature_tensor,
     compute_disjoint_support_splits,
 )
-from ..probe.probe_data import get_env_param_names
-
-
-def encode_window_dataset(
-    encoder: WorldEncoder,
-    device: torch.device,
-    windows: dict[str, np.ndarray],
-    batch_size: int = 512,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Encode every saved probe window into posterior mean and log-variance."""
-    encoder.eval()
-    states = windows["states"].astype(np.float32)
-    actions = windows["actions"].astype(np.int64)
-    rewards = windows["rewards"].astype(np.float32)
-
-    means = []
-    logvars = []
-    with torch.no_grad():
-        for start in range(0, states.shape[0], batch_size):
-            stop = start + batch_size
-            state_t = torch.tensor(states[start:stop], dtype=torch.float32, device=device)
-            action_t = torch.tensor(actions[start:stop], dtype=torch.long, device=device)
-            reward_t = torch.tensor(rewards[start:stop], dtype=torch.float32, device=device)
-            mean_t, logvar_t = encoder.encode_posterior(state_t, action_t, rewards=reward_t)
-            means.append(mean_t.cpu().numpy().astype(np.float32))
-            logvars.append(logvar_t.cpu().numpy().astype(np.float32))
-
-    return (
-        np.concatenate(means, axis=0).astype(np.float32),
-        np.concatenate(logvars, axis=0).astype(np.float32),
-    )
-
-
-def project_latents_2d(latent_means: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Project latents to 2D with a tiny PCA implementation."""
-    centered = latent_means.astype(np.float32) - latent_means.mean(axis=0, keepdims=True).astype(np.float32)
-    centered = np.nan_to_num(centered, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-    try:
-        _u, singular_values, vt = np.linalg.svd(centered, full_matrices=False)
-        components = vt[:2].astype(np.float32)
-        projection = centered @ components.T
-        explained = np.square(singular_values[:2]) / max(np.square(singular_values).sum(), 1e-6)
-    except np.linalg.LinAlgError:
-        components = np.zeros((2, centered.shape[1]), dtype=np.float32)
-        if centered.shape[1] >= 1:
-            components[0, 0] = 1.0
-        if centered.shape[1] >= 2:
-            components[1, 1] = 1.0
-        projection = centered[:, :2] if centered.shape[1] >= 2 else np.pad(centered, ((0, 0), (0, max(0, 2 - centered.shape[1]))))
-        projection = projection.astype(np.float32)
-        explained = np.zeros((2,), dtype=np.float32)
-    return projection.astype(np.float32), components, explained.astype(np.float32)
+from .metrics import project_latents_2d
+from .snapshot import (
+    build_latent_snapshot,
+    compute_message_rate_distortion,
+    list_latent_snapshot_paths,
+    load_latent_snapshot,
+    save_latent_snapshot,
+)
 
 
 def build_env_belief_dataset(
@@ -92,11 +45,13 @@ def build_env_belief_dataset(
     window_mean: np.ndarray,
     window_logvar: np.ndarray,
     windows: dict[str, np.ndarray],
+    env_name: str | None = None,
     support_size: int = 6,
     subset_count: int = 8,
 ) -> dict[str, np.ndarray]:
     """Aggregate window posteriors into one env-level belief per sampled world."""
     probe_mode_idx = encode_probe_modes(np.asarray(windows["probe_mode"], dtype="U"))
+    probe_mode_names = np.unique(np.asarray(windows["probe_mode"], dtype="U"))
     grouped = build_env_group_tensors(
         window_mean=window_mean,
         window_logvar=window_logvar,
@@ -104,13 +59,16 @@ def build_env_belief_dataset(
         env_params=windows["env_params"],
         view_group_id=probe_mode_idx,
     )
+    split_idx = max(2, int(windows["actions"].shape[1]) // 2)
     future_summary = build_future_summary_targets(
-        states=windows["states"].astype(np.float32),
-        actions=windows["actions"].astype(np.int64),
-        rewards=windows["rewards"].astype(np.float32),
+        states=windows["states"][:, split_idx:, :].astype(np.float32),
+        actions=windows["actions"][:, split_idx:].astype(np.int64),
+        rewards=windows["rewards"][:, split_idx:].astype(np.float32),
         terminated=windows["terminated"].astype(np.bool_),
         truncated=windows["truncated"].astype(np.bool_),
         action_vocab_size=int(np.max(windows["actions"])) + 1,
+        probe_mode=np.asarray(windows["probe_mode"], dtype="U"),
+        env_name=env_name,
     )
     grouped_future_summary = group_window_targets_numpy(
         future_summary,
@@ -125,9 +83,10 @@ def build_env_belief_dataset(
         mask_t = torch.tensor(grouped["mask"], dtype=torch.float32, device=device)
         group_ids_t = torch.tensor(grouped["view_group_id"], dtype=torch.long, device=device)
         support_size = min(max(1, support_size), mean_t.shape[1])
-        support_mask_t = build_diverse_support_mask(
+        support_mask_t = build_support_budget_mask(
             mask=mask_t,
             support_size=support_size,
+            subset_count=max(1, int(subset_count)),
             group_ids=group_ids_t,
         )
         support_group_count_t = torch.zeros((mean_t.shape[0],), dtype=torch.float32, device=device)
@@ -146,6 +105,7 @@ def build_env_belief_dataset(
             mean_t,
             logvar_t,
             support_mask_t,
+            group_ids_t,
         )
         env_mean_t = env_stats_t["env_mean_raw"]
         env_mean_unit_t = env_stats_t["env_mean"]
@@ -158,6 +118,9 @@ def build_env_belief_dataset(
             env_metric_mean_unit_t = env_mean_unit_t
         env_logvar_t = env_stats_t["env_logvar"]
         env_view_spread_t = env_stats_t["view_spread"]
+        env_mechanics_posterior_mean_t = env_stats_t["mechanics_posterior_mean"]
+        env_mechanics_posterior_std_t = env_stats_t["mechanics_posterior_std"]
+        env_mechanics_posterior_entropy_t = env_stats_t["mechanics_posterior_entropy"]
         env_param_preds_t = env_param_predictor.predict_all(env_mean_t)
         env_param_mean_t = env_param_preds_t.mean(dim=0)
         env_param_std_t = env_param_preds_t.std(dim=0, unbiased=False)
@@ -167,6 +130,7 @@ def build_env_belief_dataset(
             grouped_mean=mean_t,
             grouped_logvar=logvar_t,
             support_mask=support_mask_t,
+            group_ids=group_ids_t,
             env_param_predictor=env_param_predictor,
         )
         if env_metric_projector is not None:
@@ -194,6 +158,10 @@ def build_env_belief_dataset(
                 repeated_mean.reshape(batch_size * leave_count, max_views, latent_dim),
                 repeated_logvar.reshape(batch_size * leave_count, max_views, latent_dim),
                 leave_masks_t.reshape(batch_size * leave_count, max_views),
+                group_ids_t[:, None, :].expand(-1, leave_count, -1).reshape(
+                    batch_size * leave_count,
+                    max_views,
+                ),
             )
             leave_mean_t = leave_stats_t["env_mean_raw"].reshape(batch_size, leave_count, latent_dim)
             leave_param_mean_t = env_param_predictor.predict_all(
@@ -254,6 +222,24 @@ def build_env_belief_dataset(
     env_metric_mean_unit = np.nan_to_num(env_metric_mean_unit_t.cpu().numpy().astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     env_logvar = np.nan_to_num(env_logvar_t.cpu().numpy().astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     env_view_spread = np.nan_to_num(env_view_spread_t.cpu().numpy().astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    env_mechanics_posterior_mean = np.nan_to_num(
+        env_mechanics_posterior_mean_t.cpu().numpy().astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    env_mechanics_posterior_std = np.nan_to_num(
+        env_mechanics_posterior_std_t.cpu().numpy().astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    env_mechanics_posterior_entropy = np.nan_to_num(
+        env_mechanics_posterior_entropy_t.cpu().numpy().astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
     env_param_prediction = np.nan_to_num(
         env_param_mean_t.cpu().numpy().astype(np.float32),
         nan=0.0,
@@ -322,10 +308,46 @@ def build_env_belief_dataset(
         posinf=0.0,
         neginf=0.0,
     )
+    env_dominant_probe_mode_idx = np.zeros((env_mean.shape[0],), dtype=np.int32)
+    for env_idx in range(env_mean.shape[0]):
+        support_idx = np.flatnonzero(support_mask_t[env_idx].cpu().numpy() > 0)
+        if support_idx.size == 0:
+            continue
+        support_groups = grouped["view_group_id"][env_idx, support_idx]
+        support_groups = support_groups[support_groups >= 0]
+        if support_groups.size == 0:
+            continue
+        unique_groups, group_counts = np.unique(support_groups.astype(np.int32), return_counts=True)
+        env_dominant_probe_mode_idx[env_idx] = int(unique_groups[int(np.argmax(group_counts))])
+    env_dominant_probe_mode = probe_mode_names[np.clip(env_dominant_probe_mode_idx, 0, max(len(probe_mode_names) - 1, 0))]
     env_subset_shift = np.nan_to_num(np.linalg.norm(
         env_metric_subset_mean - env_metric_mean[:, None, :],
         axis=-1,
     ).mean(axis=1).astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    env_split_group_overlap = np.nan_to_num(
+        split_payload["split_group_overlap"].cpu().numpy().astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    env_split_balanced_half = np.nan_to_num(
+        split_payload["split_balanced_half"].cpu().numpy().astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    env_split_group_count_a = np.nan_to_num(
+        split_payload["split_group_count_a"].cpu().numpy().astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    env_split_group_count_b = np.nan_to_num(
+        split_payload["split_group_count_b"].cpu().numpy().astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
     env_between_distance = np.linalg.norm(
         env_metric_mean[:, None, :] - env_metric_mean[None, :, :],
         axis=-1,
@@ -415,6 +437,16 @@ def build_env_belief_dataset(
     env_coverage_penalty = np.clip(1.0 - env_support_group_ratio, 0.0, 1.0).astype(np.float32)
     with torch.no_grad():
         uncertainty_features_t = build_uncertainty_feature_tensor(
+            mechanics_posterior_std_mean=torch.tensor(
+                env_mechanics_posterior_std.mean(axis=1),
+                dtype=torch.float32,
+                device=device,
+            ),
+            mechanics_posterior_entropy=torch.tensor(
+                env_mechanics_posterior_entropy,
+                dtype=torch.float32,
+                device=device,
+            ),
             env_param_std_mean=torch.tensor(env_param_std.mean(axis=1), dtype=torch.float32, device=device),
             split_param_disagreement=torch.tensor(env_split_param_disagreement, dtype=torch.float32, device=device),
             split_latent_disagreement=torch.tensor(env_split_latent_disagreement, dtype=torch.float32, device=device),
@@ -439,6 +471,7 @@ def build_env_belief_dataset(
         "env_support_count": support_mask_t.sum(dim=1).cpu().numpy().astype(np.int32),
         "env_support_group_count": env_support_group_count.astype(np.float32),
         "env_support_group_ratio": env_support_group_ratio.astype(np.float32),
+        "env_dominant_probe_mode": env_dominant_probe_mode.astype("U"),
         "env_subset_size_used": np.full((env_mean.shape[0],), subset_size, dtype=np.int32),
         "env_params": grouped["env_params"].astype(np.float32),
         "env_belief_mean": env_mean.astype(np.float32),
@@ -449,6 +482,9 @@ def build_env_belief_dataset(
         "env_metric_norm": np.linalg.norm(env_metric_mean, axis=1).astype(np.float32),
         "env_belief_logvar": env_logvar.astype(np.float32),
         "env_view_spread": env_view_spread.astype(np.float32),
+        "env_mechanics_posterior_mean": env_mechanics_posterior_mean.astype(np.float32),
+        "env_mechanics_posterior_std": env_mechanics_posterior_std.astype(np.float32),
+        "env_mechanics_posterior_entropy": env_mechanics_posterior_entropy.astype(np.float32),
         "env_subset_mean": env_subset_mean.astype(np.float32),
         "env_subset_mean_unit": split_payload["env_mean_unit"].cpu().numpy().astype(np.float32),
         "env_metric_subset_mean": env_metric_subset_mean.astype(np.float32),
@@ -456,6 +492,10 @@ def build_env_belief_dataset(
         "env_subset_latent_std": env_subset_latent_std.astype(np.float32),
         "env_subset_param_std": env_subset_param_std.astype(np.float32),
         "env_subset_shift": env_subset_shift.astype(np.float32),
+        "env_split_group_overlap": env_split_group_overlap.astype(np.float32),
+        "env_split_balanced_half": env_split_balanced_half.astype(np.float32),
+        "env_split_group_count_a": env_split_group_count_a.astype(np.float32),
+        "env_split_group_count_b": env_split_group_count_b.astype(np.float32),
         "env_nearest_between_distance": env_nearest_between_distance.astype(np.float32),
         "env_nearest_between_distance_unit": env_nearest_between_distance_unit.astype(np.float32),
         "env_gap_ratio": env_gap_ratio.astype(np.float32),
@@ -494,74 +534,3 @@ def build_env_belief_dataset(
         "pca_components": pca_components.astype(np.float32),
         "pca_explained": pca_explained.astype(np.float32),
     }
-
-
-def build_latent_snapshot(
-    encoder: WorldEncoder,
-    belief_aggregator: EnvBeliefAggregator,
-    env_param_predictor: EnvParamPredictorEnsemble,
-    env_future_predictor,
-    env_metric_projector: ContrastiveProjector | None,
-    device: torch.device,
-    windows: dict[str, np.ndarray],
-    env_name: str | None = None,
-    benchmark_tag: str | None = None,
-    support_size: int = 6,
-    subset_count: int = 8,
-) -> dict[str, np.ndarray]:
-    """Build one dashboard-friendly env-belief snapshot from recorded probe windows."""
-    window_mean, window_logvar = encode_window_dataset(encoder=encoder, device=device, windows=windows)
-    env_dataset = build_env_belief_dataset(
-        belief_aggregator=belief_aggregator,
-        env_param_predictor=env_param_predictor,
-        env_future_predictor=env_future_predictor,
-        env_metric_projector=env_metric_projector,
-        device=device,
-        window_mean=window_mean,
-        window_logvar=window_logvar,
-        windows=windows,
-        support_size=support_size,
-        subset_count=subset_count,
-    )
-    reward_sum = np.sum(windows["rewards"], axis=1, dtype=np.float32)
-
-    snapshot = {
-        "window_env_instance_id": windows["env_instance_id"].astype(np.int32),
-        "window_episode_id": windows["episode_id"].astype(np.int32),
-        "window_end_step_idx": windows["end_step_idx"].astype(np.int32),
-        "window_probe_mode": windows["probe_mode"].astype("U"),
-        "window_reward_sum": reward_sum.astype(np.float32),
-        "window_terminated": windows["terminated"].astype(np.int8),
-        "window_truncated": windows["truncated"].astype(np.int8),
-        "window_latent_mean": window_mean.astype(np.float32),
-        "window_latent_logvar": window_logvar.astype(np.float32),
-        "env_param_names": np.asarray(
-            get_env_param_names(env_name, env_dataset["env_params"].shape[1]),
-            dtype="U",
-        ),
-        **env_dataset,
-    }
-    if env_name is not None:
-        snapshot["env_name"] = np.asarray(env_name)
-    if benchmark_tag is not None:
-        snapshot["benchmark_tag"] = np.asarray(benchmark_tag)
-    return snapshot
-
-
-def save_latent_snapshot(path: str | Path, snapshot: dict[str, np.ndarray]) -> None:
-    """Persist one latent snapshot artifact to disk."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(path, **snapshot)
-
-
-def load_latent_snapshot(path: str | Path) -> dict[str, np.ndarray]:
-    """Load a saved latent snapshot artifact."""
-    with np.load(Path(path), allow_pickle=False) as data:
-        return {key: data[key] for key in data.files}
-
-
-def list_latent_snapshot_paths(artifact_dir: str | Path) -> list[Path]:
-    """Find all saved latent snapshot artifacts in the artifact directory."""
-    artifact_dir = Path(artifact_dir)
-    return sorted(artifact_dir.glob("*_latent_snapshot.npz"))

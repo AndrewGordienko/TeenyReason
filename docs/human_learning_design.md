@@ -128,6 +128,20 @@ What to add over time:
 - probe scheduling that uses expected belief improvement, not just current
   disagreement
 
+Current translation in the repo:
+
+- family-conditioned future-probe predictors estimate what each probe family is
+  likely to reveal next
+- the env belief now updates sequentially with family-conditioned evidence
+  rather than only averaging a set of window embeddings
+- the crawler scores each family by predicted mechanics gain, predictive gain,
+  split-mismatch reduction, posterior entropy reduction, explicit
+  hypothesis-separation value, and expected value per probe step
+- fair mode stops early only after the belief is sharp enough and the predicted
+  next-family gain is low enough relative to its expected interaction cost
+- benchmark stop-reason summaries should count one final crawler stop decision
+  per run, not every intermediate episode-level stop event
+
 ## 5. Predictive Maps, Not Static Codes
 
 The belief should help answer:
@@ -180,6 +194,8 @@ Implementation rule:
 - leave-one-goal-out degradation matters more than decorative posterior spread
 - probe budgets should be allowed to stop early when uncertainty is already low
   enough for the downstream solver
+- uncertainty should lean more heavily on predictive failure than on pretty
+  geometry numbers when the two disagree
 
 Failure mode to avoid:
 
@@ -216,6 +232,8 @@ Near-term code decisions should follow these rules:
 - prefer surprise-driven follow-up probes over static probe questionnaires
 - prefer calibrated uncertainty over deterministic confidence theater
 - prefer domain-specific factorization when the domain genuinely supports it
+- prefer solver-facing messages that can survive compression over large opaque
+  belief vectors that only work because the controller sees everything
 
 ## 9. What To Ask Before Adding New Code
 
