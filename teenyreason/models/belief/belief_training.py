@@ -347,6 +347,8 @@ def train_encoder_predictor(
             f"ctx-teach = {env_metrics['controller_oracle_distill_loss']:.6f} | "
             f"ctx-trust = {env_metrics['controller_trust_loss']:.6f} | "
             f"env-gauss = {env_metrics['env_gaussian_loss']:.6f} | "
+            f"env-param-support = {env_metrics['env_param_support_loss']:.6f} | "
+            f"env-anchor = {env_metrics['env_param_anchor_loss']:.6f} | "
             f"gap-ratio = {env_metrics['env_gap_ratio_loss']:.6f} | "
             f"split-top1 = {env_metrics['env_split_retrieval_top1']:.3f} | "
             f"probe-leak = {env_metrics['env_probe_leakage']:.3f} | "

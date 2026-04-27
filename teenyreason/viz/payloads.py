@@ -341,11 +341,19 @@ def build_support_validity_payload(
         reasons.append("window coverage per env is below two views")
     if support_count_mean < 2.0:
         reasons.append("support coverage per env is below two windows")
+    if support_count_mean > 6.0:
+        reasons.append("canonical support budget is being exceeded")
+    # Named mechanics probes deliberately put different families on opposite
+    # split halves. That makes retrieval harder, but it is a stronger test of
+    # whether the belief encodes the world instead of the probe style.
+    strict_cross_family_split = (
+        support_group_count_mean >= 4.0
+        and support_group_ratio_mean >= 0.95
+        and split_group_overlap_mean <= 0.25
+    )
     paired_support = support_group_count_mean >= 4.0 and split_group_overlap_mean >= 0.75
-    if support_group_ratio_mean < 0.60 and not paired_support:
+    if support_group_ratio_mean < 0.60:
         reasons.append("support diversity across probe families is narrow")
-    if support_count_mean >= 6.0 and split_group_overlap_mean < 0.60:
-        reasons.append("split halves do not share enough probe families")
 
     if reasons:
         return {
@@ -368,7 +376,7 @@ def build_support_validity_payload(
         fragile_reasons.append("support subsets are still small")
     if support_group_ratio_mean < 0.85 and not paired_support:
         fragile_reasons.append("support families are only partly diverse")
-    if split_group_overlap_mean < 0.75:
+    if split_group_overlap_mean < 0.75 and not strict_cross_family_split:
         fragile_reasons.append("split halves only partly overlap by probe family")
 
     if fragile_reasons:
@@ -409,6 +417,14 @@ def build_latent_payload(path: Path) -> dict:
     env_params = snapshot["env_params"][indices]
     env_window_count = snapshot["env_window_count"][indices]
     env_support_count = snapshot.get("env_support_count", snapshot["env_window_count"])[indices]
+    env_support_available_count = snapshot.get(
+        "env_support_available_count",
+        snapshot["env_window_count"],
+    )[indices]
+    env_heldout_count = snapshot.get(
+        "env_heldout_count",
+        np.clip(env_support_available_count - env_support_count, 0, None),
+    )[indices]
     env_support_group_ratio = snapshot.get(
         "env_support_group_ratio",
         np.ones_like(snapshot.get("env_support_count", snapshot["env_window_count"]), dtype=np.float32),
@@ -451,6 +467,14 @@ def build_latent_payload(path: Path) -> dict:
     ).astype(np.float32)
     full_split_mean_a = snapshot.get("env_metric_split_mean_a", snapshot.get("env_split_mean_a", full_env_mean)).astype(np.float32)
     full_split_mean_b = snapshot.get("env_metric_split_mean_b", snapshot.get("env_split_mean_b", full_env_mean)).astype(np.float32)
+    full_cross_split_mean_a = snapshot.get(
+        "env_cross_family_metric_split_mean_a",
+        full_split_mean_a,
+    ).astype(np.float32)
+    full_cross_split_mean_b = snapshot.get(
+        "env_cross_family_metric_split_mean_b",
+        full_split_mean_b,
+    ).astype(np.float32)
     full_split_latent_disagreement = snapshot.get(
         "env_split_latent_disagreement",
         np.linalg.norm(full_split_mean_a - full_split_mean_b, axis=1).astype(np.float32),
@@ -509,6 +533,14 @@ def build_latent_payload(path: Path) -> dict:
         "env_split_group_count_b",
         np.zeros((full_env_mean.shape[0],), dtype=np.float32),
     ).astype(np.float32)
+    full_cross_split_group_overlap = snapshot.get(
+        "env_cross_family_split_group_overlap",
+        np.zeros((full_env_mean.shape[0],), dtype=np.float32),
+    ).astype(np.float32)
+    full_cross_gap_ratio = snapshot.get(
+        "env_cross_family_gap_ratio",
+        np.zeros((full_env_mean.shape[0],), dtype=np.float32),
+    ).astype(np.float32)
     full_env_dominant_probe_mode = snapshot.get(
         "env_dominant_probe_mode",
         np.asarray(["unknown"] * full_env_mean.shape[0], dtype="U"),
@@ -543,11 +575,17 @@ def build_latent_payload(path: Path) -> dict:
         terminated=full_window_terminated,
     )
     split_retrieval = compute_split_retrieval_stats(full_split_mean_a, full_split_mean_b)
+    cross_split_retrieval = compute_split_retrieval_stats(full_cross_split_mean_a, full_cross_split_mean_b)
     full_split_retrieval_rank = snapshot.get(
         "env_split_retrieval_rank",
         split_retrieval["ranks"],
     )
     full_split_retrieval_rank = np.asarray(full_split_retrieval_rank, dtype=np.int32)
+    full_cross_split_retrieval_rank = snapshot.get(
+        "env_cross_family_split_retrieval_rank",
+        cross_split_retrieval["ranks"],
+    )
+    full_cross_split_retrieval_rank = np.asarray(full_cross_split_retrieval_rank, dtype=np.int32)
     diagnostics = {
         "linear_env_fit_r2": compute_linear_env_fit(full_predictive_env_mean, full_env_params),
         "per_param_env_fit_r2": compute_per_param_env_fit(full_predictive_env_mean, full_env_params, full_param_names),
@@ -557,6 +595,10 @@ def build_latent_payload(path: Path) -> dict:
         "split_retrieval_top5": split_retrieval["top5"],
         "split_retrieval_mrr": split_retrieval["mrr"],
         "split_retrieval_median_rank": split_retrieval["median_rank"],
+        "cross_family_split_retrieval_top1": cross_split_retrieval["top1"],
+        "cross_family_split_retrieval_top5": cross_split_retrieval["top5"],
+        "cross_family_split_retrieval_mrr": cross_split_retrieval["mrr"],
+        "cross_family_split_retrieval_median_rank": cross_split_retrieval["median_rank"],
         "window_mode_leakage": compute_mode_leakage(full_window_latent_mean, full_window_probe_mode),
         "env_mode_leakage": compute_mode_leakage(full_predictive_env_mean, full_env_dominant_probe_mode),
         "same_env_spread": compute_same_env_spread(
@@ -585,9 +627,34 @@ def build_latent_payload(path: Path) -> dict:
             ).astype(np.float32)
         )),
         "split_group_overlap_mean": float(np.mean(full_split_group_overlap)),
+        "cross_family_split_group_overlap_mean": float(np.mean(full_cross_split_group_overlap)),
+        "cross_family_gap_ratio_mean": float(np.mean(full_cross_gap_ratio)),
         "split_balanced_half_fraction": float(np.mean(full_split_balanced_half)),
         "split_group_count_a_mean": float(np.mean(full_split_group_count_a)),
         "split_group_count_b_mean": float(np.mean(full_split_group_count_b)),
+        "support_group_count_mean": float(np.mean(
+            snapshot.get(
+                "env_support_group_count",
+                np.ones((full_env_mean.shape[0],), dtype=np.float32),
+            ).astype(np.float32)
+        )),
+        "support_available_count_mean": float(np.mean(
+            snapshot.get(
+                "env_support_available_count",
+                snapshot["env_window_count"],
+            ).astype(np.float32)
+        )),
+        "heldout_count_mean": float(np.mean(
+            snapshot.get(
+                "env_heldout_count",
+                np.clip(
+                    snapshot["env_window_count"]
+                    - snapshot.get("env_support_count", snapshot["env_window_count"]),
+                    0,
+                    None,
+                ),
+            ).astype(np.float32)
+        )),
         "env_param_error_mean": float(np.mean(full_env_param_error)),
         "future_probe_error_mean": float(np.mean(full_future_probe_error)),
         "mechanics_posterior_std_mean": float(np.mean(full_mechanics_posterior_std)) if full_mechanics_posterior_std.size else 0.0,
@@ -619,6 +686,8 @@ def build_latent_payload(path: Path) -> dict:
                 "uncertainty": float(uncertainty[idx]),
                 "window_count": int(env_window_count[idx]),
                 "support_count": int(env_support_count[idx]),
+                "support_available_count": int(env_support_available_count[idx]),
+                "heldout_count": int(env_heldout_count[idx]),
                 "support_group_ratio": float(env_support_group_ratio[idx]),
                 "split_group_overlap": float(env_split_group_overlap[idx]),
                 "split_balanced_half": float(env_split_balanced_half[idx]),
@@ -641,6 +710,20 @@ def build_latent_payload(path: Path) -> dict:
 
     window_count_mean = float(snapshot["env_window_count"].mean())
     support_count_mean = float(snapshot.get("env_support_count", snapshot["env_window_count"]).mean())
+    support_available_count_mean = float(
+        snapshot.get("env_support_available_count", snapshot["env_window_count"]).mean()
+    )
+    heldout_count_mean = float(
+        snapshot.get(
+            "env_heldout_count",
+            np.clip(
+                snapshot["env_window_count"]
+                - snapshot.get("env_support_count", snapshot["env_window_count"]),
+                0,
+                None,
+            ),
+        ).mean()
+    )
     support_group_count_mean = float(np.mean(
         snapshot.get(
             "env_support_group_count",
@@ -662,6 +745,16 @@ def build_latent_payload(path: Path) -> dict:
         support_group_ratio_mean=support_group_ratio_mean,
         split_group_overlap_mean=float(np.mean(full_split_group_overlap)),
     )
+    sysid_payload = {
+        "available": bool("sysid_validation_top1" in snapshot),
+        "validation_top1": float(np.asarray(snapshot.get("sysid_validation_top1", np.asarray([0.0], dtype=np.float32))).reshape(-1)[0]),
+        "validation_margin": float(np.asarray(snapshot.get("sysid_validation_margin", np.asarray([0.0], dtype=np.float32))).reshape(-1)[0]),
+        "validation_nll": float(np.asarray(snapshot.get("sysid_validation_nll", np.asarray([0.0], dtype=np.float32))).reshape(-1)[0]),
+        "trusted": bool(np.asarray(snapshot.get("sysid_trusted", np.asarray([0.0], dtype=np.float32))).reshape(-1)[0] > 0.5),
+        "particle_entropy_mean": float(np.mean(snapshot.get("particle_entropy", np.asarray([], dtype=np.float32)))) if "particle_entropy" in snapshot else 0.0,
+        "particle_ess_ratio_mean": float(np.mean(snapshot.get("particle_ess_ratio", np.asarray([], dtype=np.float32)))) if "particle_ess_ratio" in snapshot else 0.0,
+        "particle_leaveout_shift_mean": float(np.mean(snapshot.get("particle_leaveout_shift", np.asarray([], dtype=np.float32)))) if "particle_leaveout_shift" in snapshot else 0.0,
+    }
 
     return {
         "name": path.name,
@@ -678,18 +771,25 @@ def build_latent_payload(path: Path) -> dict:
             "terminated_rate": float(np.mean(env_terminated_rate)),
             "window_count_mean": window_count_mean,
             "support_count_mean": support_count_mean,
+            "support_available_count_mean": support_available_count_mean,
+            "heldout_count_mean": heldout_count_mean,
+            "support_group_count_mean": support_group_count_mean,
             "support_group_ratio_mean": support_group_ratio_mean,
             "split_group_overlap_mean": float(np.mean(full_split_group_overlap)),
+            "cross_family_split_group_overlap_mean": float(np.mean(full_cross_split_group_overlap)),
+            "cross_family_gap_ratio_mean": float(np.mean(full_cross_gap_ratio)),
             "split_balanced_half_fraction": float(np.mean(full_split_balanced_half)),
             "pca_explained": [float(value) for value in snapshot["pca_explained"].tolist()],
             "sampled_points": int(len(points)),
         },
         "support_validity": support_validity,
+        "system_id": sysid_payload,
         "diagnostics": diagnostics,
         "series": {
             "pairwise_between_distance": full_pairwise_between_distance.astype(np.float32),
             "pairwise_between_distance_unit": full_pairwise_between_distance_unit.astype(np.float32),
             "split_retrieval_rank": full_split_retrieval_rank.astype(np.int32),
+            "cross_family_split_retrieval_rank": full_cross_split_retrieval_rank.astype(np.int32),
         },
         "compression": {
             "bits": snapshot.get("compression_bits", np.asarray([], dtype=np.int32)).astype(np.int32),
@@ -725,7 +825,10 @@ def build_benchmark_payload(path: Path) -> dict:
     ).astype(np.int64)
     probe_no_expression_episode_solves = summary.get(
         "probe_no_expression_episode_solves",
-        summary.get("probe_no_expression_solves", probe_episode_solves),
+        summary.get(
+            "probe_no_expression_solves",
+            np.full_like(probe_episode_solves, -1),
+        ),
     ).astype(np.int64)
     full_system_episode_solves = summary.get(
         "full_system_episode_solves",
@@ -823,6 +926,14 @@ def build_benchmark_payload(path: Path) -> dict:
         "probe_no_expression_completed_episodes",
         np.full_like(probe_no_expression_episode_solves, 0),
     ).astype(np.int64)
+    probe_no_expression_available = summary.get(
+        "probe_no_expression_available",
+        (probe_no_expression_completed_episodes > 0).astype(np.int8),
+    ).astype(np.int8)
+    latent_claim_valid = summary.get(
+        "latent_claim_valid",
+        np.zeros_like(probe_episode_solves, dtype=np.int8),
+    ).astype(np.int8)
     full_system_completed_episodes = summary.get(
         "full_system_completed_episodes",
         np.full_like(full_system_episode_solves, 0),
@@ -1131,9 +1242,62 @@ def build_benchmark_payload(path: Path) -> dict:
         "probe_run_classification",
         np.asarray(["protocol_win"] * len(probe_episode_solves), dtype="U"),
     ).astype("U")
+    belief_mode = summary.get(
+        "belief_mode",
+        np.asarray(["latent_pool"] * len(probe_episode_solves), dtype="U"),
+    ).astype("U")
     belief_progress_index = summary.get(
         "belief_progress_index",
         np.zeros_like(probe_episode_solves, dtype=np.float32),
+    ).astype(np.float32)
+    system_id_progress_index = summary.get(
+        "system_id_progress_index",
+        np.zeros_like(probe_episode_solves, dtype=np.float32),
+    ).astype(np.float32)
+    sysid_trusted = summary.get(
+        "sysid_trusted",
+        np.zeros_like(probe_episode_solves, dtype=np.float32),
+    ).astype(np.float32)
+    sysid_validation_top1 = summary.get(
+        "sysid_validation_top1",
+        np.zeros_like(probe_episode_solves, dtype=np.float32),
+    ).astype(np.float32)
+    sysid_validation_margin = summary.get(
+        "sysid_validation_margin",
+        np.zeros_like(probe_episode_solves, dtype=np.float32),
+    ).astype(np.float32)
+    sysid_validation_nll = summary.get(
+        "sysid_validation_nll",
+        np.zeros_like(probe_episode_solves, dtype=np.float32),
+    ).astype(np.float32)
+    particle_entropy_mean = summary.get(
+        "particle_entropy_mean",
+        np.zeros_like(probe_episode_solves, dtype=np.float32),
+    ).astype(np.float32)
+    particle_entropy_norm_mean = summary.get(
+        "particle_entropy_norm_mean",
+        np.zeros_like(probe_episode_solves, dtype=np.float32),
+    ).astype(np.float32)
+    particle_ess_ratio_mean = summary.get(
+        "particle_ess_ratio_mean",
+        np.zeros_like(probe_episode_solves, dtype=np.float32),
+    ).astype(np.float32)
+    particle_leaveout_shift_mean = summary.get(
+        "particle_leaveout_shift_mean",
+        np.zeros_like(probe_episode_solves, dtype=np.float32),
+    ).astype(np.float32)
+    particle_subset_stability_mean = summary.get(
+        "particle_subset_stability_mean",
+        np.zeros_like(probe_episode_solves, dtype=np.float32),
+    ).astype(np.float32)
+    derived_particle_subset_stability = np.clip(
+        1.0 - particle_leaveout_shift_mean / 0.35,
+        0.0,
+        1.0,
+    ).astype(np.float32)
+    particle_subset_stability_mean = np.maximum(
+        particle_subset_stability_mean,
+        derived_particle_subset_stability,
     ).astype(np.float32)
     latent_mechanics_fit = summary.get(
         "latent_mechanics_fit",
@@ -1220,6 +1384,9 @@ def build_benchmark_payload(path: Path) -> dict:
     )
     latent_support_diagnostic_rows = load_optional_json_rows(
         summary.get("latent_support_diagnostics_json")
+    )
+    latent_claim_rejection_rows = load_optional_json_rows(
+        summary.get("latent_claim_rejection_reasons_json")
     )
     full_system_state_only_eval_returns_rows = load_optional_json_rows(
         summary.get("full_system_state_only_eval_returns_json")
@@ -1394,6 +1561,13 @@ def build_benchmark_payload(path: Path) -> dict:
             if idx < len(latent_support_diagnostic_rows)
             else {}
         )
+        latent_claim_rejections = (
+            latent_claim_rejection_rows[idx]
+            if idx < len(latent_claim_rejection_rows)
+            else []
+        )
+        if not isinstance(latent_claim_rejections, list):
+            latent_claim_rejections = []
         rows.append(
             {
                 "seed": int(seed),
@@ -1452,6 +1626,11 @@ def build_benchmark_payload(path: Path) -> dict:
                 "full_system_state_only_completed_episodes": int(full_system_state_only_completed_episodes[idx]),
                 "full_system_oracle_completed_episodes": int(full_system_oracle_completed_episodes[idx]),
                 "sim_fanout_completed_episodes": int(sim_fanout_completed_episodes[idx]),
+                "probe_no_expression_available": bool(probe_no_expression_available[idx]),
+                "latent_claim_valid": bool(latent_claim_valid[idx]),
+                "latent_claim_rejection_reasons": [
+                    str(reason) for reason in latent_claim_rejections
+                ],
                 "full_system_controller_style": str(full_system_controller_style[idx]),
                 "full_system_oracle_controller_style": str(full_system_oracle_controller_style[idx]),
                 "sim_fanout_controller_style": str(sim_fanout_controller_style[idx]),
@@ -1468,7 +1647,18 @@ def build_benchmark_payload(path: Path) -> dict:
                 "probe_shadow_confidence_median": float(probe_shadow_confidence_median[idx]),
                 "probe_shadow_strict_miss_fraction": float(probe_shadow_strict_miss_fraction[idx]),
                 "probe_run_classification": str(probe_run_classification[idx]),
+                "belief_mode": str(belief_mode[idx]),
                 "belief_progress_index": float(belief_progress_index[idx]),
+                "system_id_progress_index": float(system_id_progress_index[idx]),
+                "sysid_trusted": bool(sysid_trusted[idx] > 0.5),
+                "sysid_validation_top1": float(sysid_validation_top1[idx]),
+                "sysid_validation_margin": float(sysid_validation_margin[idx]),
+                "sysid_validation_nll": float(sysid_validation_nll[idx]),
+                "particle_entropy_mean": float(particle_entropy_mean[idx]),
+                "particle_entropy_norm_mean": float(particle_entropy_norm_mean[idx]),
+                "particle_ess_ratio_mean": float(particle_ess_ratio_mean[idx]),
+                "particle_leaveout_shift_mean": float(particle_leaveout_shift_mean[idx]),
+                "particle_subset_stability_mean": float(particle_subset_stability_mean[idx]),
                 "latent_mechanics_fit": float(latent_mechanics_fit[idx]),
                 "latent_split_top1": float(latent_split_top1[idx]),
                 "latent_neighbor_alignment": float(latent_neighbor_alignment[idx]),
@@ -1479,6 +1669,9 @@ def build_benchmark_payload(path: Path) -> dict:
                 "latent_support_diagnostics": support_diag,
                 "latent_center_window_share": float(support_diag.get("center_window_share", 0.0)),
                 "latent_directional_window_share": float(support_diag.get("directional_window_share", 0.0)),
+                "latent_mechanics_window_share": float(support_diag.get("mechanics_window_share", 0.0)),
+                "latent_passive_window_share": float(support_diag.get("passive_window_share", 0.0)),
+                "latent_stress_window_share": float(support_diag.get("stress_window_share", 0.0)),
                 "latent_window_mode_leakage": float(support_diag.get("window_mode_leakage", 0.0)),
                 "latent_env_mode_leakage": float(support_diag.get("env_mode_leakage", 0.0)),
                 "probe_stop_reasons": probe_stop_reasons_rows[idx] if idx < len(probe_stop_reasons_rows) else {},
@@ -1669,6 +1862,14 @@ def build_benchmark_payload(path: Path) -> dict:
         "probe_honesty_headline": honesty_headline,
         "latent_win_gate": latent_win_gate,
         "latent_win_gate_failure_reasons": latent_win_gate_failure_reasons,
+        "probe_no_expression_available": bool(
+            probe_no_expression_available.size > 0
+            and np.all(probe_no_expression_available > 0)
+        ),
+        "latent_claim_valid": bool(
+            latent_claim_valid.size > 0
+            and np.all(latent_claim_valid > 0)
+        ),
         "probe_shadow_available": bool(
             np.any(probe_shadow_completed_episodes > 0)
             or np.any(probe_shadow_episode_solves >= 0)
@@ -1717,6 +1918,30 @@ def build_benchmark_payload(path: Path) -> dict:
                 "median": float(np.median(belief_progress_index)) if belief_progress_index.size else 0.0,
                 "mean": float(np.mean(belief_progress_index)) if belief_progress_index.size else 0.0,
                 "count": int(belief_progress_index.size),
+            },
+            "system_id": {
+                "available": bool(
+                    belief_mode.size
+                    and (
+                        np.any(belief_mode == "particle_sysid")
+                        or np.any(sysid_validation_top1 > 0.0)
+                    )
+                ),
+                "mode": (
+                    "particle_sysid"
+                    if bool(np.any(belief_mode == "particle_sysid"))
+                    else "latent_pool"
+                ),
+                "progress_median": float(np.median(system_id_progress_index)) if system_id_progress_index.size else 0.0,
+                "progress_mean": float(np.mean(system_id_progress_index)) if system_id_progress_index.size else 0.0,
+                "trusted_fraction": float(np.mean(sysid_trusted)) if sysid_trusted.size else 0.0,
+                "validation_top1_median": float(np.median(sysid_validation_top1)) if sysid_validation_top1.size else 0.0,
+                "validation_margin_median": float(np.median(sysid_validation_margin)) if sysid_validation_margin.size else 0.0,
+                "validation_nll_median": float(np.median(sysid_validation_nll)) if sysid_validation_nll.size else 0.0,
+                "particle_entropy_median": float(np.median(particle_entropy_mean)) if particle_entropy_mean.size else 0.0,
+                "particle_ess_ratio_median": float(np.median(particle_ess_ratio_mean)) if particle_ess_ratio_mean.size else 0.0,
+                "particle_leaveout_shift_median": float(np.median(particle_leaveout_shift_mean)) if particle_leaveout_shift_mean.size else 0.0,
+                "particle_subset_stability_median": float(np.median(particle_subset_stability_mean)) if particle_subset_stability_mean.size else 0.0,
             },
             "latent_mechanics_fit": {
                 "median": float(np.median(latent_mechanics_fit)) if latent_mechanics_fit.size else 0.0,

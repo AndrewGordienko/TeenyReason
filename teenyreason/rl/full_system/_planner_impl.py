@@ -13,7 +13,7 @@ import torch.optim as optim
 from ...crawler import CrawlerModelBundle
 from ...probe.probe_latent import aggregate_env_belief
 from ._objectives_impl import rollout_supervision_and_alignment
-from ..core.ppo_core import (
+from ..core import (
     BeliefNativeActorCritic,
     action_scale_bias,
     sanitize_numpy,

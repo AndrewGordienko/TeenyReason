@@ -15,9 +15,17 @@ def build_diverse_support_mask(
     group_ids: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Choose a small support set, preferring one view per group before repeats."""
+    """Choose one canonical support set, preferring early unique groups.
+
+    Probe collection orders windows deliberately. For Continuous CartPole the
+    first four named probes are the stable mechanics-identification views, while
+    the later stress probes are best treated as held-out evidence. Keeping this
+    deterministic makes the belief contract inspectable and avoids silently
+    rebuilding the headline belief from different families every epoch.
+    """
     if support_size <= 0:
         raise ValueError("support_size must be positive")
+    del generator
 
     mask_bool = mask.bool()
     support_mask = torch.zeros_like(mask_bool, dtype=torch.float32)
@@ -33,27 +41,14 @@ def build_diverse_support_mask(
         chosen: list[int] = []
         if group_ids is not None:
             valid_groups = group_ids[row_idx, valid_idx]
-            unique_groups = torch.unique(valid_groups[valid_groups >= 0], sorted=False)
-            if unique_groups.numel() > 0:
-                group_order = unique_groups[
-                    torch.randperm(unique_groups.numel(), generator=generator, device=unique_groups.device)
-                ]
-                for group_value in group_order.tolist():
-                    group_candidates = valid_idx[valid_groups == group_value]
-                    if group_candidates.numel() == 0:
-                        continue
-                    selected = group_candidates[
-                        torch.randint(
-                            low=0,
-                            high=group_candidates.numel(),
-                            size=(1,),
-                            generator=generator,
-                            device=group_candidates.device,
-                        )
-                    ]
-                    chosen.append(int(selected.item()))
-                    if len(chosen) >= support_size:
-                        break
+            seen_groups: set[int] = set()
+            for idx, group_value in zip(valid_idx.tolist(), valid_groups.tolist(), strict=False):
+                if int(group_value) < 0 or int(group_value) in seen_groups:
+                    continue
+                seen_groups.add(int(group_value))
+                chosen.append(int(idx))
+                if len(chosen) >= support_size:
+                    break
 
         if len(chosen) < support_size:
             remaining_idx = torch.tensor(
@@ -63,10 +58,7 @@ def build_diverse_support_mask(
             )
             if remaining_idx.numel() > 0:
                 take = min(int(remaining_idx.numel()), support_size - len(chosen))
-                perm = remaining_idx[
-                    torch.randperm(remaining_idx.numel(), generator=generator, device=remaining_idx.device)
-                ]
-                chosen.extend(int(item) for item in perm[:take].tolist())
+                chosen.extend(int(item) for item in remaining_idx[:take].tolist())
 
         if not chosen:
             support_mask[row_idx, valid_idx[0]] = 1.0
@@ -83,31 +75,44 @@ def build_support_budget_mask(
     group_ids: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Spend a support budget across several diverse draws, then union the views."""
+    """Choose the canonical support views used to build the env belief.
+
+    `subset_count` used to mean "draw this many supports and union them". That
+    made the headline belief quietly average most windows in a world, which hid
+    collapse and left little held-out evidence for prediction checks. Keep the
+    argument for API compatibility, but spend the support budget exactly once.
+    Split and leaveout diagnostics still create their own masks downstream.
+    """
     if subset_count <= 0:
         raise ValueError("subset_count must be positive")
 
-    support_mask = build_diverse_support_mask(
+    del subset_count
+    return build_diverse_support_mask(
         mask=mask,
         support_size=support_size,
         group_ids=group_ids,
         generator=generator,
     )
-    if subset_count == 1:
-        return support_mask
 
-    valid_mask = mask.bool()
-    for _ in range(1, int(subset_count)):
-        sampled_mask = build_diverse_support_mask(
-            mask=mask,
-            support_size=support_size,
-            group_ids=group_ids,
-            generator=generator,
-        )
-        support_mask = torch.maximum(support_mask, sampled_mask)
-        if torch.equal(support_mask.bool(), valid_mask):
-            break
-    return support_mask
+
+def build_split_source_mask(
+    mask: torch.Tensor,
+    support_mask: torch.Tensor,
+    min_extra_views: int = 2,
+) -> torch.Tensor:
+    """Choose which views are allowed to form split-retrieval diagnostics.
+
+    The headline env belief should stay on the small canonical support budget,
+    but split retrieval is meant to ask whether two partial evidence sets agree
+    about the world. When held-out probe windows exist, use them for the split
+    halves so the retrieval task is not starved down to two views per side.
+    """
+    mask_f = mask.float()
+    support_f = support_mask.float()
+    available_count = mask_f.sum(dim=1, keepdim=True)
+    support_count = support_f.sum(dim=1, keepdim=True)
+    use_available = available_count >= support_count + float(max(0, int(min_extra_views)))
+    return torch.where(use_available, mask_f, support_f)
 
 
 def build_env_subset_masks(
@@ -220,6 +225,74 @@ def build_env_subset_masks(
     return mask_a.float(), mask_b.float()
 
 
+def build_cross_family_subset_masks(
+    mask: torch.Tensor,
+    group_ids: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split valid views into disjoint probe-family halves when labels exist."""
+    if group_ids is None:
+        return build_env_subset_masks(mask, group_ids=None, generator=generator)
+
+    mask_bool = mask.bool()
+    mask_a = torch.zeros_like(mask_bool)
+    mask_b = torch.zeros_like(mask_bool)
+
+    for row_idx in range(mask_bool.shape[0]):
+        valid_idx = torch.nonzero(mask_bool[row_idx], as_tuple=False).squeeze(-1)
+        if valid_idx.numel() <= 1:
+            if valid_idx.numel() == 1:
+                mask_a[row_idx, valid_idx] = True
+                mask_b[row_idx, valid_idx] = True
+            continue
+
+        row_groups = group_ids[row_idx, valid_idx]
+        valid_groups = torch.unique(row_groups[row_groups >= 0], sorted=False)
+        if valid_groups.numel() <= 1:
+            fallback_a, fallback_b = build_env_subset_masks(
+                mask_bool[row_idx:row_idx + 1].float(),
+                group_ids=group_ids[row_idx:row_idx + 1],
+                generator=generator,
+            )
+            mask_a[row_idx] = fallback_a[0].bool()
+            mask_b[row_idx] = fallback_b[0].bool()
+            continue
+
+        shuffled_groups = valid_groups[
+            torch.randperm(
+                valid_groups.numel(),
+                generator=generator,
+                device=valid_groups.device,
+            )
+        ]
+        split_point = max(1, int(math.ceil(shuffled_groups.numel() / 2.0)))
+        groups_a = shuffled_groups[:split_point]
+        groups_b = shuffled_groups[split_point:]
+        if groups_b.numel() == 0:
+            groups_b = groups_a[-1:].clone()
+            groups_a = groups_a[:-1]
+        if groups_a.numel() == 0:
+            groups_a = groups_b[:1].clone()
+            groups_b = groups_b[1:]
+
+        row_group_ids = group_ids[row_idx]
+        for group_value in groups_a.tolist():
+            mask_a[row_idx] |= mask_bool[row_idx] & (row_group_ids == int(group_value))
+        for group_value in groups_b.tolist():
+            mask_b[row_idx] |= mask_bool[row_idx] & (row_group_ids == int(group_value))
+
+        if not torch.any(mask_a[row_idx]) or not torch.any(mask_b[row_idx]):
+            fallback_a, fallback_b = build_env_subset_masks(
+                mask_bool[row_idx:row_idx + 1].float(),
+                group_ids=group_ids[row_idx:row_idx + 1],
+                generator=generator,
+            )
+            mask_a[row_idx] = fallback_a[0].bool()
+            mask_b[row_idx] = fallback_b[0].bool()
+
+    return mask_a.float(), mask_b.float()
+
+
 def compute_disjoint_support_splits(
     aggregator: EnvBeliefAggregator,
     grouped_mean: torch.Tensor,
@@ -227,12 +300,21 @@ def compute_disjoint_support_splits(
     support_mask: torch.Tensor,
     group_ids: torch.Tensor | None = None,
     env_param_predictor: EnvParamPredictorEnsemble | None = None,
+    split_mode: str = "paired",
 ) -> dict[str, torch.Tensor]:
     """Build two non-overlapping support-set beliefs for each env instance."""
-    split_mask_a, split_mask_b = build_env_subset_masks(
-        support_mask,
-        group_ids=group_ids,
-    )
+    if split_mode == "paired":
+        split_mask_a, split_mask_b = build_env_subset_masks(
+            support_mask,
+            group_ids=group_ids,
+        )
+    elif split_mode == "cross_family":
+        split_mask_a, split_mask_b = build_cross_family_subset_masks(
+            support_mask,
+            group_ids=group_ids,
+        )
+    else:
+        raise ValueError(f"Unsupported split_mode: {split_mode}")
     stats_a = aggregator.aggregate_stats(grouped_mean, grouped_logvar, split_mask_a, group_ids)
     stats_b = aggregator.aggregate_stats(grouped_mean, grouped_logvar, split_mask_b, group_ids)
     env_mean_a = stats_a["env_mean_raw"]

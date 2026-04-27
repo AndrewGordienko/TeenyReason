@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ..core.ppo_core import sanitize_numpy, sanitize_tensor
+from ..core import sanitize_numpy, sanitize_tensor
 
 
 def rollout_supervision_and_alignment(

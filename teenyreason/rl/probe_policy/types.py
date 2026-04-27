@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from ..core.ppo_core import RunningNormalizer
+from ..core import RunningNormalizer
 
 
 @dataclass(frozen=True)

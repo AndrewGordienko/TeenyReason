@@ -9,6 +9,16 @@ import gymnasium as gym
 import numpy as np
 
 
+MECHANICS_SCALAR_PROBE_FAMILIES = (
+    "passive_decay",
+    "impulse_left",
+    "impulse_right",
+    "chirp",
+    "boundary_push",
+    "cart_brake",
+)
+
+
 def _center_action(action_space: gym.spaces.Space) -> np.ndarray | None:
     if not isinstance(action_space, gym.spaces.Box):
         return None
@@ -55,6 +65,12 @@ def _infer_scalar_box_family_labels(
     for rank, idx in enumerate(positive_indices, start=1):
         labels[idx] = f"pos_{rank}"
     return labels
+
+
+def _looks_like_continuous_cartpole(env_name: str | None, action_values: np.ndarray | None) -> bool:
+    """Detect the one-dimensional CartPole action grid that needs named probes."""
+    del action_values
+    return env_name is not None and "cartpole" in str(env_name).lower()
 
 
 def _infer_box_family_labels(
@@ -137,6 +153,7 @@ class GenericProbeExplorer:
     max_windows_per_rollout: int | None = None
     emit_partial_terminal_window = False
     partial_window_min_steps = 0
+    min_windows_per_family = 1
 
     def __init__(
         self,
@@ -144,6 +161,7 @@ class GenericProbeExplorer:
         action_space: gym.spaces.Space,
         action_values: np.ndarray | None,
         rng: np.random.Generator,
+        env_name: str | None = None,
         goal_horizon: int = 6,
     ):
         self.action_space = action_space
@@ -170,7 +188,13 @@ class GenericProbeExplorer:
             name == "center" or name.startswith("neg_") or name.startswith("pos_")
             for name in family_names
         )
-        if scalar_box_families:
+        self.mechanics_scalar_probe = bool(
+            scalar_box_families
+            and _looks_like_continuous_cartpole(env_name, self.action_values)
+        )
+        if self.mechanics_scalar_probe:
+            self.support_goal_sequence = MECHANICS_SCALAR_PROBE_FAMILIES
+        elif scalar_box_families:
             directional_names = [
                 name for name in family_names if name.startswith("neg_") or name.startswith("pos_")
             ]
@@ -183,23 +207,35 @@ class GenericProbeExplorer:
         self.max_windows_per_rollout = type(self).max_windows_per_rollout
         self.emit_partial_terminal_window = bool(type(self).emit_partial_terminal_window)
         self.partial_window_min_steps = int(type(self).partial_window_min_steps)
+        self.min_windows_per_family = max(1, int(type(self).min_windows_per_family))
         self.center_recovery_bonus = 0.45
         self.min_windows_per_env = len(self.support_goal_sequence)
         self.max_support_retry_rollouts = max(2, len(self.support_goal_sequence) // 2)
         if scalar_box_families:
-            # Continuous CartPole benefits from a denser few-view support set so
-            # leave-one-family-out stability has a chance to clear the strict gate.
+            # Scalar continuous controls are easy to oversample. Emit one
+            # compact window per named experiment so the encoder learns from a
+            # small, auditable support budget plus genuine held-out windows.
             self.active_step_cap = max(self.active_step_cap, 64)
             self.active_window_stride = min(self.active_window_stride, 6)
             self.max_windows_per_rollout = 1
             self.emit_partial_terminal_window = True
             self.partial_window_min_steps = 3
             self.center_recovery_bonus = 0.20
-            self.min_windows_per_env = max(2 * len(self.support_goal_sequence), 12)
+            self.min_windows_per_env = len(self.support_goal_sequence)
             self.max_support_retry_rollouts = max(
                 self.max_support_retry_rollouts,
                 len(self.support_goal_sequence),
             )
+            if self.mechanics_scalar_probe:
+                # Two independent windows per named experiment let split
+                # diagnostics separate same-family stability from cross-family
+                # transfer instead of treating every split as purely cross-family.
+                self.min_windows_per_family = 2
+                self.min_windows_per_env = len(self.support_goal_sequence) * self.min_windows_per_family
+                self.max_support_retry_rollouts = max(
+                    self.max_support_retry_rollouts,
+                    self.min_windows_per_env,
+                )
         self.family_indices = {
             family: np.asarray(
                 [idx for idx, label in enumerate(self.action_labels) if label == family],
@@ -207,6 +243,22 @@ class GenericProbeExplorer:
             )
             for family in self.support_goal_sequence
         }
+        if self.mechanics_scalar_probe and self.action_values is not None:
+            scalar_actions = np.asarray(self.action_values, dtype=np.float32).reshape(-1)
+            center_idx = int(np.argmin(np.abs(scalar_actions)))
+            left_idx = int(np.argmin(scalar_actions))
+            right_idx = int(np.argmax(scalar_actions))
+            self.scalar_center_idx = center_idx
+            self.scalar_left_idx = left_idx
+            self.scalar_right_idx = right_idx
+            self.family_indices = {
+                "passive_decay": np.asarray([center_idx], dtype=np.int64),
+                "impulse_left": np.asarray([left_idx], dtype=np.int64),
+                "impulse_right": np.asarray([right_idx], dtype=np.int64),
+                "chirp": np.asarray([left_idx, right_idx], dtype=np.int64),
+                "boundary_push": np.asarray([left_idx, right_idx], dtype=np.int64),
+                "cart_brake": np.asarray([left_idx, right_idx], dtype=np.int64),
+            }
         self.goal_counts = {goal: 0 for goal in self.support_goal_sequence}
         self.goal_transition_sum = {goal: 0.0 for goal in self.support_goal_sequence}
         self.goal_transition_count = {goal: 0 for goal in self.support_goal_sequence}
@@ -274,10 +326,33 @@ class GenericProbeExplorer:
         return self.current_goal
 
     def action_prior_scores(self, state: np.ndarray, recent_actions: list[int]) -> np.ndarray:
-        del state
         goal = self.ensure_goal(np.zeros((1,), dtype=np.float32))
         counts = np.bincount(recent_actions, minlength=self.action_vocab_size).astype(np.float32)
         scores = 0.05 / (1.0 + counts)
+        if self.mechanics_scalar_probe:
+            state_np = np.asarray(state, dtype=np.float32).reshape(-1)
+            left_idx = int(getattr(self, "scalar_left_idx", 0))
+            right_idx = int(getattr(self, "scalar_right_idx", max(self.action_vocab_size - 1, 0)))
+            center_idx = int(getattr(self, "scalar_center_idx", self.action_vocab_size // 2))
+            if goal == "passive_decay":
+                scores[center_idx] += 1.0
+            elif goal == "impulse_left":
+                scores[left_idx] += 1.0
+            elif goal == "impulse_right":
+                scores[right_idx] += 1.0
+            elif goal == "chirp":
+                scores[left_idx if (self.steps_in_goal // 2) % 2 == 0 else right_idx] += 1.0
+            elif goal == "boundary_push":
+                # Push in the direction the cart/pole is already leaning so
+                # the window exposes edge dynamics instead of another center roll.
+                position = float(state_np[0]) if state_np.size > 0 else 0.0
+                angle = float(state_np[2]) if state_np.size > 2 else position
+                scores[right_idx if position + 0.5 * angle >= 0.0 else left_idx] += 1.0
+            elif goal == "cart_brake":
+                velocity = float(state_np[1]) if state_np.size > 1 else 0.0
+                scores[left_idx if velocity >= 0.0 else right_idx] += 1.0
+            return scores.astype(np.float32)
+
         target_indices = self.family_indices.get(goal, np.asarray([], dtype=np.int64))
         if target_indices.size > 0:
             scores[target_indices] += 1.0
@@ -330,6 +405,7 @@ def build_probe_planner(
     action_space: gym.spaces.Space,
     action_values: np.ndarray | None,
     rng: np.random.Generator,
+    env_name: str | None = None,
 ):
     """Return the default generic probe explorer for supported gym action spaces."""
     if isinstance(action_space, (gym.spaces.Discrete, gym.spaces.Box)):
@@ -337,5 +413,6 @@ def build_probe_planner(
             action_space=action_space,
             action_values=action_values,
             rng=rng,
+            env_name=env_name,
         )
     return None

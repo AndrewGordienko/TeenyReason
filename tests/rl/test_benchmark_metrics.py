@@ -54,6 +54,7 @@ class BenchmarkMetricTests(unittest.TestCase):
             probe_step_solves=[15000, 15000, 15000, None, None],
             probe_total_env_steps=[15000, 15000, 15000, 15000, 15000],
             probe_env_expression_delta=[-5.0, -3.0, -1.0, -2.0, -4.0],
+            probe_no_expression_available=False,
             probe_ready_fraction=[0.10] * 5,
             probe_muted_fraction=[0.90] * 5,
             latent_mechanics_fit=[0.30] * 5,
@@ -70,6 +71,7 @@ class BenchmarkMetricTests(unittest.TestCase):
 
         self.assertFalse(gate["pass"])
         self.assertIn("probe_success_rate_below_baseline", gate["failure_reasons"])
+        self.assertIn("probe_no_expression_missing", gate["failure_reasons"])
         self.assertIn("env_expression_not_beating_noexpr", gate["failure_reasons"])
         self.assertIn("probe_ready_fraction_too_low", gate["failure_reasons"])
         self.assertIn("probe_muted_fraction_too_high", gate["failure_reasons"])
@@ -89,14 +91,15 @@ class BenchmarkMetricTests(unittest.TestCase):
             probe_step_solves=[25000, 25500, 24800, 25200, 25100],
             probe_total_env_steps=[25000, 25500, 24800, 25200, 25100],
             probe_env_expression_delta=[25.0, 31.0, 28.0, 30.0, 29.0],
+            probe_no_expression_available=True,
             probe_ready_fraction=[0.60] * 5,
             probe_muted_fraction=[0.20] * 5,
-            latent_mechanics_fit=[0.55] * 5,
+            latent_mechanics_fit=[0.65] * 5,
             latent_neighbor_alignment=[0.30] * 5,
-            latent_split_retrieval=[0.25] * 5,
+            latent_split_retrieval=[0.50] * 5,
             latent_gap_ratio=[0.75] * 5,
             latent_probe_leakage=[0.10] * 5,
-            latent_uncert_error_corr=[0.25] * 5,
+            latent_uncert_error_corr=[0.35] * 5,
             full_system_state_only_ablation_delta=[60.0] * 5,
             full_system_zero_context_ablation_delta=[58.0] * 5,
             full_system_shuffled_context_ablation_delta=[54.0] * 5,

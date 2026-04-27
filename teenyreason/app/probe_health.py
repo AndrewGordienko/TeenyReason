@@ -49,6 +49,27 @@ def geometry_status(*, split_mrr: float | None, neighbor_alignment: float | None
     return "weak"
 
 
+def system_id_geometry_status(
+    *,
+    trusted: bool,
+    validation_top1: float | None,
+    validation_margin: float | None,
+    leaveout_shift: float | None,
+    subset_stability: float | None,
+) -> str:
+    validation_top1 = float(validation_top1 or 0.0)
+    validation_margin = float(validation_margin or 0.0)
+    leaveout_shift = float(leaveout_shift or 0.0)
+    subset_stability = float(subset_stability or 0.0)
+    if not trusted or validation_top1 < 0.45 or validation_margin < 0.25:
+        return "weak"
+    if validation_top1 >= 0.70 and leaveout_shift <= 0.20 and subset_stability >= 0.60:
+        return "good"
+    if leaveout_shift <= 0.45 or subset_stability >= 0.25:
+        return "improving"
+    return "weak"
+
+
 def utility_status(
     *,
     baseline_episode: int | None,

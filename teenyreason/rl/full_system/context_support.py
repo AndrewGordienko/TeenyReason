@@ -17,7 +17,7 @@ from ...probe.probe_latent import (
     update_recurrent_belief_from_window,
 )
 from ...representation import DeltaPredictorEnsemble, WorldEncoder
-from ..core.ppo_core import sanitize_numpy
+from ..core import sanitize_numpy
 from ..probe_policy.budget import choose_fair_probe_family
 from ..probe_policy.eval import compute_probe_surprise
 
@@ -177,17 +177,32 @@ def collect_support_context(
             )
         )
         probe_families.append(observed_family)
+        probe_window_record = {
+            "states": np.asarray(window_states, dtype=np.float32),
+            "actions": np.asarray(window_actions, dtype=np.int64),
+            "rewards": np.asarray(window_rewards, dtype=np.float32),
+            "terminated": False,
+            "truncated": False,
+            "probe_family": "" if observed_family is None else str(observed_family),
+            "chosen_family": "" if observed_family is None else str(observed_family),
+            "probe_surprise": float(probe_surprise),
+            "probe_steps_used": int(probe_steps_used),
+        }
+        probe_windows.append(probe_window_record)
         probe_group_ids = probe_group_ids_from_families(
             probe_families,
             family_names=crawler_bundle.family_names,
         )
-        belief, payload = aggregate_env_belief(
-            belief_aggregator=belief_aggregator,
-            env_param_predictor=env_param_predictor,
-            device=crawler_bundle.device,
-            posterior_views=belief_posteriors,
-            probe_group_ids=probe_group_ids,
-        )
+        if str(getattr(crawler_bundle, "belief_mode", "latent_pool")) == "particle_sysid":
+            belief, payload = crawler_bundle.build_particle_env_belief(probe_windows)
+        else:
+            belief, payload = aggregate_env_belief(
+                belief_aggregator=belief_aggregator,
+                env_param_predictor=env_param_predictor,
+                device=crawler_bundle.device,
+                posterior_views=belief_posteriors,
+                probe_group_ids=probe_group_ids,
+            )
         predictive_belief = crawler_bundle.build_predictive_belief(payload)
         uncertainty_estimate = crawler_bundle.build_uncertainty_estimate(payload)
         expected_family_gain = crawler_bundle.score_probe_families(
@@ -209,16 +224,6 @@ def collect_support_context(
         )
         total_probe_windows += 1
         probe_count += 1
-        probe_windows.append(
-            {
-                "states": np.asarray(window_states, dtype=np.float32),
-                "actions": np.asarray(window_actions, dtype=np.int64),
-                "rewards": np.asarray(window_rewards, dtype=np.float32),
-                "chosen_family": "" if observed_family is None else str(observed_family),
-                "probe_surprise": float(probe_surprise),
-                "probe_steps_used": int(probe_steps_used),
-            }
-        )
         if chosen_family is not None:
             family_counts[chosen_family] = family_counts.get(chosen_family, 0) + 1
         if trace_writer is not None:

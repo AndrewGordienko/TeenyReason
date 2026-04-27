@@ -1115,7 +1115,7 @@
         </div>
 
         <div class="subsection">
-          <div class="subhead">Split Retrieval Rank Distribution</div>
+          <div class="subhead">Paired Split Retrieval Rank Distribution</div>
           <div class="plot-shell" id="retrievalRankPlotWrap"></div>
         </div>
 
@@ -1341,6 +1341,7 @@
       const pairwiseBetween = (series.pairwise_between_distance || []).map(Number).filter((value) => Number.isFinite(value));
       const pairwiseBetweenUnit = (series.pairwise_between_distance_unit || []).map(Number).filter((value) => Number.isFinite(value));
       const splitRetrievalRanks = (series.split_retrieval_rank || []).map(Number).filter((value) => Number.isFinite(value));
+      const crossFamilySplitRetrievalRanks = (series.cross_family_split_retrieval_rank || []).map(Number).filter((value) => Number.isFinite(value));
       const beliefNorms = payload.points.map((point) => Number(point.belief_norm ?? 0)).filter((value) => Number.isFinite(value));
       const totalModes = payload.mode_counts.reduce((sum, row) => sum + row.count, 0);
       const sortedModes = [...payload.mode_counts].sort((left, right) => right.count - left.count);
@@ -1371,13 +1372,18 @@
         splitRetrievalTop5: diagnostics.split_retrieval_top5 ?? 0,
         splitRetrievalMrr: diagnostics.split_retrieval_mrr ?? 0,
         splitRetrievalMedianRank: diagnostics.split_retrieval_median_rank ?? 0,
+        crossFamilySplitRetrievalTop1: diagnostics.cross_family_split_retrieval_top1 ?? diagnostics.split_retrieval_top1 ?? 0,
+        crossFamilySplitRetrievalMrr: diagnostics.cross_family_split_retrieval_mrr ?? diagnostics.split_retrieval_mrr ?? 0,
+        crossFamilyGapRatioMean: diagnostics.cross_family_gap_ratio_mean ?? payload.summary.cross_family_gap_ratio_mean ?? 0,
         sameEnvGapRatio: diagnostics.same_env_gap_ratio ?? {mean: 0, p90: 0},
         envParamUncertaintyMean: diagnostics.env_param_uncertainty_mean ?? 0,
         futureProbeErrorMean: diagnostics.future_probe_error_mean ?? 0,
         mechanicsPosteriorStdMean: diagnostics.mechanics_posterior_std_mean ?? 0,
         mechanicsPosteriorEntropyMean: diagnostics.mechanics_posterior_entropy_mean ?? 0,
+        supportGroupCountMean: diagnostics.support_group_count_mean ?? payload.summary.support_group_count_mean ?? 0,
         supportGroupRatioMean: diagnostics.support_group_ratio_mean ?? payload.summary.support_group_ratio_mean ?? 0,
         splitGroupOverlapMean: diagnostics.split_group_overlap_mean ?? payload.summary.split_group_overlap_mean ?? 0,
+        crossFamilySplitGroupOverlapMean: diagnostics.cross_family_split_group_overlap_mean ?? payload.summary.cross_family_split_group_overlap_mean ?? 0,
         splitBalancedHalfFraction: diagnostics.split_balanced_half_fraction ?? payload.summary.split_balanced_half_fraction ?? 0,
         splitGroupCountAMean: diagnostics.split_group_count_a_mean ?? 0,
         splitGroupCountBMean: diagnostics.split_group_count_b_mean ?? 0,
@@ -1388,6 +1394,7 @@
         pairwiseBetween,
         pairwiseBetweenUnit,
         splitRetrievalRanks,
+        crossFamilySplitRetrievalRanks,
       };
     }
 
@@ -1452,9 +1459,14 @@
           n: "how much closer latent neighbors are in env-parameter space than random pairings"
         },
         {
-          k: "Split Retrieval",
+          k: "Paired Retrieval",
           v: latentDerived ? `${(100 * latentDerived.splitRetrievalTop1).toFixed(1)}%` : "n/a",
-          n: "top-1 retrieval accuracy between two disjoint small support halves from the same sampled world"
+          n: "top-1 retrieval accuracy when duplicate probe-family evidence can appear on both split halves"
+        },
+        {
+          k: "Cross Retrieval",
+          v: latentDerived ? `${(100 * latentDerived.crossFamilySplitRetrievalTop1).toFixed(1)}%` : "n/a",
+          n: "stricter top-1 retrieval when the split halves use disjoint probe-family evidence"
         },
         {
           k: "Support Diversity",
@@ -1462,9 +1474,9 @@
           n: "share of support windows that come from distinct experiment families instead of repeated copies of one probe"
         },
         {
-          k: "Split Overlap",
+          k: "Paired Overlap",
           v: latentDerived ? `${(100 * latentDerived.splitGroupOverlapMean).toFixed(1)}%` : "n/a",
-          n: "share of split-half family coverage that appears on both sides instead of collapsing into different probe-family subsets"
+          n: "share of paired split-half family coverage that appears on both sides"
         },
         {
           k: "Split Balance",
@@ -2464,6 +2476,7 @@
       renderHero();
       const summary = payload.summary;
       const derived = computeLatentDerived(payload);
+      const systemId = payload.system_id || {};
       const supportValidity = payload.support_validity || {
         status: "ok",
         headline: "",
@@ -2499,14 +2512,21 @@
         matrixRow("Total Windows", formatInteger(summary.num_windows), "probe windows pooled into those env-level beliefs"),
         matrixRow("Windows / Env", summary.window_count_mean.toFixed(1), "average number of probe windows contributing to one env belief"),
         matrixRow("Support / Env", summary.support_count_mean.toFixed(1), "average number of windows actually used to build each env belief"),
-        matrixRow("Support Diversity", `${(100 * (summary.support_group_ratio_mean ?? 1)).toFixed(1)}%`, "share of support windows that come from distinct goal families rather than repeated copies of one experiment"),
-        matrixRow("Split Group Overlap", `${(100 * (summary.split_group_overlap_mean ?? 0)).toFixed(1)}%`, "how much of the split-half family coverage is duplicated on both sides instead of separating by probe family"),
+        matrixRow("Support Families", `${Number(summary.support_group_count_mean ?? 0).toFixed(1)} · ${(100 * (summary.support_group_ratio_mean ?? 1)).toFixed(1)}%`, "distinct probe families represented per env, followed by the distinct-family share of support windows"),
+        matrixRow("Paired Split Overlap", `${(100 * (summary.split_group_overlap_mean ?? 0)).toFixed(1)}%`, "how much split-half family coverage is duplicated on both sides for the paired-repeat diagnostic"),
+        matrixRow("Cross Split Overlap", `${(100 * (summary.cross_family_split_group_overlap_mean ?? 0)).toFixed(1)}%`, "how much family coverage overlaps in the deliberately stricter cross-family split"),
         matrixRow("Split Half Balance", `${(100 * (summary.split_balanced_half_fraction ?? 0)).toFixed(1)}%`, "share of env beliefs whose two disjoint split halves stayed balanced in size"),
         matrixRow("Env Param Mean Band", `${derived ? derived.envMeanMin.toFixed(3) : "n/a"} to ${derived ? derived.envMeanMax.toFixed(3) : "n/a"}`, "coarse span of hidden parameter settings covered by the aggregated env beliefs"),
         matrixRow("Uncertainty Mean", summary.uncertainty_mean.toFixed(3), "average disagreement across disjoint small support halves and their decoded mechanics"),
         matrixRow("Uncertainty Std", derived ? derived.uncertaintyStd.toFixed(3) : "n/a", "spread of env-level uncertainty across sampled worlds; near-zero usually means confidence collapse"),
         matrixRow("Posterior Std", derived ? derived.mechanicsPosteriorStdMean.toFixed(3) : "n/a", "mean per-factor mechanics posterior std; lower means the world hypothesis is becoming sharper"),
         matrixRow("Posterior Entropy", derived ? derived.mechanicsPosteriorEntropyMean.toFixed(3) : "n/a", "average entropy of the explicit mechanics posterior carried by the env belief"),
+        ...(systemId.available ? [
+          matrixRow("System-ID Trust", systemId.trusted ? "yes" : "no", "whether the particle likelihood model cleared the held-out identification gate"),
+          matrixRow("SysID Top-1", `${(100 * Number(systemId.validation_top1 || 0)).toFixed(1)}%`, "held-out candidate mechanics retrieval accuracy for the likelihood model"),
+          matrixRow("Particle ESS", Number(systemId.particle_ess_ratio_mean || 0).toFixed(3), "effective sample size ratio of the particle posterior; lower means evidence has concentrated on fewer worlds"),
+          matrixRow("Particle Leaveout", Number(systemId.particle_leaveout_shift_mean || 0).toFixed(3), "mean posterior shift when one observed probe family is removed"),
+        ] : []),
         matrixRow("Belief Norm Std", derived ? derived.beliefNormStd.toFixed(3) : "n/a", "spread of pre-normalization belief magnitudes across sampled worlds; near-zero usually means raw belief collapse"),
         matrixRow("Median Nearest-Between", derived ? derived.nearestBetweenMedian.toFixed(3) : "n/a", "typical distance to the nearest different-world belief; tiny values usually mean the belief cloud has collapsed"),
         matrixRow("Pairwise Between Mean", derived ? derived.pairwiseBetweenMean.toFixed(3) : "n/a", "mean distance across different-world env beliefs; low values usually mean global geometry is still compressed"),
@@ -2536,14 +2556,24 @@
           "Average same-world split disagreement as a share of the nearest different-world latent distance. Lower is better: same worlds should be much closer than different worlds."
         ),
         readoutRow(
-          "Split Retrieval",
+          "Paired Retrieval",
           `${(100 * derived.splitRetrievalTop1).toFixed(1)}%`,
-          "Top-1 retrieval accuracy when one disjoint support half tries to identify its matching other half. Higher means local geometry is becoming more world-consistent."
+          "Top-1 retrieval accuracy when duplicate probe-family evidence can be split across the two halves. This should improve before strict cross-family transfer does."
         ),
         readoutRow(
-          "Split MRR",
+          "Cross-Family Retrieval",
+          `${(100 * derived.crossFamilySplitRetrievalTop1).toFixed(1)}%`,
+          "Top-1 retrieval accuracy when the two halves are forced to use disjoint probe families. This is the stricter transfer check."
+        ),
+        readoutRow(
+          "Paired MRR",
           derived.splitRetrievalMrr.toFixed(2),
           "Mean reciprocal rank for split-half retrieval. Higher is better and usually more stable than top-1 alone."
+        ),
+        readoutRow(
+          "Cross-Family MRR",
+          derived.crossFamilySplitRetrievalMrr.toFixed(2),
+          "Mean reciprocal rank for the stricter cross-family split retrieval check."
         ),
         readoutRow(
           "Env Param Disagreement",
@@ -2566,14 +2596,14 @@
           "Average entropy of the explicit mechanics posterior. This is the new posterior-style uncertainty source for probe planning."
         ),
         readoutRow(
-          "Support Diversity",
-          `${(100 * derived.supportGroupRatioMean).toFixed(1)}%`,
-          "How much of the support set comes from distinct experiment families. Low values usually mean the scientist is repeating one comfortable probe instead of testing the world broadly."
+          "Support Families",
+          `${derived.supportGroupCountMean.toFixed(1)} · ${(100 * derived.supportGroupRatioMean).toFixed(1)}%`,
+          "Distinct probe families represented per env. The percentage falls when each family has paired/repeated windows, so use it with the family count and split overlap."
         ),
         readoutRow(
-          "Split Group Overlap",
+          "Split Family Overlap",
           `${(100 * derived.splitGroupOverlapMean).toFixed(1)}%`,
-          "How often the same probe families show up on both disjoint support halves. Higher is better: same-world splits should not be separating into family-specific subsets."
+          "How often the same probe families show up on both disjoint support halves. Low overlap is intentional for the stricter cross-family split; retrieval then has to match worlds from different probe evidence."
         ),
         readoutRow(
           "Split Half Balance",
@@ -2615,6 +2645,8 @@
         "subset beliefs still disagree";
       const supportDiversity =
         !derived ? "n/a" :
+        derived.supportGroupCountMean >= 8.0 && derived.splitGroupOverlapMean > 0.85 ? "support covers all families" :
+        derived.supportGroupCountMean >= 5.0 && derived.splitGroupOverlapMean > 0.70 ? "support is paired across families" :
         derived.supportGroupRatioMean > 0.85 ? "support is broadly covered" :
         derived.supportGroupRatioMean > 0.60 ? "support is partly diverse" :
         "support is too narrow";
@@ -2638,7 +2670,7 @@
         readoutRow(
           "Local Consistency",
           localConsistency,
-          `Nearest-neighbor alignment is ${(100 * derived.neighborEnvAlignment).toFixed(1)}%, and split retrieval is ${(100 * derived.splitRetrievalTop1).toFixed(1)}%. If both stay low, the env-belief cloud may look structured while still failing to preserve the real similarity of worlds.`
+          `Nearest-neighbor alignment is ${(100 * derived.neighborEnvAlignment).toFixed(1)}%, paired retrieval is ${(100 * derived.splitRetrievalTop1).toFixed(1)}%, and cross-family retrieval is ${(100 * derived.crossFamilySplitRetrievalTop1).toFixed(1)}%. Paired should move first; cross-family is the harder transfer check.`
         ),
         readoutRow(
           "Same-env Agreement",
@@ -2648,7 +2680,7 @@
         readoutRow(
           "Support Coverage",
           supportDiversity,
-          `Support diversity is ${(100 * derived.supportGroupRatioMean).toFixed(1)}%, but split-half overlap is ${(100 * derived.splitGroupOverlapMean).toFixed(1)}% and split balance is ${(100 * derived.splitBalancedHalfFraction).toFixed(1)}%. Broad support is not enough if the two disjoint halves still separate by family.`
+          `Support covers ${derived.supportGroupCountMean.toFixed(1)} families/env with ${(100 * derived.supportGroupRatioMean).toFixed(1)}% distinct-family share. Paired split overlap is ${(100 * derived.splitGroupOverlapMean).toFixed(1)}%, cross-family overlap is ${(100 * derived.crossFamilySplitGroupOverlapMean).toFixed(1)}%, and split balance is ${(100 * derived.splitBalancedHalfFraction).toFixed(1)}%.`
         ),
         readoutRow(
           "Uncertainty Usefulness",
@@ -3010,12 +3042,35 @@
       const latentSupport = summaries.latent_support_diagnostics || {};
       const supportCenterShare = Number(latentSupport.center_window_share || 0);
       const supportDirectionalShare = Number(latentSupport.directional_window_share || 0);
+      const supportMechanicsShare = Number(latentSupport.mechanics_window_share || 0);
+      const supportPassiveShare = Number(latentSupport.passive_window_share || 0);
+      const supportStressShare = Number(latentSupport.stress_window_share || 0);
+      const hasNamedMechanicsSupport = supportMechanicsShare > 0 || supportPassiveShare > 0 || supportStressShare > 0;
       const supportEffectiveFamilies = Number(latentSupport.effective_window_families || 0);
       const supportWindowLeak = Number(latentSupport.window_mode_leakage || 0);
       const supportEnvLeak = Number(latentSupport.env_mode_leakage || 0);
-      const nextLatentBottleneck = summaries.probe_env_expression_delta.mean <= 0
-        ? "expression harmful"
-        : supportCenterShare > 0.30
+      const latentNearestBetween = Number(latentSupport.nearest_between_median || 0);
+      const systemId = summaries.system_id || {};
+      const particleSysidMode = systemId.available && String(systemId.mode || "") === "particle_sysid";
+      const particleSubsetWeak =
+        particleSysidMode
+        && (
+          Number(systemId.particle_subset_stability_median || 0) < 0.45
+          || Number(systemId.particle_leaveout_shift_median || 0) > 0.25
+        );
+      const latentGeometryCollapsed =
+        !particleSysidMode
+        && summaries.latent_split_top1.median < 0.05
+        && (summaries.latent_gap_ratio.median > 5.0 || latentNearestBetween < 0.001);
+      const nextLatentBottleneck = particleSubsetWeak
+        ? "particle subset stability"
+        : latentGeometryCollapsed
+        ? "belief geometry collapsed"
+        : summaries.probe_env_expression_delta.mean <= 0
+          ? "expression harmful"
+        : hasNamedMechanicsSupport && supportMechanicsShare < 0.80
+          ? "mechanics support narrow"
+        : !hasNamedMechanicsSupport && supportCenterShare > 0.30
           ? "support center-heavy"
           : supportWindowLeak > 0.35
             ? "window probe leakage"
@@ -3033,11 +3088,28 @@
         summaryCell("Baseline Episode Median", summaries.baseline_episode.median.toFixed(1), "median solve episode with unsolved runs capped by completed episodes"),
         summaryCell("Probe Episode Median", summaries.probe_episode.median.toFixed(1), "episode solve speed for the latent-conditioned path"),
         summaryCell("Belief Progress Index", summaries.belief_progress_index.median.toFixed(3), "fast-loop latent progress score combining mechanics fit, geometry, held-out probe prediction, uncertainty honesty, and leakage control"),
-        summaryCell("Support Center", `${(100 * supportCenterShare).toFixed(1)}%`, "share of saved encoder/support windows that used the center probe family"),
+        ...(systemId.available ? [
+          summaryCell("System-ID Progress", Number(systemId.progress_median || 0).toFixed(3), "particle-system-ID health from held-out sysid quality, posterior sharpness, and leave-one-family stability"),
+          summaryCell("SysID Top-1", `${(100 * Number(systemId.validation_top1_median || 0)).toFixed(1)}%`, "held-out candidate mechanics retrieval accuracy for the particle likelihood model"),
+          summaryCell("Particle Leaveout", Number(systemId.particle_leaveout_shift_median || 0).toFixed(3), "posterior mean shift when one observed probe family is removed"),
+        ] : []),
+        summaryCell(
+          hasNamedMechanicsSupport ? "Mechanics Support" : "Support Center",
+          hasNamedMechanicsSupport ? `${(100 * supportMechanicsShare).toFixed(1)}%` : `${(100 * supportCenterShare).toFixed(1)}%`,
+          hasNamedMechanicsSupport
+            ? "share of saved windows covered by the named CartPole mechanics probes"
+            : "share of saved encoder/support windows that used the center probe family"
+        ),
         summaryCell("Effective Families", supportEffectiveFamilies.toFixed(2), "inverse-concentration count of probe families represented in saved support windows"),
         summaryCell("Window Leak", supportWindowLeak.toFixed(2), "linear probe-family leakage measured on individual support windows before env pooling"),
         summaryCell("Env Leak", supportEnvLeak.toFixed(2), "probe-family leakage measured after pooling support windows into env beliefs"),
-        summaryCell("Latent Win Gate", latentWinGateStatus, "A run only counts as cracked when probe beats baseline, the latent clears the representation floors, and learned context materially beats the matched ablations"),
+        summaryCell(
+          particleSysidMode ? "Legacy Latent Gate" : "Latent Win Gate",
+          latentWinGateStatus,
+          particleSysidMode
+            ? "The old latent-geometry gate is still shown as the baseline contrast; particle sysid health is tracked separately."
+            : "A run only counts as cracked when probe beats baseline, the latent clears the representation floors, and learned context materially beats the matched ablations"
+        ),
         ...(payload.probe_shadow_available ? [
           summaryCell("Shadow Episode Median", summaries.probe_shadow_episode.median.toFixed(1), "diagnostic near-ready gate using the same probe protocol without changing headline classification"),
         ] : []),
@@ -3102,7 +3174,15 @@
         summaryCell("Benchmark Mode", `${payload.benchmark_mode || "fair"} / ${payload.probe_budget_mode || "fair_two_probe_handoff"}`, "headline mode for this saved benchmark artifact"),
       ].join("");
 
-      el("seedGrid").innerHTML = payload.rows.length ? payload.rows.map((row) => `
+      el("seedGrid").innerHTML = payload.rows.length ? payload.rows.map((row) => {
+        const rowMechanicsShare = Number(row.latent_mechanics_window_share || 0);
+        const rowPassiveShare = Number(row.latent_passive_window_share || 0);
+        const rowStressShare = Number(row.latent_stress_window_share || 0);
+        const rowHasNamedMechanics = rowMechanicsShare > 0 || rowPassiveShare > 0 || rowStressShare > 0;
+        const rowSupportMix = rowHasNamedMechanics
+          ? `mech ${(100 * rowMechanicsShare).toFixed(1)}% · passive ${(100 * rowPassiveShare).toFixed(1)}% · stress ${(100 * rowStressShare).toFixed(1)}%`
+          : `center ${(100 * Number(row.latent_center_window_share || 0)).toFixed(1)}% · dir ${(100 * Number(row.latent_directional_window_share || 0)).toFixed(1)}%`;
+        return `
         <div class="seed-row">
           <div>
             <div class="seed-cell-label">Seed</div>
@@ -3222,7 +3302,7 @@
           </div>
           <div>
             <div class="seed-cell-label">Support Mix</div>
-            <div class="seed-cell-value">center ${(100 * Number(row.latent_center_window_share || 0)).toFixed(1)}% · dir ${(100 * Number(row.latent_directional_window_share || 0)).toFixed(1)}%</div>
+            <div class="seed-cell-value">${rowSupportMix}</div>
             <div class="seed-cell-note">window leak ${Number(row.latent_window_mode_leakage || 0).toFixed(2)} · env leak ${Number(row.latent_env_mode_leakage || 0).toFixed(2)} · eff ${Number(row.latent_support_diagnostics?.effective_window_families || 0).toFixed(2)}</div>
           </div>
           ${payload.full_system_available ? `
@@ -3298,7 +3378,8 @@
             <div class="seed-cell-note">latent vs protocol story for this seed</div>
           </div>
         </div>
-      `).join("") : `<div class="empty">No benchmark summary is available yet.</div>`;
+      `;
+      }).join("") : `<div class="empty">No benchmark summary is available yet.</div>`;
 
       const stopRows = Object.entries(stopReasonTotals)
         .filter(([, value]) => Number(value) > 0)
@@ -3329,6 +3410,10 @@
       const noExprEpisodeDelta = hasNoExpressionSolve
         ? summaries.probe_no_expression_episode.median - summaries.probe_episode.median
         : 0;
+      const strictExpressionActive = strictUsageStatus === "active"
+        || Number(summaries.probe_fair_expression_enabled_fraction.mean || 0) > 0.05;
+      const latentContributionLabel = strictExpressionActive ? "expression" : "conditioned branch";
+      const noExpressionReferenceLabel = strictExpressionActive ? "no-expression" : "no-expression branch";
       const shadowEpisodeDelta = payload.probe_shadow_available && hasNoExpressionSolve
         ? summaries.probe_no_expression_episode.median - summaries.probe_shadow_episode.median
         : 0;
@@ -3339,7 +3424,7 @@
         ? summaries.probe_no_expression_episode.median - summaries.full_system_oracle_episode.median
         : 0;
       const simFanoutEpisodeDelta = payload.sim_fanout_available && payload.full_system_available
-        ? summaries.full_system_episode.median - summaries.sim_fanout_episode.median
+        ? summaries.sim_fanout_episode.median - summaries.full_system_episode.median
         : 0;
       el("benchmarkCards").innerHTML = [
         readoutRow(
@@ -3365,32 +3450,53 @@
         readoutRow(
           "Latent Contribution",
           hasNoExpressionSolve
-            ? (noExprEpisodeDelta >= 0 ? `expression faster by ${noExprEpisodeDelta.toFixed(1)}` : `no-expression faster by ${Math.abs(noExprEpisodeDelta).toFixed(1)}`)
+            ? (
+              noExprEpisodeDelta >= 0
+                ? `${latentContributionLabel} faster by ${noExprEpisodeDelta.toFixed(1)}${strictExpressionActive ? "" : " · strict unused"}`
+                : `${noExpressionReferenceLabel} faster by ${Math.abs(noExprEpisodeDelta).toFixed(1)}`
+            )
             : "not run",
-          hasNoExpressionSolve
+          hasNoExpressionSolve && strictExpressionActive
             ? "This compares the matched probe run against the same protocol with the env expression muted."
+            : hasNoExpressionSolve
+            ? "Strict fair expression was not active here, so this compares branches rather than proving learned message contribution."
             : "No matched no-expression solve arm is available in this artifact, so this page will not infer latent contribution from a zero placeholder."
         ),
         readoutRow(
-          "Latent Gate",
+          particleSysidMode ? "Legacy Latent Gate" : "Latent Gate",
           latentWinGateStatus,
           latentWinGateReasons.length
             ? `Still blocked by: ${latentWinGateReasons.join(", ")}.`
             : "This artifact clears the cracked-it gate instead of only looking good on one downstream view."
         ),
+        ...(systemId.available ? [
+          readoutRow(
+            "System-ID Gate",
+            `${(100 * Number(systemId.trusted_fraction || 0)).toFixed(1)}% trusted`,
+            `Top-1 ${(100 * Number(systemId.validation_top1_median || 0)).toFixed(1)}%, margin ${Number(systemId.validation_margin_median || 0).toFixed(2)}, ESS ${Number(systemId.particle_ess_ratio_median || 0).toFixed(3)}, leaveout ${Number(systemId.particle_leaveout_shift_median || 0).toFixed(3)}.`
+          ),
+        ] : []),
         readoutRow(
           "Representation Floor",
-          `bpi ${summaries.belief_progress_index.median.toFixed(3)} · fit ${summaries.latent_mechanics_fit.median.toFixed(2)} · neighbor ${(100 * summaries.latent_neighbor_alignment.median).toFixed(1)}% · split ${(100 * summaries.latent_split_top1.median).toFixed(1)}%`,
-          `Gap ratio ${summaries.latent_gap_ratio.median.toFixed(2)}, held-out probe error ${summaries.latent_heldout_probe_error.median.toFixed(2)}, leakage ${(100 * summaries.latent_probe_leakage.median).toFixed(1)}%, uncertainty/error corr ${summaries.latent_uncert_error_corr.median.toFixed(2)}.`
+          particleSysidMode
+            ? `sysid ${Number(systemId.progress_median || 0).toFixed(3)} · top1 ${(100 * Number(systemId.validation_top1_median || 0)).toFixed(1)}% · ess ${Number(systemId.particle_ess_ratio_median || 0).toFixed(3)} · leaveout ${Number(systemId.particle_leaveout_shift_median || 0).toFixed(3)}`
+            : `bpi ${summaries.belief_progress_index.median.toFixed(3)} · fit ${summaries.latent_mechanics_fit.median.toFixed(2)} · neighbor ${(100 * summaries.latent_neighbor_alignment.median).toFixed(1)}% · cross ${(100 * summaries.latent_split_top1.median).toFixed(1)}%`,
+          particleSysidMode
+            ? `Trusted ${(100 * Number(systemId.trusted_fraction || 0)).toFixed(1)}%, margin ${Number(systemId.validation_margin_median || 0).toFixed(2)}, entropy ${Number(systemId.particle_entropy_median || 0).toFixed(2)}, subset stability ${Number(systemId.particle_subset_stability_median || 0).toFixed(2)}. Legacy latent gap is still ${summaries.latent_gap_ratio.median.toFixed(2)}.`
+            : `Gap ratio ${summaries.latent_gap_ratio.median.toFixed(2)}, held-out probe error ${summaries.latent_heldout_probe_error.median.toFixed(2)}, leakage ${(100 * summaries.latent_probe_leakage.median).toFixed(1)}%, uncertainty/error corr ${summaries.latent_uncert_error_corr.median.toFixed(2)}.`
         ),
         readoutRow(
           "Next Bottleneck",
           nextLatentBottleneck,
-          `Expression delta ${summaries.probe_env_expression_delta.mean.toFixed(2)}, center support ${(100 * supportCenterShare).toFixed(1)}%, split retrieval ${(100 * summaries.latent_split_top1.median).toFixed(1)}%, gap ratio ${summaries.latent_gap_ratio.median.toFixed(2)}.`
+          particleSysidMode
+            ? `Expression delta ${summaries.probe_env_expression_delta.mean.toFixed(2)}, sysid trusted ${(100 * Number(systemId.trusted_fraction || 0)).toFixed(1)}%, particle leaveout ${Number(systemId.particle_leaveout_shift_median || 0).toFixed(3)}, subset ${Number(systemId.particle_subset_stability_median || 0).toFixed(2)}.`
+            : `Expression delta ${summaries.probe_env_expression_delta.mean.toFixed(2)}, ${hasNamedMechanicsSupport ? `mechanics support ${(100 * supportMechanicsShare).toFixed(1)}%` : `center support ${(100 * supportCenterShare).toFixed(1)}%`}, cross-family retrieval ${(100 * summaries.latent_split_top1.median).toFixed(1)}%, gap ratio ${summaries.latent_gap_ratio.median.toFixed(2)}.`
         ),
         readoutRow(
           "Support Mix",
-          `center ${(100 * supportCenterShare).toFixed(1)}% · directional ${(100 * supportDirectionalShare).toFixed(1)}% · effective ${supportEffectiveFamilies.toFixed(2)}`,
+          hasNamedMechanicsSupport
+            ? `mechanics ${(100 * supportMechanicsShare).toFixed(1)}% · passive ${(100 * supportPassiveShare).toFixed(1)}% · stress ${(100 * supportStressShare).toFixed(1)}%`
+            : `center ${(100 * supportCenterShare).toFixed(1)}% · directional ${(100 * supportDirectionalShare).toFixed(1)}%`,
           `Support/env ${Number(latentSupport.support_count_mean || 0).toFixed(1)}, split-overlap ${(100 * Number(latentSupport.split_group_overlap_mean || 0)).toFixed(1)}%, dominant-window ${(100 * Number(latentSupport.dominant_window_share || 0)).toFixed(1)}%.`
         ),
         readoutRow(

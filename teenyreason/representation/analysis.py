@@ -20,9 +20,10 @@ from ..models.belief_world_model import (
 from ..models.env_belief import (
     EnvBeliefAggregator,
     EnvParamPredictorEnsemble,
-    build_leave_one_group_out_masks,
-    build_support_budget_mask,
     build_env_group_tensors,
+    build_leave_one_group_out_masks,
+    build_split_source_mask,
+    build_support_budget_mask,
     build_uncertainty_feature_tensor,
     compute_disjoint_support_splits,
 )
@@ -36,6 +37,47 @@ from .snapshot import (
 )
 
 
+def _split_retrieval_rank_and_margin(
+    split_mean_a: np.ndarray,
+    split_mean_b: np.ndarray,
+    margin: float = 0.20,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute retrieval rank and margin deficit for paired split beliefs."""
+    norm_split_a = np.asarray(split_mean_a, dtype=np.float32)
+    norm_split_b = np.asarray(split_mean_b, dtype=np.float32)
+    norm_split_a = norm_split_a / np.clip(np.linalg.norm(norm_split_a, axis=1, keepdims=True), 1e-6, None)
+    norm_split_b = norm_split_b / np.clip(np.linalg.norm(norm_split_b, axis=1, keepdims=True), 1e-6, None)
+    split_similarity = norm_split_a @ norm_split_b.T
+    positive_similarity = np.diag(split_similarity).astype(np.float32)
+    split_rank_order = np.argsort(-split_similarity, axis=1)
+    split_rank_position = (
+        np.argmax(
+            split_rank_order == np.arange(split_rank_order.shape[0], dtype=np.int32)[:, None],
+            axis=1,
+        )
+        + 1
+    ).astype(np.int32)
+    np.fill_diagonal(split_similarity, -np.inf)
+    hard_negative_a = np.nan_to_num(
+        np.max(split_similarity, axis=1).astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    hard_negative_b = np.nan_to_num(
+        np.max(split_similarity.T, axis=1).astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    margin_deficit = np.clip(
+        margin - 0.5 * ((positive_similarity - hard_negative_a) + (positive_similarity - hard_negative_b)),
+        a_min=0.0,
+        a_max=None,
+    ).astype(np.float32)
+    return split_rank_position, margin_deficit
+
+
 def build_env_belief_dataset(
     belief_aggregator: EnvBeliefAggregator,
     env_param_predictor: EnvParamPredictorEnsemble,
@@ -46,8 +88,8 @@ def build_env_belief_dataset(
     window_logvar: np.ndarray,
     windows: dict[str, np.ndarray],
     env_name: str | None = None,
-    support_size: int = 6,
-    subset_count: int = 8,
+    support_size: int = 4,
+    subset_count: int = 1,
 ) -> dict[str, np.ndarray]:
     """Aggregate window posteriors into one env-level belief per sampled world."""
     probe_mode_idx = encode_probe_modes(np.asarray(windows["probe_mode"], dtype="U"))
@@ -59,6 +101,19 @@ def build_env_belief_dataset(
         env_params=windows["env_params"],
         view_group_id=probe_mode_idx,
     )
+    param_normalizer_mean = np.asarray(windows["env_params"], dtype=np.float32).mean(
+        axis=0,
+        keepdims=True,
+    )
+    param_normalizer_std = np.asarray(windows["env_params"], dtype=np.float32).std(
+        axis=0,
+        keepdims=True,
+    )
+    param_normalizer_std = np.where(
+        np.abs(param_normalizer_std) < 1e-6,
+        1.0,
+        param_normalizer_std,
+    ).astype(np.float32)
     split_idx = max(2, int(windows["actions"].shape[1]) // 2)
     future_summary = build_future_summary_targets(
         states=windows["states"][:, split_idx:, :].astype(np.float32),
@@ -82,6 +137,21 @@ def build_env_belief_dataset(
         logvar_t = torch.tensor(grouped["window_logvar"], dtype=torch.float32, device=device)
         mask_t = torch.tensor(grouped["mask"], dtype=torch.float32, device=device)
         group_ids_t = torch.tensor(grouped["view_group_id"], dtype=torch.long, device=device)
+        param_normalizer_mean_t = torch.tensor(
+            param_normalizer_mean,
+            dtype=torch.float32,
+            device=device,
+        )
+        param_normalizer_std_t = torch.tensor(
+            param_normalizer_std,
+            dtype=torch.float32,
+            device=device,
+        )
+        grouped_env_params_t = torch.tensor(
+            grouped["env_params"],
+            dtype=torch.float32,
+            device=device,
+        )
         support_size = min(max(1, support_size), mean_t.shape[1])
         support_mask_t = build_support_budget_mask(
             mask=mask_t,
@@ -101,6 +171,21 @@ def build_env_belief_dataset(
             unique_groups = torch.unique(support_groups[support_groups >= 0], sorted=True)
             support_group_count_t[env_idx] = float(unique_groups.numel())
             support_group_ratio_t[env_idx] = float(unique_groups.numel()) / max(float(support_idx.numel()), 1.0)
+        support_mask_np = support_mask_t.cpu().numpy().astype(np.float32)
+        window_support_mask = np.zeros((windows["env_instance_id"].shape[0],), dtype=np.float32)
+        env_row_by_id = {
+            int(env_id): int(row_idx)
+            for row_idx, env_id in enumerate(grouped["env_instance_id"].tolist())
+        }
+        env_position_by_id: dict[int, int] = {}
+        for window_idx, env_id_value in enumerate(windows["env_instance_id"].tolist()):
+            env_id = int(env_id_value)
+            env_position = env_position_by_id.get(env_id, 0)
+            env_position_by_id[env_id] = env_position + 1
+            row_idx = env_row_by_id.get(env_id)
+            if row_idx is None or env_position >= support_mask_np.shape[1]:
+                continue
+            window_support_mask[window_idx] = float(support_mask_np[row_idx, env_position] > 0)
         env_stats_t = belief_aggregator.aggregate_stats(
             mean_t,
             logvar_t,
@@ -129,9 +214,18 @@ def build_env_belief_dataset(
             aggregator=belief_aggregator,
             grouped_mean=mean_t,
             grouped_logvar=logvar_t,
-            support_mask=support_mask_t,
+            support_mask=build_split_source_mask(mask_t, support_mask_t),
             group_ids=group_ids_t,
             env_param_predictor=env_param_predictor,
+        )
+        cross_split_payload = compute_disjoint_support_splits(
+            aggregator=belief_aggregator,
+            grouped_mean=mean_t,
+            grouped_logvar=logvar_t,
+            support_mask=build_split_source_mask(mask_t, support_mask_t),
+            group_ids=group_ids_t,
+            env_param_predictor=env_param_predictor,
+            split_mode="cross_family",
         )
         if env_metric_projector is not None:
             env_metric_subset_mean_t = env_metric_projector.project_raw(
@@ -140,9 +234,13 @@ def build_env_belief_dataset(
             env_metric_subset_mean_unit_t = env_metric_projector(
                 split_payload["env_mean"].reshape(-1, split_payload["env_mean"].shape[-1])
             ).reshape(split_payload["env_mean"].shape[0], split_payload["env_mean"].shape[1], -1)
+            env_cross_metric_subset_mean_t = env_metric_projector.project_raw(
+                cross_split_payload["env_mean"].reshape(-1, cross_split_payload["env_mean"].shape[-1])
+            ).reshape(cross_split_payload["env_mean"].shape[0], cross_split_payload["env_mean"].shape[1], -1)
         else:
             env_metric_subset_mean_t = split_payload["env_mean"]
             env_metric_subset_mean_unit_t = split_payload["env_mean_unit"]
+            env_cross_metric_subset_mean_t = cross_split_payload["env_mean"]
         subset_size = int(split_payload["split_count"].min(dim=1).values.float().mean().item())
         leave_masks_t, leave_valid_t = build_leave_one_group_out_masks(support_mask_t, group_ids_t)
         leaveout_latent_std_t = torch.zeros_like(env_mean_t)
@@ -177,10 +275,14 @@ def build_env_belief_dataset(
                     leave_mean_t[env_idx, valid_idx] - env_mean_t[env_idx].unsqueeze(0),
                     dim=-1,
                 ).mean()
+                leave_param_mean_raw = (
+                    leave_param_mean_t[env_idx, valid_idx] * param_normalizer_std_t
+                    + param_normalizer_mean_t
+                )
                 leaveout_prediction_error_t[env_idx] = torch.mean(
                     torch.abs(
-                        leave_param_mean_t[env_idx, valid_idx]
-                        - torch.tensor(grouped["env_params"][env_idx], dtype=torch.float32, device=device).unsqueeze(0)
+                        leave_param_mean_raw
+                        - grouped_env_params_t[env_idx].unsqueeze(0)
                     )
                 )
         future_summary_t = torch.tensor(grouped_future_summary, dtype=torch.float32, device=device)
@@ -240,14 +342,26 @@ def build_env_belief_dataset(
         posinf=0.0,
         neginf=0.0,
     )
-    env_param_prediction = np.nan_to_num(
+    env_param_prediction_normalized = np.nan_to_num(
         env_param_mean_t.cpu().numpy().astype(np.float32),
         nan=0.0,
         posinf=0.0,
         neginf=0.0,
     )
-    env_param_std = np.nan_to_num(
+    env_param_prediction = np.nan_to_num(
+        (env_param_prediction_normalized * param_normalizer_std + param_normalizer_mean).astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    env_param_std_normalized = np.nan_to_num(
         env_param_std_t.cpu().numpy().astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    env_param_std = np.nan_to_num(
+        (env_param_std_normalized * param_normalizer_std).astype(np.float32),
         nan=0.0,
         posinf=0.0,
         neginf=0.0,
@@ -264,13 +378,28 @@ def build_env_belief_dataset(
         posinf=0.0,
         neginf=0.0,
     )
-    env_subset_param_mean = np.nan_to_num(
+    env_subset_param_mean_normalized = np.nan_to_num(
         split_payload["env_param_mean"].cpu().numpy().astype(np.float32),
         nan=0.0,
         posinf=0.0,
         neginf=0.0,
     )
+    env_subset_param_mean = np.nan_to_num(
+        (
+            env_subset_param_mean_normalized * param_normalizer_std[:, None, :]
+            + param_normalizer_mean[:, None, :]
+        ).astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
     env_subset_latent_std = np.nan_to_num(env_subset_mean.std(axis=1).astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    env_subset_param_std_normalized = np.nan_to_num(
+        env_subset_param_mean_normalized.std(axis=1).astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
     env_subset_param_std = np.nan_to_num(env_subset_param_mean.std(axis=1).astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     env_split_latent_disagreement = np.nan_to_num(
         np.linalg.norm(env_metric_subset_mean[:, 0, :] - env_metric_subset_mean[:, 1, :], axis=-1).astype(np.float32),
@@ -284,14 +413,29 @@ def build_env_belief_dataset(
         posinf=0.0,
         neginf=0.0,
     )
+    env_split_param_disagreement_normalized = np.nan_to_num(
+        np.linalg.norm(
+            env_subset_param_mean_normalized[:, 0, :] - env_subset_param_mean_normalized[:, 1, :],
+            axis=-1,
+        ).astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
     env_leaveout_latent_std = np.nan_to_num(
         leaveout_latent_std_t.cpu().numpy().astype(np.float32),
         nan=0.0,
         posinf=0.0,
         neginf=0.0,
     )
-    env_leaveout_param_std = np.nan_to_num(
+    env_leaveout_param_std_normalized = np.nan_to_num(
         leaveout_param_std_t.cpu().numpy().astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    env_leaveout_param_std = np.nan_to_num(
+        (env_leaveout_param_std_normalized * param_normalizer_std).astype(np.float32),
         nan=0.0,
         posinf=0.0,
         neginf=0.0,
@@ -348,6 +492,36 @@ def build_env_belief_dataset(
         posinf=0.0,
         neginf=0.0,
     )
+    env_cross_family_subset_mean = np.nan_to_num(
+        cross_split_payload["env_mean"].cpu().numpy().astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    env_cross_family_metric_subset_mean = np.nan_to_num(
+        env_cross_metric_subset_mean_t.cpu().numpy().astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    env_cross_family_split_group_overlap = np.nan_to_num(
+        cross_split_payload["split_group_overlap"].cpu().numpy().astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    env_cross_family_split_group_count_a = np.nan_to_num(
+        cross_split_payload["split_group_count_a"].cpu().numpy().astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    env_cross_family_split_group_count_b = np.nan_to_num(
+        cross_split_payload["split_group_count_b"].cpu().numpy().astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
     env_between_distance = np.linalg.norm(
         env_metric_mean[:, None, :] - env_metric_mean[None, :, :],
         axis=-1,
@@ -376,25 +550,29 @@ def build_env_belief_dataset(
         posinf=0.0,
         neginf=0.0,
     )
-    norm_split_a = env_metric_subset_mean[:, 0, :].astype(np.float32)
-    norm_split_b = env_metric_subset_mean[:, 1, :].astype(np.float32)
-    norm_split_a = norm_split_a / np.clip(np.linalg.norm(norm_split_a, axis=1, keepdims=True), 1e-6, None)
-    norm_split_b = norm_split_b / np.clip(np.linalg.norm(norm_split_b, axis=1, keepdims=True), 1e-6, None)
-    split_similarity = norm_split_a @ norm_split_b.T
-    positive_similarity = np.diag(split_similarity).astype(np.float32)
-    split_rank_order = np.argsort(-split_similarity, axis=1)
-    split_rank_position = (np.argmax(
-        split_rank_order == np.arange(split_rank_order.shape[0], dtype=np.int32)[:, None],
-        axis=1,
-    ) + 1).astype(np.int32)
-    np.fill_diagonal(split_similarity, -np.inf)
-    hard_negative_a = np.nan_to_num(np.max(split_similarity, axis=1).astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-    hard_negative_b = np.nan_to_num(np.max(split_similarity.T, axis=1).astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-    env_split_retrieval_margin_deficit = np.clip(
-        0.20 - 0.5 * ((positive_similarity - hard_negative_a) + (positive_similarity - hard_negative_b)),
-        a_min=0.0,
-        a_max=None,
-    ).astype(np.float32)
+    split_rank_position, env_split_retrieval_margin_deficit = _split_retrieval_rank_and_margin(
+        env_metric_subset_mean[:, 0, :],
+        env_metric_subset_mean[:, 1, :],
+    )
+    cross_split_rank_position, env_cross_family_split_retrieval_margin_deficit = _split_retrieval_rank_and_margin(
+        env_cross_family_metric_subset_mean[:, 0, :],
+        env_cross_family_metric_subset_mean[:, 1, :],
+    )
+    env_cross_family_split_latent_disagreement = np.nan_to_num(
+        np.linalg.norm(
+            env_cross_family_metric_subset_mean[:, 0, :] - env_cross_family_metric_subset_mean[:, 1, :],
+            axis=-1,
+        ).astype(np.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    env_cross_family_gap_ratio = np.nan_to_num(
+        env_cross_family_split_latent_disagreement / np.clip(env_nearest_between_distance, 1e-6, None),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
     env_pairwise_between_distance = np.nan_to_num(
         env_between_distance[np.triu_indices(env_between_distance.shape[0], k=1)].astype(np.float32),
         nan=0.0,
@@ -447,11 +625,19 @@ def build_env_belief_dataset(
                 dtype=torch.float32,
                 device=device,
             ),
-            env_param_std_mean=torch.tensor(env_param_std.mean(axis=1), dtype=torch.float32, device=device),
-            split_param_disagreement=torch.tensor(env_split_param_disagreement, dtype=torch.float32, device=device),
+            env_param_std_mean=torch.tensor(env_param_std_normalized.mean(axis=1), dtype=torch.float32, device=device),
+            split_param_disagreement=torch.tensor(
+                env_split_param_disagreement_normalized,
+                dtype=torch.float32,
+                device=device,
+            ),
             split_latent_disagreement=torch.tensor(env_split_latent_disagreement, dtype=torch.float32, device=device),
             split_env_shift=torch.tensor(env_subset_shift, dtype=torch.float32, device=device),
-            leaveout_param_std_mean=torch.tensor(env_leaveout_param_std.mean(axis=1), dtype=torch.float32, device=device),
+            leaveout_param_std_mean=torch.tensor(
+                env_leaveout_param_std_normalized.mean(axis=1),
+                dtype=torch.float32,
+                device=device,
+            ),
             leaveout_shift=torch.tensor(env_leaveout_shift, dtype=torch.float32, device=device),
             env_view_spread_mean=torch.tensor(env_view_spread.mean(axis=1), dtype=torch.float32, device=device),
             support_group_ratio=torch.tensor(env_support_group_ratio, dtype=torch.float32, device=device),
@@ -468,10 +654,15 @@ def build_env_belief_dataset(
     return {
         "env_instance_id": grouped["env_instance_id"].astype(np.int32),
         "env_window_count": grouped["window_count"].astype(np.int32),
+        "env_support_available_count": mask_t.sum(dim=1).cpu().numpy().astype(np.int32),
         "env_support_count": support_mask_t.sum(dim=1).cpu().numpy().astype(np.int32),
+        "env_support_used_count": support_mask_t.sum(dim=1).cpu().numpy().astype(np.int32),
+        "env_heldout_count": _heldout_count_t.cpu().numpy().astype(np.int32),
         "env_support_group_count": env_support_group_count.astype(np.float32),
         "env_support_group_ratio": env_support_group_ratio.astype(np.float32),
         "env_dominant_probe_mode": env_dominant_probe_mode.astype("U"),
+        "window_is_support": window_support_mask.astype(np.int8),
+        "window_is_heldout": (1 - window_support_mask.astype(np.int8)).astype(np.int8),
         "env_subset_size_used": np.full((env_mean.shape[0],), subset_size, dtype=np.int32),
         "env_params": grouped["env_params"].astype(np.float32),
         "env_belief_mean": env_mean.astype(np.float32),
@@ -491,14 +682,19 @@ def build_env_belief_dataset(
         "env_metric_subset_mean_unit": env_metric_subset_mean_unit_t.cpu().numpy().astype(np.float32),
         "env_subset_latent_std": env_subset_latent_std.astype(np.float32),
         "env_subset_param_std": env_subset_param_std.astype(np.float32),
+        "env_subset_param_std_normalized": env_subset_param_std_normalized.astype(np.float32),
         "env_subset_shift": env_subset_shift.astype(np.float32),
         "env_split_group_overlap": env_split_group_overlap.astype(np.float32),
         "env_split_balanced_half": env_split_balanced_half.astype(np.float32),
         "env_split_group_count_a": env_split_group_count_a.astype(np.float32),
         "env_split_group_count_b": env_split_group_count_b.astype(np.float32),
+        "env_cross_family_split_group_overlap": env_cross_family_split_group_overlap.astype(np.float32),
+        "env_cross_family_split_group_count_a": env_cross_family_split_group_count_a.astype(np.float32),
+        "env_cross_family_split_group_count_b": env_cross_family_split_group_count_b.astype(np.float32),
         "env_nearest_between_distance": env_nearest_between_distance.astype(np.float32),
         "env_nearest_between_distance_unit": env_nearest_between_distance_unit.astype(np.float32),
         "env_gap_ratio": env_gap_ratio.astype(np.float32),
+        "env_cross_family_gap_ratio": env_cross_family_gap_ratio.astype(np.float32),
         "env_split_mean_a": env_subset_mean[:, 0, :].astype(np.float32),
         "env_split_mean_b": env_subset_mean[:, 1, :].astype(np.float32),
         "env_split_mean_unit_a": split_payload["env_mean_unit"][:, 0, :].cpu().numpy().astype(np.float32),
@@ -507,19 +703,30 @@ def build_env_belief_dataset(
         "env_metric_split_mean_b": env_metric_subset_mean[:, 1, :].astype(np.float32),
         "env_metric_split_mean_unit_a": env_metric_subset_mean_unit_t[:, 0, :].cpu().numpy().astype(np.float32),
         "env_metric_split_mean_unit_b": env_metric_subset_mean_unit_t[:, 1, :].cpu().numpy().astype(np.float32),
+        "env_cross_family_split_mean_a": env_cross_family_subset_mean[:, 0, :].astype(np.float32),
+        "env_cross_family_split_mean_b": env_cross_family_subset_mean[:, 1, :].astype(np.float32),
+        "env_cross_family_metric_split_mean_a": env_cross_family_metric_subset_mean[:, 0, :].astype(np.float32),
+        "env_cross_family_metric_split_mean_b": env_cross_family_metric_subset_mean[:, 1, :].astype(np.float32),
         "env_split_param_mean_a": env_subset_param_mean[:, 0, :].astype(np.float32),
         "env_split_param_mean_b": env_subset_param_mean[:, 1, :].astype(np.float32),
         "env_split_latent_disagreement": env_split_latent_disagreement.astype(np.float32),
         "env_split_param_disagreement": env_split_param_disagreement.astype(np.float32),
+        "env_split_param_disagreement_normalized": env_split_param_disagreement_normalized.astype(np.float32),
         "env_split_retrieval_margin_deficit": env_split_retrieval_margin_deficit.astype(np.float32),
         "env_split_retrieval_rank": split_rank_position.astype(np.int32),
+        "env_cross_family_split_latent_disagreement": env_cross_family_split_latent_disagreement.astype(np.float32),
+        "env_cross_family_split_retrieval_margin_deficit": env_cross_family_split_retrieval_margin_deficit.astype(np.float32),
+        "env_cross_family_split_retrieval_rank": cross_split_rank_position.astype(np.int32),
         "env_pairwise_between_distance": env_pairwise_between_distance.astype(np.float32),
         "env_pairwise_between_distance_unit": env_pairwise_between_distance_unit.astype(np.float32),
         "env_leaveout_latent_std": env_leaveout_latent_std.astype(np.float32),
         "env_leaveout_param_std": env_leaveout_param_std.astype(np.float32),
+        "env_leaveout_param_std_normalized": env_leaveout_param_std_normalized.astype(np.float32),
         "env_leaveout_shift": env_leaveout_shift.astype(np.float32),
         "env_param_prediction": env_param_prediction.astype(np.float32),
+        "env_param_prediction_normalized": env_param_prediction_normalized.astype(np.float32),
         "env_param_std": env_param_std.astype(np.float32),
+        "env_param_std_normalized": env_param_std_normalized.astype(np.float32),
         "env_param_abs_error": env_param_abs_error.astype(np.float32),
         "env_param_error_mean": env_param_error_mean.astype(np.float32),
         "env_split_prediction_error": env_split_prediction_error.astype(np.float32),

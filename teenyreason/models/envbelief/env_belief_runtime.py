@@ -10,6 +10,7 @@ import torch
 from .env_belief_models import EnvBeliefAggregator, EnvParamPredictorEnsemble
 from .env_belief_subsets import (
     build_leave_one_group_out_masks,
+    build_split_source_mask,
     build_support_budget_mask,
     compute_disjoint_support_splits,
     compute_support_group_stats,
@@ -98,9 +99,9 @@ def aggregate_env_posteriors(
     window_means: np.ndarray,
     window_logvars: np.ndarray,
     probe_group_ids: np.ndarray | None = None,
-    subset_count: int = 4,
+    subset_count: int = 1,
     subset_size: int = 6,
-    support_size: int = 6,
+    support_size: int = 4,
 ) -> dict[str, np.ndarray]:
     """Aggregate one env's window posteriors into an env belief plus uncertainty."""
     del subset_size
@@ -139,7 +140,7 @@ def aggregate_env_posteriors(
             aggregator=aggregator,
             grouped_mean=mean_t,
             grouped_logvar=logvar_t,
-            support_mask=support_mask_t,
+            support_mask=build_split_source_mask(mask_t, support_mask_t),
             group_ids=group_ids_t,
             env_param_predictor=env_param_predictor,
         )

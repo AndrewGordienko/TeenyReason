@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from teenyreason.crawler import ControllerBeliefContext, EnvExpression
-from teenyreason.rl.core.ppo_core import (
+from teenyreason.rl.core import (
     BeliefNativeActorCritic,
     EpisodeBatch,
     ProbeConditionedGaussianActorCritic,
@@ -20,6 +20,7 @@ from teenyreason.rl.probe_policy.messages import (
     build_solver_episode_expression,
     compute_message_mode,
     compute_env_expression_readiness_components,
+    compute_strict_fair_diagnostic_scale,
     compute_solver_message_scale,
     compute_solver_training_dropout_prob,
     env_expression_is_ready,
@@ -297,7 +298,7 @@ class ProbeControllerTests(unittest.TestCase):
             confidence=0.72,
             uncertainty_scalar=0.08,
             future_probe_error=0.40,
-            support_count=2,
+            support_count=4,
             support_diversity_ratio=0.90,
             posterior_entropy=3.5,
             gap_ratio=0.12,
@@ -309,7 +310,7 @@ class ProbeControllerTests(unittest.TestCase):
             confidence=0.72,
             uncertainty_scalar=0.08,
             future_probe_error=0.40,
-            support_count=2,
+            support_count=4,
             support_diversity_ratio=0.90,
             posterior_entropy=3.5,
             gap_ratio=0.36,
@@ -326,7 +327,7 @@ class ProbeControllerTests(unittest.TestCase):
             confidence=0.72,
             uncertainty_scalar=0.08,
             future_probe_error=0.40,
-            support_count=2,
+            support_count=4,
             support_diversity_ratio=0.90,
             posterior_entropy=3.5,
             gap_ratio=0.12,
@@ -340,7 +341,7 @@ class ProbeControllerTests(unittest.TestCase):
             confidence=0.72,
             uncertainty_scalar=0.08,
             future_probe_error=0.40,
-            support_count=2,
+            support_count=4,
             support_diversity_ratio=0.90,
             posterior_entropy=3.5,
             gap_ratio=0.12,
@@ -354,7 +355,7 @@ class ProbeControllerTests(unittest.TestCase):
         self.assertTrue(ready)
         self.assertFalse(not_ready)
 
-    def test_env_expression_ready_accepts_near_ready_two_support_case_after_calibration(self):
+    def test_env_expression_ready_rejects_near_ready_two_support_case(self):
         ready = env_expression_is_ready(
             confidence=0.34,
             uncertainty_scalar=0.08,
@@ -372,7 +373,7 @@ class ProbeControllerTests(unittest.TestCase):
             uncertainty_probe_threshold=0.10,
         )
 
-        self.assertTrue(ready)
+        self.assertFalse(ready)
 
     def test_near_ready_thresholds_do_not_override_weak_geometry(self):
         not_ready = env_expression_is_ready(
@@ -381,7 +382,7 @@ class ProbeControllerTests(unittest.TestCase):
             future_probe_error=0.62,
             heldout_family_future_error=0.58,
             support_size_matched_future_error=0.72,
-            support_count=2,
+            support_count=4,
             support_diversity_ratio=0.86,
             posterior_entropy=4.4,
             gap_ratio=0.36,
@@ -480,13 +481,13 @@ class ProbeControllerTests(unittest.TestCase):
             readiness_score=readiness_score,
         )
         diag_mode, diag_blocker = compute_message_mode(
-            support_count=1,
+            support_count=2,
             confidence=0.55,
             readiness_components=components,
             readiness_score=readiness_score,
         )
         on_mode, on_blocker = compute_message_mode(
-            support_count=2,
+            support_count=4,
             confidence=0.55,
             readiness_components=components,
             readiness_score=readiness_score,
@@ -500,7 +501,7 @@ class ProbeControllerTests(unittest.TestCase):
         self.assertEqual(on_mode, "on")
         self.assertEqual(on_blocker, "enabled")
 
-    def test_message_mode_turns_near_ready_two_support_expression_on_after_calibration(self):
+    def test_message_mode_keeps_near_ready_two_support_expression_diagnostic(self):
         components = compute_env_expression_readiness_components(
             future_probe_error=0.62,
             heldout_family_future_error=0.58,
@@ -526,8 +527,8 @@ class ProbeControllerTests(unittest.TestCase):
         self.assertLess(readiness_score, 0.62)
         self.assertLess(0.34, 0.40)
         self.assertGreaterEqual(0.34, 0.32)
-        self.assertEqual(message_mode, "on")
-        self.assertEqual(blocker, "enabled")
+        self.assertEqual(message_mode, "diag")
+        self.assertEqual(blocker, "support_count")
 
     def test_low_confidence_message_enters_diag_instead_of_staying_off(self):
         components = compute_env_expression_readiness_components(
@@ -546,7 +547,7 @@ class ProbeControllerTests(unittest.TestCase):
         readiness_score = min(components.values())
 
         diag_mode, diag_blocker = compute_message_mode(
-            support_count=1,
+            support_count=2,
             confidence=0.10,
             readiness_components=components,
             readiness_score=readiness_score,
@@ -564,7 +565,7 @@ class ProbeControllerTests(unittest.TestCase):
         }
 
         diag_mode, diag_blocker = compute_message_mode(
-            support_count=1,
+            support_count=2,
             confidence=0.70,
             readiness_components=readiness_components,
             readiness_score=0.25,
@@ -680,6 +681,21 @@ class ProbeControllerTests(unittest.TestCase):
                 "online_offline_gap": 0.02,
             },
         )
+        marginal_live_geometry = EnvExpression(
+            vector=torch.tensor([0.25, -0.5], dtype=torch.float32).numpy(),
+            confidence=0.8,
+            ready=True,
+            uncertainty_scalar=0.1,
+            compressed=False,
+            metadata={
+                "readiness_score": 0.75,
+                "future_probe_quality": 0.72,
+                "subset_stability": 1.0,
+                "online_subset_stability": 0.55,
+                "online_geometry_complete": True,
+                "online_offline_gap": 0.02,
+            },
+        )
         strong_live_geometry = EnvExpression(
             vector=torch.tensor([0.25, -0.5], dtype=torch.float32).numpy(),
             confidence=0.8,
@@ -697,6 +713,7 @@ class ProbeControllerTests(unittest.TestCase):
         )
 
         self.assertFalse(fair_env_expression_enabled(env_expression=weak_live_geometry))
+        self.assertFalse(fair_env_expression_enabled(env_expression=marginal_live_geometry))
         self.assertTrue(fair_env_expression_enabled(env_expression=strong_live_geometry))
 
     def test_solver_episode_expression_keeps_confidence_and_ready(self):
@@ -777,7 +794,7 @@ class ProbeControllerTests(unittest.TestCase):
         self.assertFalse(fair_env_expression_enabled(env_expression=low_trust_expression))
         self.assertFalse(fair_env_expression_enabled(env_expression=not_ready_expression))
 
-    def test_fair_expression_enabled_accepts_near_ready_on_message_after_calibration(self):
+    def test_fair_expression_enabled_rejects_near_ready_on_message(self):
         near_ready_expression = EnvExpression(
             vector=torch.tensor([0.25, -0.5], dtype=torch.float32).numpy(),
             confidence=0.36,
@@ -803,7 +820,35 @@ class ProbeControllerTests(unittest.TestCase):
             near_ready_expression.metadata["readiness_score"],
             0.62,
         )
-        self.assertTrue(fair_env_expression_enabled(env_expression=near_ready_expression))
+        self.assertFalse(fair_env_expression_enabled(env_expression=near_ready_expression))
+
+    def test_strict_fair_expression_mutes_on_message_that_fails_fair_gate(self):
+        near_ready_expression = EnvExpression(
+            vector=torch.tensor([0.25, -0.5], dtype=torch.float32).numpy(),
+            confidence=0.36,
+            ready=True,
+            uncertainty_scalar=0.1,
+            compressed=False,
+            metadata={
+                "message_mode": "on",
+                "readiness_score": 0.57,
+                "future_probe_quality": 0.57,
+                "online_subset_stability": 0.55,
+                "online_geometry_complete": True,
+                "online_offline_gap": 0.02,
+            },
+        )
+
+        solver_expression, expression_scale = build_solver_episode_expression(
+            env_expression=near_ready_expression,
+            current_episode=24,
+            total_episodes=200,
+            disable_env_expression=False,
+            strict_fair_mode=True,
+        )
+
+        self.assertEqual(expression_scale, 0.0)
+        self.assertAlmostEqual(float(solver_expression[-2]), 0.0, places=6)
 
     def test_fair_expression_enabled_blocks_confidence_below_new_floor(self):
         low_conf_expression = EnvExpression(
@@ -1042,7 +1087,7 @@ class ProbeControllerTests(unittest.TestCase):
         self.assertAlmostEqual(float(muted_solver_expression[-2]), 0.0, places=6)
         self.assertAlmostEqual(float(muted_solver_expression[-1]), 0.1, places=6)
 
-    def test_solver_episode_expression_allows_capped_diag_message_in_strict_fair_mode(self):
+    def test_solver_episode_expression_mutes_diag_message_in_strict_fair_mode(self):
         diag_expression = EnvExpression(
             vector=torch.tensor([0.25, -0.5], dtype=torch.float32).numpy(),
             confidence=0.8,
@@ -1069,11 +1114,10 @@ class ProbeControllerTests(unittest.TestCase):
             strict_fair_mode=True,
         )
 
-        self.assertGreater(expression_scale, 0.0)
-        self.assertGreaterEqual(expression_scale, 0.12)
-        self.assertLessEqual(expression_scale, 0.20)
+        self.assertEqual(expression_scale, 0.0)
+        self.assertAlmostEqual(float(solver_expression[-2]), 0.0, places=6)
 
-    def test_strict_fair_diag_scale_softens_weaker_messages(self):
+    def test_non_strict_diag_scale_softens_weaker_messages(self):
         strong_diag_expression = EnvExpression(
             vector=torch.tensor([0.25, -0.5], dtype=torch.float32).numpy(),
             confidence=0.8,
@@ -1114,19 +1158,28 @@ class ProbeControllerTests(unittest.TestCase):
             current_episode=18,
             total_episodes=200,
             disable_env_expression=False,
-            strict_fair_mode=True,
+            strict_fair_mode=False,
         )
         _weak_solver_expression, weak_scale = build_solver_episode_expression(
             env_expression=weak_diag_expression,
             current_episode=18,
             total_episodes=200,
             disable_env_expression=False,
-            strict_fair_mode=True,
+            strict_fair_mode=False,
+        )
+        strong_strict_diag_scale = compute_strict_fair_diagnostic_scale(
+            env_expression=strong_diag_expression,
+            base_scale=0.0,
+        )
+        weak_strict_diag_scale = compute_strict_fair_diagnostic_scale(
+            env_expression=weak_diag_expression,
+            base_scale=0.0,
         )
 
         self.assertGreater(strong_scale, weak_scale)
-        self.assertLess(weak_scale, DEFAULT_DIAGNOSTIC_SCALE_FLOOR)
-        self.assertGreater(weak_scale, 0.0)
+        self.assertGreater(strong_strict_diag_scale, weak_strict_diag_scale)
+        self.assertLess(weak_strict_diag_scale, DEFAULT_DIAGNOSTIC_SCALE_FLOOR)
+        self.assertGreater(weak_strict_diag_scale, 0.0)
 
     def test_solver_episode_expression_can_force_small_eval_message_through_off_gate(self):
         off_expression = EnvExpression(

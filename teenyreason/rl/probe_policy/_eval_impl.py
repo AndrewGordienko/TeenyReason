@@ -31,7 +31,7 @@ from ...probe.probe_latent import (
     select_episode_physics,
     update_recurrent_belief_from_window,
 )
-from ..core.ppo_core import (
+from ..core import (
     BeliefNativeActorCritic,
     PlainGaussianActorCritic,
     ProbeConditionedGaussianActorCritic,

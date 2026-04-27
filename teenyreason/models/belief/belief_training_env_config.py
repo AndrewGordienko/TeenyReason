@@ -40,6 +40,7 @@ def build_env_belief_phase_config(
     phase_a_end = 1.0 / 3.0
     phase_b_end = 2.0 / 3.0
     metric_scale_ceiling = 0.40
+    metric_scale_floor = 0.0
     controller_scale_ceiling = 1.0
     env_expression_scale_ceiling = 0.95
     metric_gate_active = False
@@ -64,11 +65,13 @@ def build_env_belief_phase_config(
         metric_gate_active = True
         if "split_retrieval" not in metric_gate_reasons:
             metric_gate_reasons.append("split_retrieval")
-        metric_scale_ceiling = max(metric_scale_ceiling, 0.42)
+        metric_scale_ceiling = max(metric_scale_ceiling, 0.52)
+        metric_scale_floor = max(metric_scale_floor, 0.08)
         env_expression_scale_ceiling = min(env_expression_scale_ceiling, 0.82)
         controller_scale_ceiling = min(controller_scale_ceiling, 0.45)
     if split_retrieval_value is not None and split_retrieval_value < 0.10:
-        metric_scale_ceiling = max(metric_scale_ceiling, 0.48)
+        metric_scale_ceiling = max(metric_scale_ceiling, 0.60)
+        metric_scale_floor = max(metric_scale_floor, 0.14)
         env_expression_scale_ceiling = min(env_expression_scale_ceiling, 0.72)
         controller_scale_ceiling = min(controller_scale_ceiling, 0.28)
     metric_gate_reason = "+".join(metric_gate_reasons) if metric_gate_reasons else "ok"
@@ -76,7 +79,7 @@ def build_env_belief_phase_config(
         return EnvBeliefPhaseConfig(
             name="phase_a_handoff",
             predictive_scale=1.0,
-            metric_scale=0.0,
+            metric_scale=metric_scale_floor,
             env_expression_scale=min(0.46, env_expression_scale_ceiling),
             controller_scale=min(0.06, controller_scale_ceiling),
             uncertainty_scale=0.30,
@@ -90,7 +93,7 @@ def build_env_belief_phase_config(
         return EnvBeliefPhaseConfig(
             name="phase_b_metric",
             predictive_scale=1.0,
-            metric_scale=float(metric_scale_ceiling * metric_progress),
+            metric_scale=float(max(metric_scale_floor, metric_scale_ceiling * metric_progress)),
             env_expression_scale=min(0.66, env_expression_scale_ceiling),
             controller_scale=float(
                 controller_phase_b_target * (0.35 + 0.65 * metric_progress)
@@ -137,11 +140,20 @@ def build_primary_env_loss_terms(
     env_leaveout_consistency_loss: torch.Tensor,
     env_split_contrastive_loss: torch.Tensor,
     env_retrieval_loss: torch.Tensor,
+    raw_env_retrieval_loss: torch.Tensor,
     env_retrieval_margin_loss: torch.Tensor,
+    raw_env_retrieval_margin_loss: torch.Tensor,
     env_gap_ratio_loss: torch.Tensor,
+    raw_env_gap_ratio_loss: torch.Tensor,
     env_unit_gap_ratio_loss: torch.Tensor,
     env_unit_retrieval_margin_loss: torch.Tensor,
     env_metric_geometry_loss: torch.Tensor,
+    env_spread_loss: torch.Tensor,
+    raw_env_spread_loss: torch.Tensor,
+    env_uniformity_loss: torch.Tensor,
+    raw_env_uniformity_loss: torch.Tensor,
+    env_vicreg_loss: torch.Tensor,
+    raw_env_vicreg_loss: torch.Tensor,
     env_mode_adversary_loss: torch.Tensor,
     uncertainty_calibration_loss: torch.Tensor,
     env_expression_loss: torch.Tensor,
@@ -157,8 +169,13 @@ def build_primary_env_loss_terms(
     """Assemble the smaller primary objective used for env-belief training."""
     gate_reasons = set(str(phase.metric_gate_reason).split("+"))
     leakage_control_scale = 0.06 + phase.metric_scale * 0.08
+    retrieval_pressure = 1.0
+    anti_collapse_pressure = 1.0
     if "probe_leakage" in gate_reasons:
         leakage_control_scale += 0.10
+    if "split_retrieval" in gate_reasons:
+        retrieval_pressure = 2.0
+        anti_collapse_pressure = 1.8
     return {
         "physics": physics_loss_weight * (env_param_loss + 0.85 * mechanics_posterior_loss),
         "env_consistency": env_consistency_loss_weight * env_split_loss,
@@ -166,13 +183,55 @@ def build_primary_env_loss_terms(
         "env_family_future": phase.predictive_scale * 0.42 * env_family_future_loss,
         "env_leaveout_future": phase.predictive_scale * 0.40 * env_leaveout_future_loss,
         "env_leaveout_consistency": phase.predictive_scale * 0.20 * env_leaveout_consistency_loss,
-        "env_contrastive": phase.metric_scale * 0.04 * contrastive_loss_weight * env_split_contrastive_loss,
-        "env_retrieval": phase.metric_scale * 0.08 * env_retrieval_loss_weight * env_retrieval_loss,
-        "env_retrieval_margin": phase.metric_scale * 0.06 * env_retrieval_margin_loss,
-        "env_gap_ratio": phase.metric_scale * 0.06 * env_gap_ratio_loss,
-        "env_unit_gap_ratio": phase.metric_scale * 0.18 * env_unit_gap_ratio_loss,
-        "env_unit_retrieval_margin": phase.metric_scale * 0.16 * env_unit_retrieval_margin_loss,
-        "env_metric_geometry": phase.metric_scale * 0.05 * env_metric_geometry_loss,
+        "env_contrastive": (
+            phase.metric_scale
+            * 0.07
+            * retrieval_pressure
+            * contrastive_loss_weight
+            * env_split_contrastive_loss
+        ),
+        "env_retrieval": (
+            phase.metric_scale
+            * 0.18
+            * retrieval_pressure
+            * env_retrieval_loss_weight
+            * env_retrieval_loss
+        ),
+        "raw_env_retrieval": (
+            phase.metric_scale
+            * 0.12
+            * retrieval_pressure
+            * env_retrieval_loss_weight
+            * raw_env_retrieval_loss
+        ),
+        "env_retrieval_margin": phase.metric_scale * 0.12 * retrieval_pressure * env_retrieval_margin_loss,
+        "raw_env_retrieval_margin": (
+            phase.metric_scale
+            * 0.10
+            * retrieval_pressure
+            * raw_env_retrieval_margin_loss
+        ),
+        "env_gap_ratio": phase.metric_scale * 0.12 * retrieval_pressure * env_gap_ratio_loss,
+        "raw_env_gap_ratio": phase.metric_scale * 0.10 * retrieval_pressure * raw_env_gap_ratio_loss,
+        "env_unit_gap_ratio": phase.metric_scale * 0.22 * retrieval_pressure * env_unit_gap_ratio_loss,
+        "env_unit_retrieval_margin": (
+            phase.metric_scale
+            * 0.20
+            * retrieval_pressure
+            * env_unit_retrieval_margin_loss
+        ),
+        "env_metric_geometry": (
+            phase.metric_scale
+            * 0.08
+            * anti_collapse_pressure
+            * env_metric_geometry_loss
+        ),
+        "env_spread": phase.metric_scale * 0.16 * anti_collapse_pressure * env_spread_loss,
+        "raw_env_spread": phase.metric_scale * 0.12 * anti_collapse_pressure * raw_env_spread_loss,
+        "env_uniformity": phase.metric_scale * 0.08 * anti_collapse_pressure * env_uniformity_loss,
+        "raw_env_uniformity": phase.metric_scale * 0.06 * anti_collapse_pressure * raw_env_uniformity_loss,
+        "env_vicreg": phase.metric_scale * 0.14 * anti_collapse_pressure * env_vicreg_loss,
+        "raw_env_vicreg": phase.metric_scale * 0.10 * anti_collapse_pressure * raw_env_vicreg_loss,
         "env_leakage_control": leakage_control_scale * env_mode_adversary_loss,
         "uncertainty_calibration": phase.uncertainty_scale * 0.22 * uncertainty_calibration_loss,
         "env_expression": phase.env_expression_scale * 0.34 * env_expression_loss,

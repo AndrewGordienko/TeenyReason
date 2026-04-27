@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from ..core.ppo_core import RunningNormalizer
+from ..core import RunningNormalizer
 
 
 def default_family_metric_counter(family_names: tuple[str, ...]) -> dict[str, float]:

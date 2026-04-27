@@ -365,6 +365,7 @@ class ProbeCrawler:
             action_space=self.env.action_space,
             action_values=self.action_values,
             rng=self.rng,
+            env_name=self.env_name,
         )
         if planner is None:
             raise ValueError("Active dataset requested without a scientist planner")
@@ -381,17 +382,39 @@ class ProbeCrawler:
             else max(1, int(raw_max_windows_per_rollout))
         )
         min_windows_per_env = int(getattr(planner, "min_windows_per_env", len(support_goal_sequence)))
+        min_windows_per_family = max(1, int(getattr(planner, "min_windows_per_family", 1)))
         max_support_retry_rollouts = int(
             getattr(planner, "max_support_retry_rollouts", len(support_goal_sequence))
         )
+        required_window_counts = {
+            goal: min_windows_per_family
+            for goal in support_goal_sequence
+            if goal is not None
+        }
+
+        def count_goal_windows(start_idx: int) -> Counter[str]:
+            return Counter(str(window.probe_mode) for window in self.windows[start_idx:])
 
         for env_instance_id in range(env_instances):
             episode_physics = sample_env_params(self.rng, self.base_physics) if self.randomize_physics else self.base_physics
             planner.begin_env_instance()
             env_window_start = len(self.windows)
-            rollout_budget = len(support_goal_sequence) + max(0, max_support_retry_rollouts)
+            rollout_budget = (
+                len(support_goal_sequence) * min_windows_per_family
+                + max(0, max_support_retry_rollouts)
+            )
             for rollout_idx in range(rollout_budget):
-                primary_goal = support_goal_sequence[rollout_idx % len(support_goal_sequence)]
+                goal_counts = count_goal_windows(env_window_start)
+                undercovered_goals = [
+                    goal
+                    for goal in support_goal_sequence
+                    if goal is not None and goal_counts[str(goal)] < required_window_counts.get(goal, 1)
+                ]
+                primary_goal = (
+                    undercovered_goals[0]
+                    if undercovered_goals
+                    else support_goal_sequence[rollout_idx % len(support_goal_sequence)]
+                )
                 self.run_active_probe_episode(
                     env_instance_id=env_instance_id,
                     episode_id=episode_id,
@@ -405,8 +428,17 @@ class ProbeCrawler:
                 )
                 episode_id += 1
                 env_window_count = len(self.windows) - env_window_start
+                goal_counts = count_goal_windows(env_window_start)
+                completed_family_targets = all(
+                    goal_counts[str(goal)] >= required_count
+                    for goal, required_count in required_window_counts.items()
+                )
                 completed_support_cycle = rollout_idx + 1 >= len(support_goal_sequence)
-                if completed_support_cycle and env_window_count >= max(1, min_windows_per_env):
+                if (
+                    completed_support_cycle
+                    and completed_family_targets
+                    and env_window_count >= max(1, min_windows_per_env)
+                ):
                     break
 
     def collect(self, episodes_per_mode: int = 20, max_steps: int = 200):
@@ -421,6 +453,7 @@ class ProbeCrawler:
             action_space=self.env.action_space,
             action_values=self.action_values,
             rng=self.rng,
+            env_name=self.env_name,
         ) is not None:
             self._collect_active_dataset(env_instances=episodes_per_mode, max_steps=max_steps)
             return

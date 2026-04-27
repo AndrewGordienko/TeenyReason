@@ -26,6 +26,7 @@ from .benchmark_support import (
     benchmark_profile_flags,
     classify_probe_run,
     compute_belief_progress_index,
+    compute_system_id_progress_index,
     default_seeds_for_profile,
     full_system_display_label,
     matched_eval_summary_dict,
@@ -73,6 +74,12 @@ def print_array_shapes(title: str, arrays: dict[str, np.ndarray]):
     for key, value in arrays.items():
         if isinstance(value, np.ndarray):
             print(f"  {key}: {value.shape}")
+
+
+def snapshot_mean(snapshot: dict, key: str, default: float = 0.0) -> float:
+    """Read one scalar mean from a snapshot field if it exists."""
+    values = np.asarray(snapshot.get(key, np.asarray([], dtype=np.float32)), dtype=np.float32)
+    return float(np.mean(values)) if values.size else float(default)
 
 
 def run_single_seed(
@@ -130,6 +137,13 @@ def run_single_seed(
         z_dim=config.z_dim,
         window_size=config.window_size,
         action_vocab_size=crawler.action_dim,
+        belief_mode=config.belief_mode,
+        sysid_epochs=config.sysid_epochs,
+        sysid_batch_size=config.sysid_batch_size,
+        sysid_lr=config.sysid_lr,
+        sysid_negative_count=config.sysid_negative_count,
+        sysid_particle_count=config.sysid_particle_count,
+        sysid_likelihood_scale=config.sysid_likelihood_scale,
         progress_callback=None if live_trace is None else live_trace.record_encoder_epoch,
         epochs=config.encoder_epochs,
         batch_size=config.encoder_batch_size,
@@ -168,6 +182,7 @@ def run_single_seed(
         benchmark_tag=config.benchmark_tag,
         support_size=config.encoder_belief_subset_size,
         subset_count=config.encoder_belief_subset_count,
+        crawler_bundle=crawler_bundle,
     )
     latent_snapshot_path = Path("artifacts") / f"{artifact_tag}_latent_snapshot.npz"
     save_latent_snapshot(latent_snapshot_path, latent_snapshot)
@@ -184,6 +199,14 @@ def run_single_seed(
     latent_split_mean_b = latent_snapshot.get(
         "env_metric_split_mean_b",
         latent_snapshot["env_split_mean_b"],
+    ).astype(np.float32)
+    latent_cross_split_mean_a = latent_snapshot.get(
+        "env_cross_family_metric_split_mean_a",
+        latent_split_mean_a,
+    ).astype(np.float32)
+    latent_cross_split_mean_b = latent_snapshot.get(
+        "env_cross_family_metric_split_mean_b",
+        latent_split_mean_b,
     ).astype(np.float32)
     latent_env_params = latent_snapshot["env_params"].astype(np.float32)
     latent_env_uncertainty = latent_snapshot.get(
@@ -206,6 +229,10 @@ def run_single_seed(
         latent_split_mean_a,
         latent_split_mean_b,
     )
+    latent_cross_split_stats = compute_split_retrieval_stats(
+        latent_cross_split_mean_a,
+        latent_cross_split_mean_b,
+    )
     latent_neighbor_alignment = compute_neighbor_env_alignment(
         latent_metric_mean,
         latent_env_params,
@@ -218,6 +245,11 @@ def run_single_seed(
         latent_metric_mean,
         latent_split_mean_a,
         latent_split_mean_b,
+    )
+    latent_cross_gap_ratio = compute_same_env_gap_ratio(
+        latent_metric_mean,
+        latent_cross_split_mean_a,
+        latent_cross_split_mean_b,
     )
     latent_uncertainty_alignment = compute_uncertainty_error_alignment(
         latent_env_uncertainty,
@@ -236,10 +268,37 @@ def run_single_seed(
     latent_belief_progress_index = compute_belief_progress_index(
         mechanics_fit=latent_mechanics_fit,
         neighbor_alignment=latent_neighbor_alignment,
-        split_retrieval=float(latent_split_stats["top1"]),
+        split_retrieval=float(latent_cross_split_stats["top1"]),
         heldout_probe_error=latent_heldout_probe_error,
         uncert_error_corr=float(latent_uncertainty_alignment["correlation"]),
         probe_leakage=latent_probe_leakage,
+    )
+    sysid_metrics = dict(getattr(crawler_bundle, "sysid_validation_metrics", {}) or {})
+    belief_mode = str(getattr(crawler_bundle, "belief_mode", config.belief_mode))
+    sysid_trusted = bool(getattr(crawler_bundle, "sysid_trusted", False))
+    sysid_validation_top1 = float(sysid_metrics.get("validation_top1", 0.0))
+    sysid_validation_margin = float(sysid_metrics.get("validation_margin", 0.0))
+    sysid_validation_nll = float(sysid_metrics.get("validation_nll", 0.0))
+    particle_entropy_mean = snapshot_mean(latent_snapshot, "particle_entropy")
+    particle_entropy_norm_mean = snapshot_mean(latent_snapshot, "particle_entropy_norm")
+    particle_ess_ratio_mean = snapshot_mean(latent_snapshot, "particle_ess_ratio")
+    particle_leaveout_shift_mean = snapshot_mean(latent_snapshot, "particle_leaveout_shift")
+    particle_subset_stability_mean = snapshot_mean(
+        latent_snapshot,
+        "particle_subset_stability",
+        default=float("nan"),
+    )
+    if not np.isfinite(particle_subset_stability_mean):
+        particle_subset_stability_mean = float(
+            np.clip(1.0 - particle_leaveout_shift_mean / 0.35, 0.0, 1.0)
+        )
+    system_id_progress_index = compute_system_id_progress_index(
+        trusted=sysid_trusted,
+        validation_top1=sysid_validation_top1,
+        validation_margin=sysid_validation_margin,
+        particle_entropy_norm=particle_entropy_norm_mean,
+        particle_ess_ratio=particle_ess_ratio_mean,
+        particle_leaveout_shift=particle_leaveout_shift_mean,
     )
     latent_support_diagnostics = build_latent_support_diagnostics(latent_snapshot)
 
@@ -1019,18 +1078,34 @@ def run_single_seed(
         f"bpi={latent_belief_progress_index:.3f} | "
         f"fit={latent_mechanics_fit:.3f} | "
         f"neighbor={latent_neighbor_alignment:.3f} | "
-        f"split-top1={float(latent_split_stats['top1']):.3f} | "
-        f"gap={float(latent_gap_ratio['mean']):.3f} | "
+        f"paired-top1={float(latent_split_stats['top1']):.3f} | "
+        f"cross-top1={float(latent_cross_split_stats['top1']):.3f} | "
+        f"gap={float(latent_cross_gap_ratio['mean']):.3f} | "
         f"leak={latent_probe_leakage:.3f} | "
         f"uncert-corr={float(latent_uncertainty_alignment['correlation']):.3f}"
     )
+    if belief_mode == "particle_sysid":
+        print(
+            "System-ID progress: "
+            f"score={system_id_progress_index:.3f} | "
+            f"trusted={sysid_trusted} | "
+            f"top1={sysid_validation_top1:.3f} | "
+            f"margin={sysid_validation_margin:.3f} | "
+            f"entropy={particle_entropy_mean:.3f} | "
+            f"ess={particle_ess_ratio_mean:.3f} | "
+            f"leaveout={particle_leaveout_shift_mean:.3f}"
+        )
     print(
         "Belief support: "
         f"center={float(latent_support_diagnostics['center_window_share']):.3f} | "
         f"directional={float(latent_support_diagnostics['directional_window_share']):.3f} | "
+        f"mechanics={float(latent_support_diagnostics.get('mechanics_window_share', 0.0)):.3f} | "
+        f"passive={float(latent_support_diagnostics.get('passive_window_share', 0.0)):.3f} | "
+        f"stress={float(latent_support_diagnostics.get('stress_window_share', 0.0)):.3f} | "
         f"eff-family={float(latent_support_diagnostics['effective_window_families']):.2f} | "
         f"support/env={float(latent_support_diagnostics['support_count_mean']):.1f} | "
         f"split-overlap={float(latent_support_diagnostics['split_group_overlap_mean']):.3f} | "
+        f"cross-overlap={float(latent_support_diagnostics.get('cross_family_split_group_overlap_mean', 0.0)):.3f} | "
         f"window-leak={float(latent_support_diagnostics['window_mode_leakage']):.3f} | "
         f"nearest={float(latent_support_diagnostics['nearest_between_median']):.4f}"
     )
@@ -1252,15 +1327,29 @@ def run_single_seed(
         "probe_message_ablation_config_diff": probe_result.message_ablation_config_diff,
         "probe_teacher_action_agreement": probe_result.teacher_action_agreement,
         "latent_mechanics_fit": float(latent_mechanics_fit),
-        "latent_split_mrr": float(latent_split_stats["mrr"]),
-        "latent_split_top1": float(latent_split_stats["top1"]),
+        "latent_split_mrr": float(latent_cross_split_stats["mrr"]),
+        "latent_paired_split_mrr": float(latent_split_stats["mrr"]),
+        "latent_split_top1": float(latent_cross_split_stats["top1"]),
+        "latent_paired_split_top1": float(latent_split_stats["top1"]),
         "latent_neighbor_alignment": float(latent_neighbor_alignment),
-        "latent_gap_ratio": float(latent_gap_ratio["mean"]),
+        "latent_gap_ratio": float(latent_cross_gap_ratio["mean"]),
+        "latent_paired_gap_ratio": float(latent_gap_ratio["mean"]),
         "latent_heldout_probe_error": float(latent_heldout_probe_error),
         "latent_probe_leakage": float(latent_probe_leakage),
         "latent_uncert_error_corr": float(latent_uncertainty_alignment["correlation"]),
         "latent_support_diagnostics": latent_support_diagnostics,
         "belief_progress_index": float(latent_belief_progress_index),
+        "belief_mode": belief_mode,
+        "system_id_progress_index": float(system_id_progress_index),
+        "sysid_trusted": bool(sysid_trusted),
+        "sysid_validation_top1": float(sysid_validation_top1),
+        "sysid_validation_margin": float(sysid_validation_margin),
+        "sysid_validation_nll": float(sysid_validation_nll),
+        "particle_entropy_mean": float(particle_entropy_mean),
+        "particle_entropy_norm_mean": float(particle_entropy_norm_mean),
+        "particle_ess_ratio_mean": float(particle_ess_ratio_mean),
+        "particle_leaveout_shift_mean": float(particle_leaveout_shift_mean),
+        "particle_subset_stability_mean": float(particle_subset_stability_mean),
         "probe_run_classification": probe_run_classification,
         "full_system_learned_eval_summary": full_system_learned_eval_summary,
         "full_system_state_only_eval_summary": full_system_state_only_eval_summary,

@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from ..core.ppo_core import (
+from ..core import (
     action_scale_bias,
     init_linear,
     sanitize_numpy,

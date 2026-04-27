@@ -12,7 +12,13 @@ from .benchmark_support import (
     print_solve_summary,
     probe_strict_usage_status,
 )
-from .probe_health import format_status, geometry_status, signal_status, utility_status
+from .probe_health import (
+    format_status,
+    geometry_status,
+    signal_status,
+    system_id_geometry_status,
+    utility_status,
+)
 from .config import ExperimentConfig
 from .live_trace import LiveTrainingTraceWriter
 
@@ -323,6 +329,50 @@ def finalize_benchmark_run(
         float(item["belief_progress_index"] or 0.0)
         for item in results
     ]
+    belief_mode = [
+        str(item.get("belief_mode", config.belief_mode))
+        for item in results
+    ]
+    system_id_progress_index = [
+        float(item.get("system_id_progress_index", 0.0) or 0.0)
+        for item in results
+    ]
+    sysid_trusted = [
+        1.0 if bool(item.get("sysid_trusted", False)) else 0.0
+        for item in results
+    ]
+    sysid_validation_top1 = [
+        float(item.get("sysid_validation_top1", 0.0) or 0.0)
+        for item in results
+    ]
+    sysid_validation_margin = [
+        float(item.get("sysid_validation_margin", 0.0) or 0.0)
+        for item in results
+    ]
+    sysid_validation_nll = [
+        float(item.get("sysid_validation_nll", 0.0) or 0.0)
+        for item in results
+    ]
+    particle_entropy_mean = [
+        float(item.get("particle_entropy_mean", 0.0) or 0.0)
+        for item in results
+    ]
+    particle_entropy_norm_mean = [
+        float(item.get("particle_entropy_norm_mean", 0.0) or 0.0)
+        for item in results
+    ]
+    particle_ess_ratio_mean = [
+        float(item.get("particle_ess_ratio_mean", 0.0) or 0.0)
+        for item in results
+    ]
+    particle_leaveout_shift_mean = [
+        float(item.get("particle_leaveout_shift_mean", 0.0) or 0.0)
+        for item in results
+    ]
+    particle_subset_stability_mean = [
+        float(item.get("particle_subset_stability_mean", 0.0) or 0.0)
+        for item in results
+    ]
     latent_mechanics_fit = [
         float(item["latent_mechanics_fit"] or 0.0)
         for item in results
@@ -559,6 +609,10 @@ def finalize_benchmark_run(
         probe_step_solves=probe_step_solves,
         probe_total_env_steps=probe_total_env_steps,
         probe_env_expression_delta=probe_env_expression_delta,
+        probe_no_expression_available=(
+            bool(probe_no_expression_completed_episodes)
+            and all(int(value) > 0 for value in probe_no_expression_completed_episodes)
+        ),
         probe_ready_fraction=probe_fair_ready_handoff_fraction,
         probe_muted_fraction=probe_fair_expression_force_muted_fraction,
         latent_mechanics_fit=latent_mechanics_fit,
@@ -635,15 +689,41 @@ def finalize_benchmark_run(
             f"probe_leaveout={leaveout_stability_mean:.3f} | "
             f"support_center={float((item.get('latent_support_diagnostics') or {}).get('center_window_share', 0.0)):.3f} | "
             f"support_dir={float((item.get('latent_support_diagnostics') or {}).get('directional_window_share', 0.0)):.3f} | "
+            f"support_mech={float((item.get('latent_support_diagnostics') or {}).get('mechanics_window_share', 0.0)):.3f} | "
+            f"support_passive={float((item.get('latent_support_diagnostics') or {}).get('passive_window_share', 0.0)):.3f} | "
+            f"support_stress={float((item.get('latent_support_diagnostics') or {}).get('stress_window_share', 0.0)):.3f} | "
             f"support_eff={float((item.get('latent_support_diagnostics') or {}).get('effective_window_families', 0.0)):.2f} | "
             f"window_leak={float((item.get('latent_support_diagnostics') or {}).get('window_mode_leakage', 0.0)):.3f} | "
             f"bpi={item['belief_progress_index']:.3f} | "
             f"class={item['probe_run_classification']}"
         )
+        if str(item.get("belief_mode", config.belief_mode)) == "particle_sysid":
+            print(
+                "  sysid | "
+                f"trusted={bool(item.get('sysid_trusted', False))} | "
+                f"top1={float(item.get('sysid_validation_top1', 0.0)):.3f} | "
+                f"margin={float(item.get('sysid_validation_margin', 0.0)):.3f} | "
+                f"ess={float(item.get('particle_ess_ratio_mean', 0.0)):.3f} | "
+                f"leaveout={float(item.get('particle_leaveout_shift_mean', 0.0)):.3f} | "
+                f"score={float(item.get('system_id_progress_index', 0.0)):.3f}"
+            )
+        if str(item.get("belief_mode", config.belief_mode)) == "particle_sysid":
+            geometry_label = system_id_geometry_status(
+                trusted=bool(item.get("sysid_trusted", False)),
+                validation_top1=float(item.get("sysid_validation_top1", 0.0)),
+                validation_margin=float(item.get("sysid_validation_margin", 0.0)),
+                leaveout_shift=float(item.get("particle_leaveout_shift_mean", 0.0)),
+                subset_stability=float(item.get("particle_subset_stability_mean", 0.0)),
+            )
+        else:
+            geometry_label = geometry_status(
+                split_mrr=item["latent_split_mrr"],
+                neighbor_alignment=item["latent_neighbor_alignment"],
+            )
         print(
             "  health | "
             f"{format_status('signal', signal_status(message_on_fraction=item['probe_message_on_fraction'], message_diag_fraction=item['probe_message_diag_fraction'], probe_expr_delta=item['probe_env_expression_delta']))} | "
-            f"{format_status('geometry', geometry_status(split_mrr=item['latent_split_mrr'], neighbor_alignment=item['latent_neighbor_alignment']))} | "
+            f"{format_status('geometry', geometry_label)} | "
             f"{format_status('utility', utility_status(baseline_episode=item['baseline_solve_episode'], probe_episode=item['probe_solve_episode'], no_message_episode=item['probe_no_expression_solve_episode']))}"
         )
         if (
@@ -667,13 +747,27 @@ def finalize_benchmark_run(
         "Latent Support Diagnostics: "
         f"center={_diag_median(latent_support_diagnostics, 'center_window_share'):.3f} | "
         f"directional={_diag_median(latent_support_diagnostics, 'directional_window_share'):.3f} | "
+        f"mechanics={_diag_median(latent_support_diagnostics, 'mechanics_window_share'):.3f} | "
+        f"passive={_diag_median(latent_support_diagnostics, 'passive_window_share'):.3f} | "
+        f"stress={_diag_median(latent_support_diagnostics, 'stress_window_share'):.3f} | "
         f"eff-family={_diag_median(latent_support_diagnostics, 'effective_window_families'):.2f} | "
         f"support/env={_diag_median(latent_support_diagnostics, 'support_count_mean'):.1f} | "
         f"split-overlap={_diag_median(latent_support_diagnostics, 'split_group_overlap_mean'):.3f} | "
+        f"cross-overlap={_diag_median(latent_support_diagnostics, 'cross_family_split_group_overlap_mean'):.3f} | "
         f"window-leak={_diag_median(latent_support_diagnostics, 'window_mode_leakage'):.3f} | "
         f"env-leak={_diag_median(latent_support_diagnostics, 'env_mode_leakage'):.3f} | "
         f"nearest={_diag_median(latent_support_diagnostics, 'nearest_between_median'):.4f}"
     )
+    if any(str(mode) == "particle_sysid" for mode in belief_mode):
+        print(
+            "System-ID Diagnostics: "
+            f"trusted={float(np.mean(np.asarray(sysid_trusted, dtype=np.float32))):.2f} | "
+            f"top1={float(np.median(np.asarray(sysid_validation_top1, dtype=np.float32))):.3f} | "
+            f"margin={float(np.median(np.asarray(sysid_validation_margin, dtype=np.float32))):.3f} | "
+            f"ess={float(np.median(np.asarray(particle_ess_ratio_mean, dtype=np.float32))):.3f} | "
+            f"leaveout={float(np.median(np.asarray(particle_leaveout_shift_mean, dtype=np.float32))):.3f} | "
+            f"score={float(np.median(np.asarray(system_id_progress_index, dtype=np.float32))):.3f}"
+        )
     print(
         "Latent Win Gate: "
         f"{'PASS' if bool(latent_win_gate['pass']) else 'BLOCKED'} | "
@@ -942,6 +1036,19 @@ def finalize_benchmark_run(
         ["" if value is None else str(value) for value in full_system_controller_style],
         ["" if value is None else str(value) for value in full_system_oracle_controller_style],
         ["" if value is None else str(value) for value in sim_fanout_controller_style],
+        extra_summary_fields={
+            "belief_mode": np.asarray(belief_mode, dtype="U"),
+            "system_id_progress_index": np.asarray(system_id_progress_index, dtype=np.float32),
+            "sysid_trusted": np.asarray(sysid_trusted, dtype=np.float32),
+            "sysid_validation_top1": np.asarray(sysid_validation_top1, dtype=np.float32),
+            "sysid_validation_margin": np.asarray(sysid_validation_margin, dtype=np.float32),
+            "sysid_validation_nll": np.asarray(sysid_validation_nll, dtype=np.float32),
+            "particle_entropy_mean": np.asarray(particle_entropy_mean, dtype=np.float32),
+            "particle_entropy_norm_mean": np.asarray(particle_entropy_norm_mean, dtype=np.float32),
+            "particle_ess_ratio_mean": np.asarray(particle_ess_ratio_mean, dtype=np.float32),
+            "particle_leaveout_shift_mean": np.asarray(particle_leaveout_shift_mean, dtype=np.float32),
+            "particle_subset_stability_mean": np.asarray(particle_subset_stability_mean, dtype=np.float32),
+        },
     )
     live_trace.finish(
         summary={

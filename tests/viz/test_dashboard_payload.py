@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
+from teenyreason.app.benchmark_diagnostics import build_latent_support_diagnostics
 from teenyreason.viz.dashboard import (
     build_benchmark_payload,
     build_index_payload,
@@ -15,6 +16,28 @@ from teenyreason.viz.payloads import build_support_validity_payload
 
 
 class DashboardPayloadTests(unittest.TestCase):
+    def test_dashboard_sim_fanout_delta_uses_same_sign_convention(self):
+        template_path = Path(__file__).resolve().parents[2] / "teenyreason" / "viz" / "templates" / "dashboard.html"
+        template = template_path.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "summaries.sim_fanout_episode.median - summaries.full_system_episode.median",
+            template,
+        )
+        self.assertNotIn(
+            "summaries.full_system_episode.median - summaries.sim_fanout_episode.median",
+            template,
+        )
+
+    def test_dashboard_does_not_call_protocol_delta_expression_when_strict_unused(self):
+        template_path = Path(__file__).resolve().parents[2] / "teenyreason" / "viz" / "templates" / "dashboard.html"
+        template = template_path.read_text(encoding="utf-8")
+
+        self.assertIn("strictExpressionActive", template)
+        self.assertIn("conditioned branch", template)
+        self.assertIn("strict unused", template)
+        self.assertIn("rather than proving learned message contribution", template)
+
     def test_summarize_solve_array_marks_skipped_variants_as_not_run(self):
         summary = summarize_solve_array(
             np.asarray([-1, -1], dtype=np.int64),
@@ -25,7 +48,7 @@ class DashboardPayloadTests(unittest.TestCase):
         self.assertEqual(summary["count"], 0)
         self.assertEqual(summary["values"], [])
 
-    def test_support_validity_accepts_paired_family_support(self):
+    def test_support_validity_rejects_pooled_support_that_exceeds_budget(self):
         payload = build_support_validity_payload(
             num_envs=8,
             num_windows=144,
@@ -36,8 +59,44 @@ class DashboardPayloadTests(unittest.TestCase):
             split_group_overlap_mean=1.0,
         )
 
+        self.assertFalse(payload["is_valid"])
+        self.assertIn("canonical support budget is being exceeded", payload["reasons"])
+
+    def test_support_validity_accepts_strict_cross_family_splits(self):
+        payload = build_support_validity_payload(
+            num_envs=50,
+            num_windows=300,
+            window_count_mean=6.0,
+            support_count_mean=4.0,
+            support_group_count_mean=4.0,
+            support_group_ratio_mean=1.0,
+            split_group_overlap_mean=0.0,
+        )
+
         self.assertTrue(payload["is_valid"])
-        self.assertNotIn("support diversity across probe families is narrow", payload["reasons"])
+        self.assertNotIn("split halves only partly overlap by probe family", payload["reasons"])
+
+    def test_latent_support_diagnostics_use_canonical_support_modes_when_available(self):
+        snapshot = {
+            "env_belief_mean": np.asarray([[0.0, 0.0], [0.2, 0.1]], dtype=np.float32),
+            "window_latent_mean": np.asarray(
+                [[0.0, 0.0], [0.1, 0.0], [0.2, 0.0], [0.3, 0.0], [0.4, 0.0], [0.5, 0.0]],
+                dtype=np.float32,
+            ),
+            "window_probe_mode": np.asarray(
+                ["passive_decay", "impulse_left", "chirp", "cart_brake", "boundary_push", "cart_brake"],
+                dtype="U",
+            ),
+            "window_is_support": np.asarray([1, 1, 1, 0, 0, 0], dtype=np.int8),
+            "env_window_count": np.asarray([3, 3], dtype=np.int32),
+            "env_support_count": np.asarray([3, 3], dtype=np.int32),
+        }
+
+        diagnostics = build_latent_support_diagnostics(snapshot)
+
+        self.assertAlmostEqual(diagnostics["mechanics_window_share"], 1.0)
+        self.assertAlmostEqual(diagnostics["stress_window_share"], 0.0)
+        self.assertAlmostEqual(diagnostics["available_stress_window_share"], 0.5)
 
     def test_latent_payload_flags_undercovered_snapshot(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -69,6 +128,45 @@ class DashboardPayloadTests(unittest.TestCase):
             self.assertEqual(payload["support_validity"]["status"], "invalid")
             self.assertFalse(payload["support_validity"]["is_valid"])
             self.assertIn("undercovered", payload["support_validity"]["headline"].lower())
+
+    def test_latent_payload_includes_system_id_block_without_dropping_latent_fields(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "toy_particle_snapshot.npz"
+            np.savez(
+                artifact_path,
+                env_belief_mean=np.asarray([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
+                projection_2d=np.asarray([[0.0, 0.1], [0.2, 0.3]], dtype=np.float32),
+                env_uncertainty=np.asarray([0.2, 0.3], dtype=np.float32),
+                env_params=np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+                env_window_count=np.asarray([4, 4], dtype=np.int32),
+                env_support_count=np.asarray([4, 4], dtype=np.int32),
+                env_support_group_ratio=np.asarray([1.0, 1.0], dtype=np.float32),
+                env_instance_id=np.asarray([0, 1], dtype=np.int32),
+                env_view_spread=np.asarray([[0.0, 0.0], [0.0, 0.0]], dtype=np.float32),
+                window_env_instance_id=np.asarray([0, 1], dtype=np.int32),
+                window_reward_sum=np.asarray([1.0, 1.5], dtype=np.float32),
+                window_probe_mode=np.asarray(["impulse_left", "impulse_right"], dtype="U"),
+                window_terminated=np.asarray([0, 0], dtype=np.int8),
+                window_latent_mean=np.asarray([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
+                env_param_names=np.asarray(["gravity", "masscart"], dtype="U"),
+                pca_explained=np.asarray([0.9, 0.1], dtype=np.float32),
+                particle_entropy=np.asarray([3.2, 2.8], dtype=np.float32),
+                particle_ess_ratio=np.asarray([0.72, 0.66], dtype=np.float32),
+                particle_leaveout_shift=np.asarray([0.08, 0.12], dtype=np.float32),
+                sysid_validation_top1=np.asarray([0.61], dtype=np.float32),
+                sysid_validation_margin=np.asarray([0.34], dtype=np.float32),
+                sysid_validation_nll=np.asarray([0.27], dtype=np.float32),
+                sysid_trusted=np.asarray([1.0], dtype=np.float32),
+            )
+
+            payload = build_latent_payload(artifact_path)
+
+            self.assertEqual(payload["summary"]["num_envs"], 2)
+            self.assertIn("points", payload)
+            self.assertTrue(payload["system_id"]["available"])
+            self.assertTrue(payload["system_id"]["trusted"])
+            self.assertAlmostEqual(payload["system_id"]["validation_top1"], 0.61, places=5)
+            self.assertAlmostEqual(payload["system_id"]["particle_ess_ratio_mean"], 0.69, places=5)
 
     def test_benchmark_payload_reads_family_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -159,7 +257,18 @@ class DashboardPayloadTests(unittest.TestCase):
                 probe_shadow_confidence_median=np.asarray([0.31], dtype=np.float32),
                 probe_shadow_strict_miss_fraction=np.asarray([0.15], dtype=np.float32),
                 probe_run_classification=np.asarray(["latent_win"], dtype="U"),
+                belief_mode=np.asarray(["particle_sysid"], dtype="U"),
                 belief_progress_index=np.asarray([0.61], dtype=np.float32),
+                system_id_progress_index=np.asarray([0.73], dtype=np.float32),
+                sysid_trusted=np.asarray([1.0], dtype=np.float32),
+                sysid_validation_top1=np.asarray([0.82], dtype=np.float32),
+                sysid_validation_margin=np.asarray([1.4], dtype=np.float32),
+                sysid_validation_nll=np.asarray([10.5], dtype=np.float32),
+                particle_entropy_mean=np.asarray([1.2], dtype=np.float32),
+                particle_entropy_norm_mean=np.asarray([0.25], dtype=np.float32),
+                particle_ess_ratio_mean=np.asarray([0.18], dtype=np.float32),
+                particle_leaveout_shift_mean=np.asarray([0.28], dtype=np.float32),
+                particle_subset_stability_mean=np.asarray([0.49], dtype=np.float32),
                 latent_mechanics_fit=np.asarray([0.52], dtype=np.float32),
                 latent_split_top1=np.asarray([0.24], dtype=np.float32),
                 latent_neighbor_alignment=np.asarray([0.31], dtype=np.float32),
@@ -173,6 +282,9 @@ class DashboardPayloadTests(unittest.TestCase):
                             {
                                 "center_window_share": 0.18,
                                 "directional_window_share": 0.72,
+                                "mechanics_window_share": 0.84,
+                                "passive_window_share": 0.14,
+                                "stress_window_share": 0.28,
                                 "effective_window_families": 4.2,
                                 "window_mode_leakage": 0.22,
                                 "env_mode_leakage": 0.09,
@@ -319,6 +431,9 @@ class DashboardPayloadTests(unittest.TestCase):
             self.assertAlmostEqual(row["latent_probe_leakage"], 0.11)
             self.assertAlmostEqual(row["latent_uncert_error_corr"], 0.23)
             self.assertAlmostEqual(row["latent_center_window_share"], 0.18)
+            self.assertAlmostEqual(row["latent_mechanics_window_share"], 0.84)
+            self.assertAlmostEqual(row["latent_passive_window_share"], 0.14)
+            self.assertAlmostEqual(row["latent_stress_window_share"], 0.28)
             self.assertAlmostEqual(row["latent_window_mode_leakage"], 0.22)
             self.assertAlmostEqual(
                 payload["summaries"]["latent_support_diagnostics"]["env_mode_leakage"],
@@ -347,6 +462,17 @@ class DashboardPayloadTests(unittest.TestCase):
             self.assertAlmostEqual(row["probe_shadow_expression_enabled_fraction"], 0.35)
             self.assertAlmostEqual(row["probe_shadow_strict_miss_fraction"], 0.15)
             self.assertEqual(row["probe_final_stop_reason"], "fair_two_probe_handoff")
+            self.assertEqual(row["belief_mode"], "particle_sysid")
+            self.assertTrue(row["sysid_trusted"])
+            self.assertAlmostEqual(row["sysid_validation_top1"], 0.82)
+            self.assertAlmostEqual(row["particle_leaveout_shift_mean"], 0.28)
+            self.assertTrue(payload["summaries"]["system_id"]["available"])
+            self.assertEqual(payload["summaries"]["system_id"]["mode"], "particle_sysid")
+            self.assertAlmostEqual(
+                payload["summaries"]["system_id"]["validation_top1_median"],
+                0.82,
+                places=5,
+            )
             self.assertEqual(row["probe_second_probe_selection_count"]["chirp"], 2)
             self.assertAlmostEqual(row["probe_second_probe_raw_future_gain_mean"], 0.06)
             self.assertAlmostEqual(row["probe_second_probe_future_estimate_mean"], 0.14)

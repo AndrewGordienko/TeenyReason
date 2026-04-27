@@ -42,6 +42,8 @@ def create_dashboard_app(artifact_dir: str | Path = "artifacts") -> Flask:
     template_dir = Path(__file__).with_name("templates")
     app = Flask(__name__, template_folder=str(template_dir))
     app.config["ARTIFACT_DIR"] = str(artifact_root)
+    app.config["TEMPLATES_AUTO_RELOAD"] = True
+    app.jinja_env.auto_reload = True
 
     @app.after_request
     def add_no_store_headers(response):

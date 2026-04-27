@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 
 from ...crawler.types import EnvExpression
-from ..core.ppo_core import sanitize_numpy
+from ..core import sanitize_numpy
 
 
 DEFAULT_EXPRESSION_UNCERTAINTY_THRESHOLD = 0.20
@@ -46,13 +46,14 @@ DEFAULT_SHADOW_CONFIDENCE_FLOOR = 0.30
 DEFAULT_SHADOW_SCALE_CAP = 0.20
 DEFAULT_FAIR_POLICY_FUTURE_QUALITY_FLOOR = 0.50
 DEFAULT_FAIR_POLICY_SUBSET_STABILITY_FLOOR = 0.45
+DEFAULT_FAIR_POLICY_LEAVEOUT_STABILITY_FLOOR = 0.55
 DEFAULT_FAIR_POLICY_CONFIDENCE_FLOOR = 0.35
 DEFAULT_FAIR_POLICY_ONLINE_OFFLINE_GAP_CEILING = 0.05
 DEFAULT_FAIR_POLICY_STRONG_READINESS_FLOOR = 0.62
 DEFAULT_FAIR_POLICY_STRONG_SUBSET_STABILITY_FLOOR = 0.60
 DEFAULT_FAIR_POLICY_SCALE_CAP = 0.35
-DEFAULT_DIAGNOSTIC_SUPPORT_COUNT = 1
-DEFAULT_READY_SUPPORT_COUNT = 2
+DEFAULT_DIAGNOSTIC_SUPPORT_COUNT = 2
+DEFAULT_READY_SUPPORT_COUNT = 4
 DEFAULT_DIAGNOSTIC_CONFIDENCE_FLOOR = 0.25
 DEFAULT_DIAGNOSTIC_FUTURE_QUALITY_FLOOR = 0.35
 DEFAULT_DIAGNOSTIC_SUBSET_STABILITY_FLOOR = 0.45
@@ -260,11 +261,6 @@ def compute_env_expression_readiness_components(
     if leaveout_param_std_mean is not None:
         leaveout_penalty += max(0.0, float(leaveout_param_std_mean) - 0.03) / 0.10
     leaveout_stability = float(np.clip(1.0 / (1.0 + leaveout_penalty), 0.02, 1.0))
-    if support_count is not None and int(support_count) < DEFAULT_READY_SUPPORT_COUNT:
-        leaveout_stability = max(
-            leaveout_stability,
-            DEFAULT_READINESS_SCORE_FLOOR,
-        )
     support_diversity = _normalize_descending(
         support_diversity_ratio,
         bad=0.55,
@@ -775,6 +771,7 @@ def build_env_expression(
             metadata={
                 "future_probe_quality": float(readiness_components["future_probe_quality"]),
                 "subset_stability": float(readiness_components["subset_stability"]),
+                "leaveout_stability": float(readiness_components["leaveout_stability"]),
                 "online_subset_stability": float(online_subset_stability),
                 "online_geometry_complete": bool(online_geometry_complete),
                 "readiness_score": float(readiness_score),
@@ -979,9 +976,10 @@ def solver_message_warmup_episodes(total_episodes: int) -> int:
 def fair_env_expression_diagnostics(
     *,
     env_expression: EnvExpression,
-    readiness_score_floor: float = DEFAULT_READINESS_SCORE_FLOOR,
+    readiness_score_floor: float = DEFAULT_FAIR_POLICY_STRONG_READINESS_FLOOR,
     future_probe_quality_floor: float = DEFAULT_FAIR_POLICY_FUTURE_QUALITY_FLOOR,
-    subset_stability_floor: float = DEFAULT_FAIR_POLICY_SUBSET_STABILITY_FLOOR,
+    subset_stability_floor: float = DEFAULT_FAIR_POLICY_STRONG_SUBSET_STABILITY_FLOOR,
+    leaveout_stability_floor: float = DEFAULT_FAIR_POLICY_LEAVEOUT_STABILITY_FLOOR,
     confidence_floor: float = DEFAULT_FAIR_POLICY_CONFIDENCE_FLOOR,
     online_offline_gap_ceiling: float = DEFAULT_FAIR_POLICY_ONLINE_OFFLINE_GAP_CEILING,
 ) -> dict[str, float | bool | str]:
@@ -999,6 +997,9 @@ def fair_env_expression_diagnostics(
             metadata.get("subset_stability", 0.0),
         )
     )
+    leaveout_stability = float(
+        metadata.get("leaveout_stability", readiness_score)
+    )
     confidence = float(env_expression.confidence)
     online_offline_gap = float(metadata.get("online_offline_gap", 0.0))
     online_geometry_complete = bool(metadata.get("online_geometry_complete", False))
@@ -1014,6 +1015,10 @@ def fair_env_expression_diagnostics(
         0.0,
         float(subset_stability_floor) - online_subset_stability,
     ) / max(float(subset_stability_floor), 1e-6)
+    leaveout_deficit = max(
+        0.0,
+        float(leaveout_stability_floor) - leaveout_stability,
+    ) / max(float(leaveout_stability_floor), 1e-6)
     confidence_deficit = max(0.0, float(confidence_floor) - confidence) / max(
         float(confidence_floor),
         1e-6,
@@ -1030,6 +1035,7 @@ def fair_env_expression_diagnostics(
         readiness_deficit <= 0.0
         and future_quality_deficit <= 0.0
         and subset_deficit <= 0.0
+        and leaveout_deficit <= 0.0
         and confidence_deficit <= 0.0
         and gap_deficit <= 0.0
         and geometry_incomplete_deficit <= 0.0
@@ -1043,6 +1049,7 @@ def fair_env_expression_diagnostics(
                 ("readiness_score", readiness_deficit),
                 ("future_probe_quality", future_quality_deficit),
                 ("online_subset_stability", subset_deficit),
+                ("leaveout_stability", leaveout_deficit),
                 ("confidence", confidence_deficit),
                 ("online_offline_gap", gap_deficit),
                 ("online_geometry_complete", geometry_incomplete_deficit),
@@ -1057,6 +1064,7 @@ def fair_env_expression_diagnostics(
         "readiness_score": float(readiness_score),
         "future_probe_quality": float(future_probe_quality),
         "online_subset_stability": float(online_subset_stability),
+        "leaveout_stability": float(leaveout_stability),
         "confidence": float(confidence),
         "online_offline_gap": float(online_offline_gap),
         "online_geometry_complete": bool(online_geometry_complete),
@@ -1097,7 +1105,7 @@ def compute_solver_expression_scale(
     utility_forecast: float | None = None,
     fair_policy_enabled: bool | None = None,
     online_subset_stability: float | None = None,
-    ) -> float:
+) -> float:
     """Warm the controller into trusting the env expression early enough to matter."""
     if disable_env_expression:
         return 0.0
@@ -1336,7 +1344,16 @@ def build_solver_episode_expression(
             force_message_mode is None
             and disable_env_expression
         )
-        or (strict_fair_mode and effective_message_mode == "off")
+        or (
+            strict_fair_mode
+            and effective_message_mode != "on"
+            and forced_expression_scale is None
+        )
+        or (
+            strict_fair_mode
+            and not fair_expression_allowed
+            and forced_expression_scale is None
+        )
         or (shadow_expression_mode and not shadow_expression_allowed)
     ):
         muted_expression = solver_expression_input_from_env_expression(

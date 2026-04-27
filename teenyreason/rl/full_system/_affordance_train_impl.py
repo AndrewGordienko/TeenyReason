@@ -37,7 +37,7 @@ from .curriculum import (
     normalize_oracle_curriculum_schedule,
     should_stop_belief_planner_plateau,
 )
-from ..core.ppo_core import (
+from ..core import (
     RunningNormalizer,
     action_scale_bias,
     build_episode_batch,

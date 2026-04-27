@@ -7,7 +7,7 @@ import torch.optim as optim
 from ...crawler import CrawlerModelBundle
 from ...envs import get_action_values, make_env
 from ...models.env_belief import EnvBeliefAggregator, EnvParamPredictorEnsemble
-from ..core.ppo_core import (
+from ..core import (
     BeliefNativeActorCritic,
     PlainGaussianActorCritic,
     ProbeConditionedGaussianActorCritic,
@@ -1009,13 +1009,42 @@ def train_probe_conditioned_ppo(
                 [record.get("probe_family") for record in probe_window_records],
                 family_names=None if crawler_bundle is None else crawler_bundle.family_names,
             )
-            belief, payload = aggregate_env_belief(
-                belief_aggregator=belief_aggregator,
-                env_param_predictor=env_param_predictor,
-                device=device,
-                posterior_views=belief_posteriors,
-                probe_group_ids=probe_group_ids,
-            )
+            particle_belief_mode = crawler_bundle is not None and str(getattr(crawler_bundle, "belief_mode", "latent_pool")) == "particle_sysid"
+            if particle_belief_mode:
+                belief, payload = crawler_bundle.build_particle_env_belief(
+                    probe_window_records,
+                    bits_per_dim=belief_bits_per_dim,
+                    use_residual_sketch=belief_use_residual_sketch and (not fair_mode),
+                )
+            else:
+                belief, payload = aggregate_env_belief(
+                    belief_aggregator=belief_aggregator,
+                    env_param_predictor=env_param_predictor,
+                    device=device,
+                    posterior_views=belief_posteriors,
+                    probe_group_ids=probe_group_ids,
+                )
+            particle_payload_overrides = {}
+            if particle_belief_mode:
+                particle_payload_overrides = {
+                    key: payload[key]
+                    for key in (
+                        "future_probe_error",
+                        "full_future_prediction_error",
+                        "observed_family_future_error",
+                        "heldout_family_future_error",
+                        "support_size_matched_future_error",
+                        "online_subset_stability",
+                        "online_geometry_complete",
+                        "online_leaveout_shift",
+                        "online_observed_family_count",
+                        "online_offline_gap",
+                        "leaveout_shift",
+                        "leaveout_param_std",
+                        "fair_handoff_probe_families",
+                    )
+                    if key in payload
+                }
 
             if crawler_bundle is not None:
                 future_diagnostics = compute_online_future_diagnostics(
@@ -1076,6 +1105,8 @@ def train_probe_conditioned_ppo(
                     future_diagnostics["fair_handoff_probe_families"],
                     dtype="U",
                 )
+                if particle_payload_overrides:
+                    payload.update(particle_payload_overrides)
                 predictive_belief = crawler_bundle.build_predictive_belief(payload)
                 uncertainty_estimate = crawler_bundle.build_uncertainty_estimate(payload)
                 expected_family_gain = crawler_bundle.score_probe_families(

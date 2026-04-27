@@ -5,6 +5,11 @@ import numpy as np
 import torch
 
 from teenyreason.crawler.library import CrawlerModelBundle, build_evidence_batch, quantize_vector
+from teenyreason.models.sysid import (
+    ProbeLikelihoodModel,
+    build_latin_hypercube_particles,
+    build_probe_sysid_features,
+)
 from teenyreason.representation.analysis import compute_message_rate_distortion
 
 
@@ -101,6 +106,93 @@ class CrawlerLibraryTests(unittest.TestCase):
             )
 
         np.testing.assert_array_equal(captured["probe_group_ids"], group_ids)
+
+    def test_build_particle_env_belief_returns_step_payload(self):
+        windows = {
+            "states": np.asarray(
+                [
+                    [[0.0, 0.0], [0.1, 0.0], [0.2, 0.1]],
+                    [[0.0, 0.0], [-0.1, 0.1], [-0.2, 0.2]],
+                ],
+                dtype=np.float32,
+            ),
+            "actions": np.asarray([[1, 1], [2, 2]], dtype=np.int64),
+            "rewards": np.asarray([[1.0, 1.0], [0.5, 0.5]], dtype=np.float32),
+            "terminated": np.asarray([False, False], dtype=np.bool_),
+            "truncated": np.asarray([False, False], dtype=np.bool_),
+            "probe_mode": np.asarray(["family_a", "family_b"], dtype="U"),
+            "env_instance_id": np.asarray([0, 1], dtype=np.int64),
+            "env_params": np.asarray([[0.8, 1.2], [1.4, 0.7]], dtype=np.float32),
+        }
+        stats = build_probe_sysid_features(windows, action_vocab_size=3).stats
+        model = ProbeLikelihoodModel(
+            param_dim=2,
+            query_dim=int(stats.query_mean.shape[0]),
+            outcome_dim=int(stats.outcome_mean.shape[0]),
+            num_families=2,
+            hidden_dim=16,
+        )
+        particles = build_latin_hypercube_particles(stats, count=16, seed=3)
+        bundle = CrawlerModelBundle(
+            encoder=None,
+            predictor=None,
+            belief_aggregator=None,
+            env_param_predictor=None,
+            env_future_predictor=None,
+            env_family_future_predictor=None,
+            family_value_predictor=None,
+            env_metric_projector=None,
+            belief_message_projector=None,
+            controller_context_projector=None,
+            device=torch.device("cpu"),
+            z_dim=16,
+            window_size=2,
+            action_vocab_size=3,
+            belief_message_dim=16,
+            controller_context_dim=34,
+            family_names=("family_a", "family_b"),
+            belief_mode="particle_sysid",
+            sysid_model=model,
+            sysid_stats=stats,
+            sysid_particles_raw=particles,
+            sysid_trusted=True,
+            sysid_validation_metrics={
+                "validation_nll": 0.1,
+                "validation_top1": 0.8,
+                "validation_margin": 0.4,
+            },
+        )
+        records = [
+            {
+                "states": windows["states"][0],
+                "actions": windows["actions"][0],
+                "rewards": windows["rewards"][0],
+                "terminated": False,
+                "truncated": False,
+                "probe_family": "family_a",
+            },
+            {
+                "states": windows["states"][1],
+                "actions": windows["actions"][1],
+                "rewards": windows["rewards"][1],
+                "terminated": False,
+                "truncated": False,
+                "probe_family": "family_b",
+            },
+        ]
+
+        _belief, payload = bundle.build_particle_env_belief(records)
+        step = bundle.build_step_result(
+            payload=payload,
+            expected_family_gain={},
+            realized_family_gain={},
+            stop_reason=None,
+        )
+
+        self.assertTrue(np.isfinite(payload["env_expression"]).all())
+        self.assertEqual(step.controller_context.metadata["source_kind"], "particle_sysid")
+        self.assertGreater(step.predictive_belief.metadata["particle_entropy"], 0.0)
+        self.assertEqual(step.predictive_belief.support_count, 4)
 
     def test_message_rate_distortion_returns_one_row_per_bitrate(self):
         env_mean = np.asarray(

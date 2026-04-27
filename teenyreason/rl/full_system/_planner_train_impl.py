@@ -49,7 +49,7 @@ from .curriculum import (
     normalize_oracle_curriculum_schedule,
     should_stop_belief_planner_plateau as _shared_should_stop_belief_planner_plateau,
 )
-from ..core.ppo_core import (
+from ..core import (
     BeliefNativeActorCritic,
     RunningNormalizer,
     mean_to_continuous_action,

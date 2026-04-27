@@ -395,6 +395,62 @@ def vicreg_variance_covariance_loss(
     return variance_loss + 0.05 * covariance_loss
 
 
+def env_param_anchor_loss(
+    embeddings: torch.Tensor,
+    normalized_env_params: torch.Tensor,
+) -> torch.Tensor:
+    """Give env beliefs a fixed mechanics-shaped target to break collapse.
+
+    Retrieval and variance losses can have tiny or symmetric gradients when the
+    whole env cloud starts nearly identical. The hidden mechanics are already
+    supervised in this private benchmark, so this deterministic anchor provides
+    a direct non-learned target in the same embedding width.
+    """
+    if embeddings.shape[0] < 2:
+        return embeddings.sum() * 0.0
+
+    embeddings = sanitize_tensor(embeddings)
+    normalized_env_params = sanitize_tensor(normalized_env_params)
+    if normalized_env_params.ndim != 2 or normalized_env_params.shape[1] == 0:
+        return embeddings.sum() * 0.0
+
+    output_dim = int(embeddings.shape[-1])
+    if output_dim <= 0:
+        return embeddings.sum() * 0.0
+
+    feature_idx = torch.arange(output_dim, dtype=torch.long, device=embeddings.device)
+    param_idx = feature_idx % normalized_env_params.shape[1]
+    harmonic = feature_idx // normalized_env_params.shape[1] + 1
+    selected = torch.clamp(normalized_env_params[:, param_idx], min=-4.0, max=4.0)
+    scale = harmonic.float().unsqueeze(0)
+    mode = (harmonic - 1) % 3
+    anchored = torch.where(
+        mode.unsqueeze(0) == 0,
+        selected / torch.sqrt(scale),
+        torch.where(
+            mode.unsqueeze(0) == 1,
+            torch.sin(selected * scale),
+            torch.cos(selected * scale),
+        ),
+    )
+    anchored = sanitize_tensor(anchored)
+    anchored = anchored - anchored.mean(dim=0, keepdim=True)
+    anchored_std = anchored.std(dim=0, unbiased=False).clamp_min(0.05)
+    anchored_centered = sanitize_tensor((anchored / anchored_std).detach())
+
+    embedding_mean = embeddings.mean(dim=0, keepdim=True)
+    embedding_centered = embeddings - embedding_mean
+    embedding_std = embedding_centered.std(dim=0, unbiased=False).detach().clamp_min(0.05)
+    embedding_centered = sanitize_tensor(embedding_centered / embedding_std)
+
+    row_anchor = retrieval_safe_normalize(anchored_centered, dim=-1)
+    row_embedding = retrieval_safe_normalize(embedding_centered, dim=-1)
+    centered_loss = F.smooth_l1_loss(embedding_centered, anchored_centered)
+    row_loss = F.mse_loss(row_embedding, row_anchor)
+    mean_loss = embedding_mean.pow(2).mean()
+    return centered_loss + 0.25 * row_loss + 0.05 * mean_loss
+
+
 def gaussian_moment_regularizer(
     values: torch.Tensor,
     *,

@@ -11,7 +11,9 @@ from teenyreason.models.belief.belief_training_env_config import (
     build_env_belief_phase_config,
 )
 from teenyreason.models.envbelief.env_belief_subsets import (
+    build_cross_family_subset_masks,
     build_env_subset_masks,
+    build_split_source_mask,
     build_support_budget_mask,
 )
 from teenyreason.rl.probe_policy.budget import (
@@ -79,7 +81,7 @@ class ProbeLogicTests(unittest.TestCase):
 
         self.assertEqual(classification, "protocol_win")
 
-    def test_probe_run_uses_eval_delta_when_no_probe_noexpr_training_run(self):
+    def test_probe_run_requires_noexpr_arm_before_latent_win_label(self):
         classification = classify_probe_run(
             baseline_episode=120,
             baseline_steps=9000,
@@ -92,12 +94,12 @@ class ProbeLogicTests(unittest.TestCase):
             probe_fair_expression_enabled_fraction=0.2,
         )
 
-        self.assertEqual(classification, "latent_win")
+        self.assertEqual(classification, "protocol_win")
 
-    def test_fast_profile_skips_probe_no_expression_training(self):
+    def test_fast_profile_runs_probe_no_expression_training(self):
         flags = benchmark_profile_flags("fast")
 
-        self.assertFalse(flags["run_probe_no_expression_training"])
+        self.assertTrue(flags["run_probe_no_expression_training"])
 
     def test_family_scorer_floors_unseen_active_future_estimate(self):
         bundle = CrawlerModelBundle(
@@ -275,6 +277,26 @@ class ProbeLogicTests(unittest.TestCase):
         self.assertTrue({0, 1}.issubset(groups_a))
         self.assertTrue({0, 1}.issubset(groups_b))
 
+    def test_cross_family_split_builder_keeps_probe_families_disjoint(self):
+        mask = torch.tensor([[1, 1, 1, 1, 1, 1]], dtype=torch.float32)
+        group_ids = torch.tensor([[0, 0, 1, 1, 2, 3]], dtype=torch.int64)
+
+        mask_a, mask_b = build_cross_family_subset_masks(
+            mask,
+            group_ids=group_ids,
+            generator=torch.Generator().manual_seed(0),
+        )
+
+        idx_a = torch.nonzero(mask_a[0] > 0, as_tuple=False).squeeze(-1)
+        idx_b = torch.nonzero(mask_b[0] > 0, as_tuple=False).squeeze(-1)
+        groups_a = set(group_ids[0, idx_a].tolist())
+        groups_b = set(group_ids[0, idx_b].tolist())
+
+        self.assertTrue(set(idx_a.tolist()).isdisjoint(set(idx_b.tolist())))
+        self.assertTrue(groups_a.isdisjoint(groups_b))
+        self.assertGreater(len(groups_a), 0)
+        self.assertGreater(len(groups_b), 0)
+
     def test_balanced_split_builder_preserves_single_view_fallback(self):
         mask = torch.tensor([[1]], dtype=torch.float32)
         group_ids = torch.tensor([[7]], dtype=torch.int64)
@@ -288,7 +310,7 @@ class ProbeLogicTests(unittest.TestCase):
         self.assertEqual(float(mask_a[0, 0]), 1.0)
         self.assertEqual(float(mask_b[0, 0]), 1.0)
 
-    def test_support_budget_mask_unions_multiple_diverse_support_draws(self):
+    def test_support_budget_mask_spends_canonical_budget_once(self):
         mask = torch.tensor([[1, 1, 1, 1, 1, 1]], dtype=torch.float32)
         group_ids = torch.tensor([[0, 1, 2, 3, 4, 5]], dtype=torch.int64)
 
@@ -303,8 +325,34 @@ class ProbeLogicTests(unittest.TestCase):
         chosen = torch.nonzero(support_mask[0] > 0, as_tuple=False).squeeze(-1)
         chosen_groups = set(group_ids[0, chosen].tolist())
 
-        self.assertGreater(int(chosen.numel()), 2)
-        self.assertGreaterEqual(len(chosen_groups), 4)
+        self.assertEqual(int(chosen.numel()), 2)
+        self.assertEqual(chosen.tolist(), [0, 1])
+        self.assertEqual(len(chosen_groups), 2)
+
+    def test_support_budget_mask_prefers_early_unique_probe_families(self):
+        mask = torch.tensor([[1, 1, 1, 1, 1, 1]], dtype=torch.float32)
+        group_ids = torch.tensor([[2, 2, 5, 3, 4, 5]], dtype=torch.int64)
+
+        support_mask = build_support_budget_mask(
+            mask,
+            support_size=3,
+            subset_count=1,
+            group_ids=group_ids,
+            generator=torch.Generator().manual_seed(99),
+        )
+
+        chosen = torch.nonzero(support_mask[0] > 0, as_tuple=False).squeeze(-1)
+
+        self.assertEqual(chosen.tolist(), [0, 2, 3])
+
+    def test_split_source_mask_uses_heldout_views_when_available(self):
+        mask = torch.tensor([[1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 0, 0]], dtype=torch.float32)
+        support_mask = torch.tensor([[1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 0, 0]], dtype=torch.float32)
+
+        split_source = build_split_source_mask(mask, support_mask)
+
+        self.assertEqual(split_source[0].tolist(), [1, 1, 1, 1, 1, 1])
+        self.assertEqual(split_source[1].tolist(), [1, 1, 1, 1, 0, 0])
 
     def test_fair_probe_stops_early_when_expression_is_ready(self):
         should_stop, reason = should_stop_probing_fair(
@@ -467,6 +515,45 @@ class ProbeLogicTests(unittest.TestCase):
         )
 
         self.assertEqual(chosen, "chirp")
+
+    def test_fair_second_probe_consumes_particle_expected_gain_rows(self):
+        chosen = choose_fair_probe_family(
+            family_names=("passive_decay", "weak_new", "strong_new", "seen_family"),
+            expected_family_gain={
+                "weak_new": {
+                    "predicted_mechanics_reduction": 0.16,
+                    "predicted_entropy_reduction": 0.18,
+                    "predicted_hypothesis_separation": 0.07,
+                    "future_gain_for_choice": 0.18,
+                    "predicted_marginal_value": 0.20,
+                    "value_per_probe_step": 0.20,
+                    "score": 0.20,
+                    "selection_score": 0.20,
+                    "estimated_probe_cost": 1.00,
+                },
+                "strong_new": {
+                    "predicted_mechanics_reduction": 0.44,
+                    "predicted_entropy_reduction": 0.46,
+                    "predicted_hypothesis_separation": 0.21,
+                    "future_gain_for_choice": 0.46,
+                    "predicted_marginal_value": 0.48,
+                    "value_per_probe_step": 0.48,
+                    "score": 0.48,
+                    "selection_score": 0.48,
+                    "estimated_probe_cost": 1.00,
+                },
+            },
+            family_counts={
+                "passive_decay": 0,
+                "weak_new": 0,
+                "strong_new": 0,
+                "seen_family": 1,
+            },
+            probe_count=1,
+            global_family_counts={"weak_new": 0, "strong_new": 8},
+        )
+
+        self.assertEqual(chosen, "strong_new")
 
     def test_fair_probe_second_family_avoids_globally_overused_weak_family(self):
         chosen = choose_fair_probe_family(

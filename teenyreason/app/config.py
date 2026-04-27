@@ -18,6 +18,13 @@ class ExperimentConfig:
     benchmark_profile: str
     benchmark_mode: str
     probe_budget_mode: str
+    belief_mode: str
+    sysid_epochs: int
+    sysid_batch_size: int
+    sysid_lr: float
+    sysid_negative_count: int
+    sysid_particle_count: int
+    sysid_likelihood_scale: float
     window_size: int
     z_dim: int
     action_bins: int
@@ -105,6 +112,13 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             benchmark_profile="full",
             benchmark_mode="fair",
             probe_budget_mode="fair_two_probe_handoff",
+            belief_mode="latent_pool",
+            sysid_epochs=0,
+            sysid_batch_size=256,
+            sysid_lr=3e-4,
+            sysid_negative_count=15,
+            sysid_particle_count=128,
+            sysid_likelihood_scale=0.35,
             window_size=24,
             z_dim=24,
             action_bins=9,
@@ -190,6 +204,13 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             benchmark_profile="full",
             benchmark_mode="fair",
             probe_budget_mode="fair_two_probe_handoff",
+            belief_mode="latent_pool",
+            sysid_epochs=0,
+            sysid_batch_size=256,
+            sysid_lr=3e-4,
+            sysid_negative_count=15,
+            sysid_particle_count=128,
+            sysid_likelihood_scale=0.35,
             window_size=24,
             z_dim=24,
             action_bins=9,
@@ -275,6 +296,13 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             benchmark_profile="fast",
             benchmark_mode="fair",
             probe_budget_mode="fair_two_probe_handoff",
+            belief_mode="particle_sysid",
+            sysid_epochs=80,
+            sysid_batch_size=256,
+            sysid_lr=3e-4,
+            sysid_negative_count=15,
+            sysid_particle_count=128,
+            sysid_likelihood_scale=0.35,
             window_size=16,
             z_dim=16,
             action_bins=9,
@@ -295,8 +323,8 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             encoder_mode_adversary_loss_weight=0.20,
             encoder_latent_rollout_loss_weight=0.20,
             encoder_env_within_between_loss_weight=0.35,
-            encoder_belief_subset_count=10,
-            encoder_belief_subset_size=6,
+            encoder_belief_subset_count=1,
+            encoder_belief_subset_size=4,
             belief_bits_per_dim=0,
             belief_use_residual_sketch=False,
             latent_memory_capacity=256,

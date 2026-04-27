@@ -30,15 +30,17 @@ class ImportCompatibilityTests(unittest.TestCase):
 
     def test_core_package_exports_public_symbols(self):
         core = importlib.import_module("teenyreason.rl.core")
-        new_core = importlib.import_module("teenyreason.rl.core.ppo_core")
+        optim = importlib.import_module("teenyreason.rl.core.optim")
+        normalization = importlib.import_module("teenyreason.rl.core.normalization")
 
-        self.assertIs(core.update_ppo_policy, new_core.update_ppo_policy)
-        self.assertIs(core.RunningNormalizer, new_core.RunningNormalizer)
+        self.assertIs(core.update_ppo_policy, optim.update_ppo_policy)
+        self.assertIs(core.RunningNormalizer, normalization.RunningNormalizer)
 
-    def test_flat_full_system_shims_are_removed(self):
+    def test_legacy_shim_modules_are_removed(self):
         for module_name in (
             "teenyreason.rl.ppo_core",
             "teenyreason.rl.probe_ppo",
+            "teenyreason.rl.core.ppo_core",
             "teenyreason.rl.belief_planner_train",
             "teenyreason.rl.belief_affordance_train",
             "teenyreason.rl.belief_planner",

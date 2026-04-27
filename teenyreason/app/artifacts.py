@@ -98,6 +98,23 @@ def _maybe_save_debug_bundle(
     )
 
 
+def _latent_claim_rejection_reasons(
+    *,
+    no_expression_completed: int,
+    strict_usage: str,
+    force_muted_fraction: float,
+) -> list[str]:
+    """Explain why one seed cannot be used as evidence for latent utility."""
+    reasons: list[str] = []
+    if int(no_expression_completed) <= 0:
+        reasons.append("probe_no_expression_missing")
+    if str(strict_usage) == "unused":
+        reasons.append("strict_expression_unused")
+    if float(force_muted_fraction) >= 1.0:
+        reasons.append("all_fair_handoffs_muted")
+    return reasons
+
+
 def save_training_artifacts(
     crawler_bundle: CrawlerModelBundle,
     baseline_result,
@@ -275,6 +292,19 @@ def save_training_artifacts(
             if crawler_bundle.env_param_normalizer_std is None
             else torch.tensor(crawler_bundle.env_param_normalizer_std, dtype=torch.float32),
             "probe_family_names": np.asarray(crawler_bundle.family_names, dtype="U"),
+            "belief_mode": str(getattr(crawler_bundle, "belief_mode", "latent_pool")),
+            "sysid_model_state_dict": None
+            if getattr(crawler_bundle, "sysid_model", None) is None
+            else crawler_bundle.sysid_model.state_dict(),
+            "sysid_feature_stats": None
+            if getattr(crawler_bundle, "sysid_stats", None) is None
+            else crawler_bundle.sysid_stats.to_dict(),
+            "sysid_particles_raw": None
+            if getattr(crawler_bundle, "sysid_particles_raw", None) is None
+            else np.asarray(crawler_bundle.sysid_particles_raw, dtype=np.float32),
+            "sysid_trusted": bool(getattr(crawler_bundle, "sysid_trusted", False)),
+            "sysid_validation_metrics": dict(getattr(crawler_bundle, "sysid_validation_metrics", {}) or {}),
+            "sysid_likelihood_scale": float(getattr(crawler_bundle, "sysid_likelihood_scale", 0.35)),
             "policy_state_dict": probe_result.policy.state_dict(),
             "state_normalizer": serialize_normalizer(probe_result.state_normalizer),
             "best_policy_state_dict": probe_result.best_policy_state_dict,
@@ -412,6 +442,19 @@ def save_training_artifacts(
                 if crawler_bundle.env_param_normalizer_std is None
                 else torch.tensor(crawler_bundle.env_param_normalizer_std, dtype=torch.float32),
                 "probe_family_names": np.asarray(crawler_bundle.family_names, dtype="U"),
+                "belief_mode": str(getattr(crawler_bundle, "belief_mode", "latent_pool")),
+                "sysid_model_state_dict": None
+                if getattr(crawler_bundle, "sysid_model", None) is None
+                else crawler_bundle.sysid_model.state_dict(),
+                "sysid_feature_stats": None
+                if getattr(crawler_bundle, "sysid_stats", None) is None
+                else crawler_bundle.sysid_stats.to_dict(),
+                "sysid_particles_raw": None
+                if getattr(crawler_bundle, "sysid_particles_raw", None) is None
+                else np.asarray(crawler_bundle.sysid_particles_raw, dtype=np.float32),
+                "sysid_trusted": bool(getattr(crawler_bundle, "sysid_trusted", False)),
+                "sysid_validation_metrics": dict(getattr(crawler_bundle, "sysid_validation_metrics", {}) or {}),
+                "sysid_likelihood_scale": float(getattr(crawler_bundle, "sysid_likelihood_scale", 0.35)),
                 "policy_state_dict": full_system_result.policy.state_dict(),
                 "state_normalizer": serialize_normalizer(full_system_result.state_normalizer),
                 "best_policy_state_dict": full_system_result.best_policy_state_dict,
@@ -807,12 +850,27 @@ def save_benchmark_results(
     full_system_controller_style,
     full_system_oracle_controller_style,
     sim_fanout_controller_style,
+    extra_summary_fields: dict[str, object] | None = None,
 ) -> None:
     """Save the cross-seed solve summary in one compact file."""
     output_dir = Path("artifacts")
     output_dir.mkdir(exist_ok=True)
 
     benchmark_path = output_dir / benchmark_summary_filename(benchmark_tag, benchmark_profile)
+    latent_claim_reasons = [
+        _latent_claim_rejection_reasons(
+            no_expression_completed=int(noexpr_completed),
+            strict_usage=str(strict_usage),
+            force_muted_fraction=float(force_muted),
+        )
+        for noexpr_completed, strict_usage, force_muted in zip(
+            probe_no_expression_completed_episodes,
+            probe_strict_usage_status,
+            probe_fair_expression_force_muted_fraction,
+        )
+    ]
+    latent_claim_valid = [len(reasons) == 0 for reasons in latent_claim_reasons]
+    extra_summary_fields = {} if extra_summary_fields is None else dict(extra_summary_fields)
     np.savez(
         benchmark_path,
         env_name=np.asarray(env_name),
@@ -877,6 +935,15 @@ def save_benchmark_results(
         probe_completed_episodes=np.asarray(probe_completed_episodes, dtype=np.int64),
         probe_shadow_completed_episodes=np.asarray(probe_shadow_completed_episodes, dtype=np.int64),
         probe_no_expression_completed_episodes=np.asarray(probe_no_expression_completed_episodes, dtype=np.int64),
+        probe_no_expression_available=np.asarray(
+            [int(value) > 0 for value in probe_no_expression_completed_episodes],
+            dtype=np.int8,
+        ),
+        latent_claim_valid=np.asarray(latent_claim_valid, dtype=np.int8),
+        latent_claim_rejection_reasons_json=np.asarray(
+            [json.dumps(reasons) for reasons in latent_claim_reasons],
+            dtype="U",
+        ),
         full_system_completed_episodes=np.asarray(full_system_completed_episodes, dtype=np.int64),
         full_system_state_only_completed_episodes=np.asarray(full_system_state_only_completed_episodes, dtype=np.int64),
         full_system_oracle_completed_episodes=np.asarray(full_system_oracle_completed_episodes, dtype=np.int64),
@@ -981,6 +1048,7 @@ def save_benchmark_results(
         full_system_oracle_online_refinement_ablation_delta=np.asarray(full_system_oracle_online_refinement_ablation_delta, dtype=np.float32),
         full_system_oracle_frozen_context_ablation_delta=np.asarray(full_system_oracle_frozen_context_ablation_delta, dtype=np.float32),
         full_system_oracle_actor_only_ablation_delta=np.asarray(full_system_oracle_actor_only_ablation_delta, dtype=np.float32),
+        **extra_summary_fields,
     )
     print(f"Saved benchmark results to {benchmark_path}")
 

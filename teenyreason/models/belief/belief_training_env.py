@@ -12,6 +12,7 @@ from .belief_common import sanitize_tensor
 from .belief_losses import (
     correlation_alignment_loss,
     env_belief_spread_loss,
+    env_param_anchor_loss,
     env_uniformity_loss,
     gaussian_moment_regularizer,
     hard_negative_retrieval_loss,
@@ -37,6 +38,7 @@ from .belief_training_env_config import (
 from .belief_training_common import modules_are_finite, sanitize_modules_
 from ..env_belief import (
     build_leave_one_group_out_masks,
+    build_split_source_mask,
     build_support_budget_mask,
     build_uncertainty_feature_tensor,
     compute_disjoint_support_splits,
@@ -255,7 +257,7 @@ def run_env_belief_update(
         aggregator=belief_aggregator,
         grouped_mean=grouped_mean,
         grouped_logvar=grouped_logvar,
-        support_mask=support_mask,
+        support_mask=build_split_source_mask(grouped_mask, support_mask),
         group_ids=grouped_probe_mode_idx,
         env_param_predictor=env_param_predictor,
     )
@@ -448,6 +450,10 @@ def run_env_belief_update(
     split_prediction_error = sanitize_tensor(
         torch.mean(torch.abs(subset_env_param_mean - env_target_env_params.unsqueeze(1)), dim=(1, 2))
     )
+    split_env_param_loss = mse_loss(
+        subset_env_param_mean,
+        env_target_env_params.unsqueeze(1).expand_as(subset_env_param_mean),
+    )
 
     leave_masks, leave_valid = build_leave_one_group_out_masks(support_mask, grouped_probe_mode_idx)
     leaveout_param_std = torch.zeros_like(env_param_mean)
@@ -525,6 +531,12 @@ def run_env_belief_update(
     raw_env_within_between_loss = within_between_env_loss(env_mean, subset_env_mean, env_target_env_params)
     env_geometry_belief_loss = pairwise_env_geometry_loss(env_metric_mean, env_target_env_params)
     raw_env_geometry_belief_loss = pairwise_env_geometry_loss(env_mean, env_target_env_params)
+    env_anchor_loss = (
+        1.25 * env_param_anchor_loss(env_mean, env_target_env_params)
+        + env_param_anchor_loss(env_metric_mean, env_target_env_params)
+        + 0.75 * env_param_anchor_loss(env_metric_mean_a, env_target_env_params)
+        + 0.75 * env_param_anchor_loss(env_metric_mean_b, env_target_env_params)
+    )
     env_spread_loss = env_belief_spread_loss(env_metric_mean)
     raw_env_spread_loss = env_belief_spread_loss(env_mean)
     env_uniformity = env_uniformity_loss(env_metric_mean)
@@ -612,6 +624,13 @@ def run_env_belief_update(
     family_belief_consistency_loss = torch.sum(family_belief_shift_target * family_valid) / family_valid_denom
     family_future_consistency_loss = torch.sum(family_future_shift_target * family_valid) / family_valid_denom
     family_param_consistency_loss = torch.sum(family_param_error_target * family_valid) / family_valid_denom
+    env_param_support_loss = sanitize_tensor(
+        env_param_loss
+        + 0.35 * split_env_param_loss
+        + 0.20 * family_param_consistency_loss
+        + 0.15 * leaveout_prediction_error.mean()
+        + 1.20 * env_anchor_loss
+    )
     uncertainty_calibration_loss = (
         F.smooth_l1_loss(standardized_uncertainty_signal, standardized_uncertainty_target)
         + 0.70 * uncertainty_ranking_loss(uncertainty_signal, uncertainty_target.detach(), margin=0.04)
@@ -820,7 +839,7 @@ def run_env_belief_update(
         env_consistency_loss_weight=env_consistency_loss_weight,
         contrastive_loss_weight=contrastive_loss_weight,
         env_retrieval_loss_weight=env_retrieval_loss_weight,
-        env_param_loss=env_param_loss,
+        env_param_loss=env_param_support_loss,
         mechanics_posterior_loss=mechanics_posterior_loss,
         env_split_loss=env_split_loss + 0.35 * env_subset_consistency_loss,
         env_future_loss=env_future_loss,
@@ -829,11 +848,20 @@ def run_env_belief_update(
         env_leaveout_consistency_loss=leaveout_consistency_loss,
         env_split_contrastive_loss=env_split_contrastive_loss,
         env_retrieval_loss=env_retrieval_loss,
+        raw_env_retrieval_loss=raw_env_retrieval_loss,
         env_retrieval_margin_loss=env_retrieval_margin_loss,
+        raw_env_retrieval_margin_loss=raw_env_retrieval_margin_loss,
         env_gap_ratio_loss=env_gap_ratio_loss,
+        raw_env_gap_ratio_loss=raw_env_gap_ratio_loss,
         env_unit_gap_ratio_loss=env_unit_gap_ratio_loss,
         env_unit_retrieval_margin_loss=env_unit_retrieval_margin_loss,
-        env_metric_geometry_loss=env_geometry_belief_loss,
+        env_metric_geometry_loss=env_geometry_belief_loss + 0.80 * env_anchor_loss,
+        env_spread_loss=env_spread_loss,
+        raw_env_spread_loss=raw_env_spread_loss,
+        env_uniformity_loss=env_uniformity,
+        raw_env_uniformity_loss=raw_env_uniformity,
+        env_vicreg_loss=env_vicreg_loss,
+        raw_env_vicreg_loss=raw_env_vicreg_loss,
         env_mode_adversary_loss=env_mode_adversary_loss,
         uncertainty_calibration_loss=uncertainty_calibration_loss,
         env_expression_loss=env_expression_loss,
@@ -858,11 +886,20 @@ def run_env_belief_update(
         + env_loss_terms["env_family_future"]
         + env_loss_terms["env_leaveout_future"]
         + env_loss_terms["env_leaveout_consistency"]
+        + env_loss_terms["raw_env_retrieval"]
         + env_loss_terms["env_retrieval_margin"]
+        + env_loss_terms["raw_env_retrieval_margin"]
         + env_loss_terms["env_gap_ratio"]
+        + env_loss_terms["raw_env_gap_ratio"]
         + env_loss_terms["env_unit_gap_ratio"]
         + env_loss_terms["env_unit_retrieval_margin"]
         + env_loss_terms["env_metric_geometry"]
+        + env_loss_terms["env_spread"]
+        + env_loss_terms["raw_env_spread"]
+        + env_loss_terms["env_uniformity"]
+        + env_loss_terms["raw_env_uniformity"]
+        + env_loss_terms["env_vicreg"]
+        + env_loss_terms["raw_env_vicreg"]
         + env_loss_terms["env_leakage_control"]
         + env_loss_terms["env_expression"]
         + env_loss_terms["controller_mechanics"]
@@ -876,7 +913,7 @@ def run_env_belief_update(
         + env_loss_terms["uncertainty_calibration"]
     )
     core_env_loss = sanitize_tensor(
-        physics_loss_weight * (env_param_loss + 0.75 * mechanics_posterior_loss)
+        physics_loss_weight * (env_param_support_loss + 0.75 * mechanics_posterior_loss)
         + env_consistency_loss_weight * env_split_loss
         + phase_config.predictive_scale * 0.26 * env_future_loss
         + phase_config.predictive_scale * 0.16 * env_leaveout_future_loss_objective
@@ -894,7 +931,13 @@ def run_env_belief_update(
         + phase_config.metric_scale * 0.08 * env_unit_gap_ratio_loss
         + phase_config.metric_scale * 0.07 * env_unit_retrieval_margin_loss
         + phase_config.metric_scale * 0.04 * env_retrieval_margin_loss
-        + phase_config.metric_scale * 0.04 * env_geometry_belief_loss
+        + phase_config.metric_scale * 0.04 * raw_env_retrieval_margin_loss
+        + phase_config.metric_scale * 0.04 * raw_env_gap_ratio_loss
+        + phase_config.metric_scale * 0.04 * (env_geometry_belief_loss + 0.80 * env_anchor_loss)
+        + phase_config.metric_scale * 0.04 * env_spread_loss
+        + phase_config.metric_scale * 0.03 * raw_env_spread_loss
+        + phase_config.metric_scale * 0.04 * env_vicreg_loss
+        + phase_config.metric_scale * 0.03 * raw_env_vicreg_loss
         + phase_config.metric_scale * 0.04 * env_mode_adversary_loss
     )
     dominant_env_term_name, dominant_env_term_value = describe_dominant_loss_term(env_loss_terms)
@@ -992,6 +1035,7 @@ def run_env_belief_update(
         "env_retrieval_pressure": float(phase_config.metric_scale),
         "env_step_mode": env_step_mode,
         "env_param_loss": float(env_param_loss.item()),
+        "env_param_support_loss": float(env_param_support_loss.item()),
         "env_split_loss": float(env_split_loss.item()),
         "env_split_contrastive_loss": float(env_split_contrastive_loss.item()),
         "env_retrieval_loss": float(env_retrieval_loss.item()),
@@ -1001,6 +1045,7 @@ def run_env_belief_update(
         "env_split_retrieval_top1": float(env_split_retrieval_top1.item()),
         "env_split_retrieval_mrr": float(env_split_retrieval_mrr.item()),
         "env_metric_geometry_loss": float(env_geometry_belief_loss.item()),
+        "env_param_anchor_loss": float(env_anchor_loss.item()),
         "env_probe_leakage": float(env_probe_leakage.item()),
         "env_leakage_control_term": float(env_loss_terms["env_leakage_control"].item()),
         "env_spread_loss": float(env_spread_loss.item()),

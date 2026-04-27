@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ..core.ppo_core import build_episode_batch, sanitize_numpy
+from ..core import build_episode_batch, sanitize_numpy
 
 
 @dataclass

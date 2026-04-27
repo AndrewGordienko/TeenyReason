@@ -60,7 +60,7 @@ class ProbePlannerTests(unittest.TestCase):
 
         self.assertEqual(int(np.argmax(scores)), 4)
 
-    def test_scalar_box_planner_raises_support_budget_for_cartpole_style_views(self):
+    def test_scalar_box_planner_uses_one_window_per_generic_scalar_goal(self):
         action_space = gym.spaces.Box(
             low=np.asarray([-1.0], dtype=np.float32),
             high=np.asarray([1.0], dtype=np.float32),
@@ -80,11 +80,40 @@ class ProbePlannerTests(unittest.TestCase):
         self.assertGreaterEqual(planner.partial_window_min_steps, 1)
         self.assertEqual(planner.support_goal_sequence[-1], "center")
         self.assertLess(planner.center_recovery_bonus, 0.45)
-        self.assertEqual(planner.min_windows_per_env, 2 * len(planner.support_goal_sequence))
+        self.assertEqual(planner.min_windows_per_env, len(planner.support_goal_sequence))
         self.assertGreaterEqual(
             planner.max_support_retry_rollouts,
             len(planner.support_goal_sequence),
         )
+
+    def test_cartpole_scalar_planner_uses_named_mechanics_probes(self):
+        action_space = gym.spaces.Box(
+            low=np.asarray([-1.0], dtype=np.float32),
+            high=np.asarray([1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+        action_values = np.linspace(-1.0, 1.0, 9, dtype=np.float32).reshape(-1, 1)
+        planner = build_probe_planner(
+            action_space=action_space,
+            action_values=action_values,
+            rng=np.random.default_rng(0),
+            env_name="continuous_cartpole",
+        )
+
+        self.assertEqual(
+            planner.support_goal_sequence,
+            (
+                "passive_decay",
+                "impulse_left",
+                "impulse_right",
+                "chirp",
+                "boundary_push",
+                "cart_brake",
+            ),
+        )
+        self.assertEqual(planner.min_windows_per_family, 2)
+        self.assertEqual(planner.min_windows_per_env, 12)
+        self.assertGreaterEqual(planner.max_support_retry_rollouts, 12)
 
     def test_generic_planner_tracks_boundary_and_surprise_events_from_transitions(self):
         action_space = gym.spaces.Box(

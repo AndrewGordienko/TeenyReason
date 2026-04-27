@@ -20,6 +20,13 @@ from ..models.belief_world_model import (
     OutcomePredictor,
 )
 from ..models.env_belief import EnvBeliefAggregator, EnvParamPredictorEnsemble
+from ..models.sysid import (
+    ProbeLikelihoodModel,
+    SysIdFeatureStats,
+    build_latin_hypercube_particles,
+    particle_payload_from_windows,
+    train_probe_likelihood_model,
+)
 from ..probe.probe_latent import aggregate_env_belief, encode_window_posterior
 from ..representation import DeltaPredictorEnsemble, WorldEncoder, train_encoder_predictor
 from ..representation.metrics import deterministic_rotation
@@ -189,6 +196,13 @@ class CrawlerModelBundle:
     controller_trust_predictor: nn.Module | None = None
     env_param_normalizer_mean: np.ndarray | None = None
     env_param_normalizer_std: np.ndarray | None = None
+    belief_mode: str = "latent_pool"
+    sysid_model: ProbeLikelihoodModel | None = None
+    sysid_stats: SysIdFeatureStats | None = None
+    sysid_particles_raw: np.ndarray | None = None
+    sysid_trusted: bool = False
+    sysid_validation_metrics: dict[str, float] | None = None
+    sysid_likelihood_scale: float = 0.35
 
     @property
     def env_expression_dim(self) -> int:
@@ -316,6 +330,48 @@ class CrawlerModelBundle:
             payload["belief_message_residual"] = step_result.env_expression.residual_vector.astype(np.float32)
         return belief, payload
 
+    def build_particle_env_belief(
+        self,
+        probe_window_records,
+        *,
+        bits_per_dim: int = 0,
+        use_residual_sketch: bool = False,
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Build an env belief by likelihood-scoring candidate CartPole mechanics."""
+        if self.sysid_model is None or self.sysid_stats is None or self.sysid_particles_raw is None:
+            raise ValueError("Particle system-ID belief was requested without a trained sysid bundle")
+        belief, payload = particle_payload_from_windows(
+            records=tuple(probe_window_records),
+            model=self.sysid_model,
+            stats=self.sysid_stats,
+            particles_raw=self.sysid_particles_raw,
+            z_dim=self.z_dim,
+            trusted=bool(self.sysid_trusted),
+            validation_metrics=self.sysid_validation_metrics or {},
+            likelihood_scale=float(self.sysid_likelihood_scale),
+        )
+        step_result = self.build_step_result(
+            payload=payload,
+            expected_family_gain={},
+            realized_family_gain={},
+            stop_reason=None,
+            bits_per_dim=bits_per_dim,
+            use_residual_sketch=use_residual_sketch,
+        )
+        payload["env_expression"] = step_result.env_expression.vector.astype(np.float32)
+        payload["env_expression_confidence"] = np.asarray(
+            [step_result.env_expression.confidence],
+            dtype=np.float32,
+        )
+        payload["env_expression_uncertainty"] = np.asarray(
+            [step_result.env_expression.uncertainty_scalar],
+            dtype=np.float32,
+        )
+        payload["belief_message"] = step_result.env_expression.vector.astype(np.float32)
+        payload["belief_message_confidence"] = payload["env_expression_confidence"]
+        payload["belief_message_uncertainty"] = payload["env_expression_uncertainty"]
+        return belief, payload
+
     def build_predictive_belief(self, payload: dict[str, np.ndarray]) -> PredictiveBelief:
         """Convert one raw aggregation payload into the canonical predictive belief."""
         leaveout_param_std = sanitize_array(
@@ -437,6 +493,60 @@ class CrawlerModelBundle:
                         payload.get("teacher_action_agreement", np.asarray([0.0], dtype=np.float32))
                     ).reshape(-1)[0]
                 ),
+                "belief_mode": str(
+                    np.asarray(payload.get("belief_mode", np.asarray([self.belief_mode], dtype="U")), dtype="U").reshape(-1)[0]
+                ),
+                "particle_param_mean": sanitize_array(
+                    payload.get("particle_param_mean", np.zeros((0,), dtype=np.float32))
+                ),
+                "particle_param_std": sanitize_array(
+                    payload.get("particle_param_std", np.zeros((0,), dtype=np.float32))
+                ),
+                "particle_param_mean_norm": sanitize_array(
+                    payload.get("particle_param_mean_norm", np.zeros((0,), dtype=np.float32))
+                ),
+                "particle_param_std_norm": sanitize_array(
+                    payload.get("particle_param_std_norm", np.zeros((0,), dtype=np.float32))
+                ),
+                "particle_weights": sanitize_array(
+                    payload.get("particle_weights", np.zeros((0,), dtype=np.float32))
+                ),
+                "particle_particles_norm": sanitize_array(
+                    payload.get("particle_particles_norm", np.zeros((0, 0), dtype=np.float32))
+                ),
+                "particle_particles_raw": sanitize_array(
+                    payload.get("particle_particles_raw", np.zeros((0, 0), dtype=np.float32))
+                ),
+                "particle_entropy": float(
+                    np.asarray(payload.get("particle_entropy", np.asarray([0.0], dtype=np.float32))).reshape(-1)[0]
+                ),
+                "particle_entropy_norm": float(
+                    np.asarray(payload.get("particle_entropy_norm", np.asarray([0.0], dtype=np.float32))).reshape(-1)[0]
+                ),
+                "particle_ess_ratio": float(
+                    np.asarray(payload.get("particle_ess_ratio", np.asarray([0.0], dtype=np.float32))).reshape(-1)[0]
+                ),
+                "particle_top_weight": float(
+                    np.asarray(payload.get("particle_top_weight", np.asarray([0.0], dtype=np.float32))).reshape(-1)[0]
+                ),
+                "particle_leaveout_shift": float(
+                    np.asarray(payload.get("particle_leaveout_shift", np.asarray([0.0], dtype=np.float32))).reshape(-1)[0]
+                ),
+                "particle_subset_stability": float(
+                    np.asarray(payload.get("particle_subset_stability", np.asarray([0.0], dtype=np.float32))).reshape(-1)[0]
+                ),
+                "sysid_validation_top1": float(
+                    np.asarray(payload.get("sysid_validation_top1", np.asarray([0.0], dtype=np.float32))).reshape(-1)[0]
+                ),
+                "sysid_validation_margin": float(
+                    np.asarray(payload.get("sysid_validation_margin", np.asarray([0.0], dtype=np.float32))).reshape(-1)[0]
+                ),
+                "sysid_validation_nll": float(
+                    np.asarray(payload.get("sysid_validation_nll", np.asarray([0.0], dtype=np.float32))).reshape(-1)[0]
+                ),
+                "sysid_trusted": bool(
+                    np.asarray(payload.get("sysid_trusted", np.asarray([0.0], dtype=np.float32))).reshape(-1)[0] > 0.5
+                ),
             },
         )
 
@@ -504,8 +614,9 @@ class CrawlerModelBundle:
         """Project the predictive belief into one controller-facing env expression."""
         predictive_mean = sanitize_array(predictive_belief.mean_raw).reshape(1, -1)
         uncertainty_scalar = np.asarray([[float(uncertainty.scalar)]], dtype=np.float32)
+        particle_mode = str(predictive_belief.metadata.get("belief_mode", "")) == "particle_sysid"
         with torch.no_grad():
-            if self.belief_message_projector is not None:
+            if self.belief_message_projector is not None and not particle_mode:
                 message_t = self.belief_message_projector(
                     torch.tensor(predictive_mean, dtype=torch.float32, device=self.device),
                     torch.tensor(uncertainty_scalar, dtype=torch.float32, device=self.device),
@@ -562,7 +673,8 @@ class CrawlerModelBundle:
         """Build the richer controller-facing belief context for the full-system path."""
         predictive_mean = sanitize_array(predictive_belief.mean_raw).reshape(1, -1)
         uncertainty_scalar = np.asarray([[float(uncertainty.scalar)]], dtype=np.float32)
-        if self.controller_context_projector is not None:
+        particle_mode = str(predictive_belief.metadata.get("belief_mode", "")) == "particle_sysid"
+        if self.controller_context_projector is not None and not particle_mode:
             with torch.no_grad():
                 mechanics_t, affordance_t = self.controller_context_projector(
                     torch.tensor(predictive_mean, dtype=torch.float32, device=self.device),
@@ -592,7 +704,7 @@ class CrawlerModelBundle:
             confidence=float(control_confidence),
             uncertainty_scalar=float(uncertainty.scalar),
             metadata={
-                "source_kind": "learned",
+                "source_kind": "particle_sysid" if particle_mode else "learned",
                 "env_expression_ready": bool(env_expression.ready),
                 "env_expression_confidence": float(env_expression.confidence),
                 "readiness_score": float(env_expression.metadata.get("readiness_score", 0.0)),
@@ -600,6 +712,8 @@ class CrawlerModelBundle:
                 "support_count": int(predictive_belief.support_count),
                 "support_diversity_ratio": float(predictive_belief.support_diversity_ratio),
                 "future_probe_error": float(predictive_belief.future_probe_error),
+                "particle_entropy": float(predictive_belief.metadata.get("particle_entropy", 0.0)),
+                "particle_ess_ratio": float(predictive_belief.metadata.get("particle_ess_ratio", 0.0)),
                 "gap_ratio": float(metric_belief.gap_ratio),
                 "nearest_between_distance": float(metric_belief.nearest_between_distance),
                 "control_confidence": float(control_confidence),
@@ -711,6 +825,89 @@ class CrawlerModelBundle:
             for idx, family in enumerate(self.family_names)
         }
 
+    def score_particle_probe_families(
+        self,
+        predictive_belief: PredictiveBelief,
+        *,
+        family_counts: dict[str, int] | None = None,
+        global_family_counts: dict[str, int] | None = None,
+    ) -> dict[str, dict[str, float]]:
+        """Score families by how strongly they separate particle hypotheses."""
+        del global_family_counts
+        if self.sysid_model is None or self.sysid_stats is None or not self.family_names:
+            return {}
+        family_counts = family_counts or {}
+        particles = sanitize_array(
+            predictive_belief.metadata.get("particle_particles_norm", np.zeros((0, 0), dtype=np.float32))
+        )
+        weights = sanitize_array(
+            predictive_belief.metadata.get("particle_weights", np.zeros((0,), dtype=np.float32))
+        ).reshape(-1)
+        if particles.ndim != 2 or particles.shape[0] == 0 or weights.shape[0] != particles.shape[0]:
+            return {}
+        weight_sum = float(np.sum(weights))
+        if not np.isfinite(weight_sum) or weight_sum <= 1e-6:
+            weights = np.full((particles.shape[0],), 1.0 / float(particles.shape[0]), dtype=np.float32)
+        else:
+            weights = (weights / weight_sum).astype(np.float32)
+
+        query_means = sanitize_array(self.sysid_stats.family_query_mean_norm)
+        if query_means.ndim != 2 or query_means.shape[0] < len(self.family_names):
+            return {}
+
+        self.sysid_model.eval()
+        particle_t = torch.tensor(particles, dtype=torch.float32, device=self.device)
+        weight_t = torch.tensor(weights, dtype=torch.float32, device=self.device).reshape(-1, 1)
+        gains: dict[str, dict[str, float]] = {}
+        for family_idx, family in enumerate(self.family_names):
+            family_query = query_means[family_idx]
+            query_t = torch.tensor(
+                np.repeat(family_query[None, :], particles.shape[0], axis=0),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            family_t = torch.full((particles.shape[0],), int(family_idx), dtype=torch.long, device=self.device)
+            with torch.no_grad():
+                mean_t, logvar_t = self.sysid_model.predict(particle_t, query_t, family_t)
+                center_t = torch.sum(weight_t * mean_t, dim=0, keepdim=True)
+                between_t = torch.sum(weight_t * torch.square(mean_t - center_t), dim=0).mean()
+                noise_t = torch.sum(weight_t * torch.exp(logvar_t), dim=0).mean()
+            between = float(max(0.0, between_t.item()))
+            noise = float(max(1e-4, noise_t.item()))
+            info = between / (noise + 1e-4)
+            entropy_reduction = float(np.log1p(max(0.0, info)))
+            hypothesis_separation = float(np.sqrt(max(0.0, between)))
+            cost = estimate_probe_family_cost(family)
+            coverage_bonus = 0.08 if int(family_counts.get(family, 0)) <= 0 else 0.0
+            score = entropy_reduction + 0.35 * hypothesis_separation
+            selection_score = score + coverage_bonus - 0.35 * cost
+            value_per_step = selection_score / max(cost, 1e-6)
+            gains[family] = {
+                "predicted_mechanics_reduction": entropy_reduction,
+                "raw_predicted_future_error_reduction": entropy_reduction,
+                "predicted_future_error_reduction": entropy_reduction,
+                "future_gain_for_choice": entropy_reduction,
+                "predicted_split_reduction": hypothesis_separation,
+                "predicted_entropy_reduction": entropy_reduction,
+                "predicted_hypothesis_separation": hypothesis_separation,
+                "diversity_bonus": 0.0,
+                "coverage_bonus": coverage_bonus,
+                "quota_bonus": 0.0,
+                "repeat_penalty": 0.0,
+                "global_repeat_penalty": 0.0,
+                "realized_gain_calibration": 1.0,
+                "realized_gain_bonus": 0.0,
+                "raw_future_error_estimate": float(predictive_belief.future_probe_error),
+                "future_error_estimate": float(predictive_belief.future_probe_error),
+                "signature_norm": hypothesis_separation,
+                "estimated_probe_cost": cost,
+                "predicted_marginal_value": selection_score,
+                "value_per_probe_step": value_per_step,
+                "score": score,
+                "selection_score": selection_score,
+            }
+        return gains
+
     def score_probe_families(
         self,
         predictive_belief: PredictiveBelief,
@@ -723,6 +920,18 @@ class CrawlerModelBundle:
         use_learned_family_value: bool = True,
     ) -> dict[str, dict[str, float]]:
         """Score probe families by expected belief improvement rather than novelty alone."""
+        del uncertainty
+        if str(self.belief_mode) == "particle_sysid" and str(
+            predictive_belief.metadata.get("belief_mode", "")
+        ) == "particle_sysid":
+            particle_scores = self.score_particle_probe_families(
+                predictive_belief,
+                family_counts=family_counts,
+                global_family_counts=global_family_counts,
+            )
+            if particle_scores:
+                return particle_scores
+
         family_counts = family_counts or {}
         global_family_counts = global_family_counts or {}
         family_error_history = family_error_history or {}
@@ -966,6 +1175,13 @@ def train_crawler_library(
     z_dim: int,
     window_size: int,
     action_vocab_size: int,
+    belief_mode: str = "latent_pool",
+    sysid_epochs: int = 0,
+    sysid_batch_size: int = 256,
+    sysid_lr: float = 3e-4,
+    sysid_negative_count: int = 15,
+    sysid_particle_count: int = 128,
+    sysid_likelihood_scale: float = 0.35,
     progress_callback=None,
     **train_kwargs,
 ) -> CrawlerModelBundle:
@@ -993,6 +1209,39 @@ def train_crawler_library(
         **train_kwargs,
     )
     family_names = tuple(sorted({str(mode) for mode in np.asarray(windows["probe_mode"], dtype="U").tolist()}))
+    sysid_model = None
+    sysid_stats = None
+    sysid_particles_raw = None
+    sysid_trusted = False
+    sysid_validation_metrics: dict[str, float] | None = None
+    if str(belief_mode) == "particle_sysid" and int(sysid_epochs) > 0:
+        sysid_result = train_probe_likelihood_model(
+            windows=windows,
+            action_vocab_size=action_vocab_size,
+            epochs=int(sysid_epochs),
+            batch_size=int(sysid_batch_size),
+            lr=float(sysid_lr),
+            negative_count=int(sysid_negative_count),
+            hidden_dim=128,
+            seed=0,
+        )
+        sysid_model = sysid_result.model
+        sysid_stats = sysid_result.stats
+        sysid_particles_raw = build_latin_hypercube_particles(
+            sysid_stats,
+            count=int(sysid_particle_count),
+            seed=173,
+        )
+        sysid_trusted = bool(sysid_result.trusted)
+        sysid_validation_metrics = dict(sysid_result.metrics)
+        print(
+            "sysid validation | "
+            f"trusted={sysid_trusted} | "
+            f"top1={sysid_validation_metrics.get('validation_top1', 0.0):.3f} | "
+            f"margin={sysid_validation_metrics.get('validation_margin', 0.0):.3f} | "
+            f"nll={sysid_validation_metrics.get('validation_nll', 0.0):.3f}"
+        )
+
     belief_message_dim = (
         int(belief_message_projector.output_dim)
         if belief_message_projector is not None and hasattr(belief_message_projector, "output_dim")
@@ -1021,6 +1270,13 @@ def train_crawler_library(
         family_names=family_names,
         env_param_normalizer_mean=sanitize_array(env_param_normalizer["mean"]),
         env_param_normalizer_std=sanitize_array(env_param_normalizer["std"]),
+        belief_mode=str(belief_mode),
+        sysid_model=sysid_model,
+        sysid_stats=sysid_stats,
+        sysid_particles_raw=None if sysid_particles_raw is None else sanitize_array(sysid_particles_raw),
+        sysid_trusted=sysid_trusted,
+        sysid_validation_metrics=sysid_validation_metrics,
+        sysid_likelihood_scale=float(sysid_likelihood_scale),
     )
 
 
@@ -1157,6 +1413,27 @@ def load_crawler_bundle_from_checkpoint(
             dtype="U",
         ).tolist()
     )
+    belief_mode = str(checkpoint.get("belief_mode", "latent_pool"))
+    sysid_stats = None
+    sysid_model = None
+    sysid_particles_raw = None
+    sysid_feature_stats = checkpoint.get("sysid_feature_stats")
+    if sysid_feature_stats is not None:
+        sysid_stats = SysIdFeatureStats.from_dict(sysid_feature_stats)
+    sysid_state_dict = checkpoint.get("sysid_model_state_dict")
+    if sysid_stats is not None and sysid_state_dict is not None:
+        sysid_model = ProbeLikelihoodModel(
+            param_dim=int(sysid_stats.env_param_mean.shape[0]),
+            query_dim=int(sysid_stats.query_mean.shape[0]),
+            outcome_dim=int(sysid_stats.outcome_mean.shape[0]),
+            num_families=len(sysid_stats.family_names),
+            hidden_dim=128,
+        ).to(device)
+        sysid_model.load_state_dict(sysid_state_dict)
+        sysid_model.eval()
+    if checkpoint.get("sysid_particles_raw") is not None:
+        sysid_particles_raw = sanitize_array(checkpoint.get("sysid_particles_raw"))
+    sysid_validation_metrics = checkpoint.get("sysid_validation_metrics") or {}
     return CrawlerModelBundle(
         encoder=encoder,
         predictor=predictor,
@@ -1189,4 +1466,14 @@ def load_crawler_bundle_from_checkpoint(
                 np.ones((int(checkpoint.get("env_param_dim", z_dim)),), dtype=np.float32),
             )
         ),
+        belief_mode=belief_mode,
+        sysid_model=sysid_model,
+        sysid_stats=sysid_stats,
+        sysid_particles_raw=sysid_particles_raw,
+        sysid_trusted=bool(checkpoint.get("sysid_trusted", False)),
+        sysid_validation_metrics={
+            str(key): float(value)
+            for key, value in dict(sysid_validation_metrics).items()
+        },
+        sysid_likelihood_scale=float(checkpoint.get("sysid_likelihood_scale", 0.35)),
     )

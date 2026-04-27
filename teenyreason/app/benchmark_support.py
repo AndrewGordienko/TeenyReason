@@ -178,6 +178,32 @@ def compute_belief_progress_index(
     )
 
 
+def compute_system_id_progress_index(
+    *,
+    trusted: bool,
+    validation_top1: float | None,
+    validation_margin: float | None,
+    particle_entropy_norm: float | None,
+    particle_ess_ratio: float | None,
+    particle_leaveout_shift: float | None,
+) -> float:
+    """Score particle sysid health without reusing legacy latent geometry."""
+    trust_score = 1.0 if trusted else 0.0
+    top1_score = clip_unit_interval(validation_top1)
+    margin_score = clip_unit_interval(float(validation_margin or 0.0) / 0.25)
+    sharpness_score = 1.0 - clip_unit_interval(particle_entropy_norm)
+    concentration_score = 1.0 - clip_unit_interval(particle_ess_ratio)
+    stability_score = 1.0 - clip_unit_interval(float(particle_leaveout_shift or 0.0) / 0.55)
+    return float(
+        0.25 * trust_score
+        + 0.20 * top1_score
+        + 0.15 * margin_score
+        + 0.15 * sharpness_score
+        + 0.10 * concentration_score
+        + 0.15 * stability_score
+    )
+
+
 def evaluate_latent_win_gate(
     *,
     benchmark_profile: str,
@@ -203,6 +229,7 @@ def evaluate_latent_win_gate(
     full_system_zero_context_ablation_delta: Iterable[float | None],
     full_system_shuffled_context_ablation_delta: Iterable[float | None],
     full_system_stale_context_ablation_delta: Iterable[float | None],
+    probe_no_expression_available: bool | None = True,
 ) -> dict[str, object]:
     """Decide whether the benchmark has genuinely cracked latent utility."""
     baseline_episode_stats = summarize_capped_solve_stats(
@@ -238,18 +265,19 @@ def evaluate_latent_win_gate(
 
     checks = {
         "full_benchmark": str(benchmark_profile) == "full" and int(seed_count) >= 5,
+        "probe_no_expression_available": bool(probe_no_expression_available),
         "probe_success_rate": probe_episode_stats["success_rate"] >= baseline_episode_stats["success_rate"],
         "probe_episode_speed": probe_episode_stats["capped_median"] <= 0.90 * baseline_episode_stats["capped_median"],
         "probe_step_speed": probe_step_stats["capped_median"] < baseline_step_stats["capped_median"],
         "env_expression_beats_noexpr": probe_delta_median > 0.0,
         "probe_ready_fraction": probe_ready_mean >= 0.50,
         "probe_muted_fraction": probe_muted_mean <= 0.50,
-        "mechanics_fit": mechanics_fit_median >= 0.50,
-        "neighbor_alignment": neighbor_alignment_median >= 0.25,
-        "split_retrieval": split_retrieval_median >= 0.20,
+        "mechanics_fit": mechanics_fit_median >= 0.60,
+        "neighbor_alignment": neighbor_alignment_median >= 0.20,
+        "split_retrieval": split_retrieval_median >= (0.45 if str(benchmark_profile) == "full" else 0.30),
         "gap_ratio": gap_ratio_median <= 1.0,
         "probe_leakage": probe_leakage_median <= 0.15,
-        "uncert_error_corr": uncert_corr_median >= 0.20,
+        "uncert_error_corr": uncert_corr_median >= 0.30,
         "full_system_state_only_delta": state_only_delta_median >= 50.0,
         "full_system_zero_delta": zero_delta_median >= 50.0,
         "full_system_shuffled_delta": shuffled_delta_median >= 50.0,
@@ -257,6 +285,7 @@ def evaluate_latent_win_gate(
     }
     failure_reason_map = {
         "full_benchmark": "benchmark_not_full",
+        "probe_no_expression_available": "probe_no_expression_missing",
         "probe_success_rate": "probe_success_rate_below_baseline",
         "probe_episode_speed": "probe_episode_speed_below_target",
         "probe_step_speed": "probe_step_cost_below_target",
@@ -349,12 +378,6 @@ def classify_probe_run(
             return "protocol_win"
         return "controller_compensation"
     if probe_no_expression_episode is None and probe_no_expression_steps is None:
-        if (
-            probe_rank < baseline_rank
-            and probe_env_expression_delta is not None
-            and float(probe_env_expression_delta) > 0.0
-        ):
-            return "latent_win"
         if probe_rank < baseline_rank:
             return "protocol_win"
         return "controller_compensation"
@@ -404,7 +427,7 @@ def benchmark_profile_flags(profile: str) -> dict[str, bool]:
     profile = str(profile)
     return {
         "run_probe_shadow": profile != "fast",
-        "run_probe_no_expression_training": profile == "full",
+        "run_probe_no_expression_training": profile in {"fast", "full"},
         "run_belief_controller": profile in {"fast", "full"},
         "run_belief_controller_oracle": profile == "full",
         "run_sim_fanout": profile in {"fast", "full"},

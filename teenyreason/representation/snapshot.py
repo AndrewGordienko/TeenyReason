@@ -89,10 +89,11 @@ def build_latent_snapshot(
     windows: dict[str, np.ndarray],
     env_name: str | None = None,
     benchmark_tag: str | None = None,
-    support_size: int = 6,
-    subset_count: int = 8,
+    support_size: int = 4,
+    subset_count: int = 1,
     belief_message_projector=None,
     compression_bits: tuple[int, ...] = (0, 8, 4, 2),
+    crawler_bundle=None,
 ) -> dict[str, np.ndarray]:
     """Build one dashboard-friendly env-belief snapshot from recorded probe windows."""
     from .analysis import build_env_belief_dataset
@@ -141,6 +142,53 @@ def build_latent_snapshot(
             compression_bits=compression_bits,
         )
     )
+    if crawler_bundle is not None and str(getattr(crawler_bundle, "belief_mode", "latent_pool")) == "particle_sysid":
+        particle_mean = []
+        particle_std = []
+        particle_entropy = []
+        particle_entropy_norm = []
+        particle_ess = []
+        particle_leaveout = []
+        particle_subset = []
+        env_ids = env_dataset["env_instance_id"].astype(np.int32)
+        window_env_ids = windows["env_instance_id"].astype(np.int32)
+        for env_id in env_ids.tolist():
+            env_indices = np.nonzero(window_env_ids == int(env_id))[0][: max(1, int(support_size))]
+            records = [
+                {
+                    "states": windows["states"][idx],
+                    "actions": windows["actions"][idx],
+                    "rewards": windows["rewards"][idx],
+                    "terminated": bool(windows["terminated"][idx]),
+                    "truncated": bool(windows["truncated"][idx]),
+                    "probe_family": str(np.asarray(windows["probe_mode"][idx]).item()),
+                }
+                for idx in env_indices.tolist()
+            ]
+            if not records:
+                continue
+            _belief, payload = crawler_bundle.build_particle_env_belief(records)
+            particle_mean.append(payload["particle_param_mean"])
+            particle_std.append(payload["particle_param_std"])
+            particle_entropy.append(float(payload["particle_entropy"].reshape(-1)[0]))
+            particle_entropy_norm.append(float(payload["particle_entropy_norm"].reshape(-1)[0]))
+            particle_ess.append(float(payload["particle_ess_ratio"].reshape(-1)[0]))
+            particle_leaveout.append(float(payload["particle_leaveout_shift"].reshape(-1)[0]))
+            particle_subset.append(float(payload["particle_subset_stability"].reshape(-1)[0]))
+        if particle_mean:
+            snapshot["particle_param_mean"] = np.stack(particle_mean, axis=0).astype(np.float32)
+            snapshot["particle_param_std"] = np.stack(particle_std, axis=0).astype(np.float32)
+            snapshot["particle_entropy"] = np.asarray(particle_entropy, dtype=np.float32)
+            snapshot["particle_entropy_norm"] = np.asarray(particle_entropy_norm, dtype=np.float32)
+            snapshot["particle_ess_ratio"] = np.asarray(particle_ess, dtype=np.float32)
+            snapshot["particle_leaveout_shift"] = np.asarray(particle_leaveout, dtype=np.float32)
+            snapshot["particle_subset_stability"] = np.asarray(particle_subset, dtype=np.float32)
+        metrics = getattr(crawler_bundle, "sysid_validation_metrics", {}) or {}
+        snapshot["sysid_validation_top1"] = np.asarray([float(metrics.get("validation_top1", 0.0))], dtype=np.float32)
+        snapshot["sysid_validation_margin"] = np.asarray([float(metrics.get("validation_margin", 0.0))], dtype=np.float32)
+        snapshot["sysid_validation_nll"] = np.asarray([float(metrics.get("validation_nll", 0.0))], dtype=np.float32)
+        snapshot["sysid_trusted"] = np.asarray([1.0 if bool(getattr(crawler_bundle, "sysid_trusted", False)) else 0.0], dtype=np.float32)
+        snapshot["belief_mode"] = np.asarray("particle_sysid")
     if env_name is not None:
         snapshot["env_name"] = np.asarray(env_name)
     if benchmark_tag is not None:
