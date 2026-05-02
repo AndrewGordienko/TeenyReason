@@ -38,6 +38,35 @@ class DashboardPayloadTests(unittest.TestCase):
         self.assertIn("strict unused", template)
         self.assertIn("rather than proving learned message contribution", template)
 
+    def test_live_dashboard_does_not_hide_curves_for_non_cartpole_envs(self):
+        template_path = Path(__file__).resolve().parents[2] / "teenyreason" / "viz" / "templates" / "dashboard.html"
+        template = template_path.read_text(encoding="utf-8")
+
+        self.assertNotIn("if (!hasLivePayload || !isCartPole)", template)
+        self.assertIn("The animated canvas is CartPole-only", template)
+
+    def test_live_dashboard_has_direct_ppo_comparison_board(self):
+        template_path = Path(__file__).resolve().parents[2] / "teenyreason" / "viz" / "templates" / "dashboard.html"
+        template = template_path.read_text(encoding="utf-8")
+
+        self.assertIn("PPO vs Probe-Conditioned PPO", template)
+        self.assertIn('data-deck-target="comparison"', template)
+        self.assertIn('id="deck-comparison"', template)
+        self.assertIn("comparisonBoard", template)
+        self.assertIn("paperFigureBoard", template)
+        self.assertIn("Sample Efficiency", template)
+        self.assertIn("Performance Ceiling", template)
+        self.assertIn("Learning Dynamics", template)
+        self.assertIn("renderPaperFigureBoard(rawPayload)", template)
+        self.assertIn("renderComparisonBoard(rawPayload)", template)
+        self.assertIn("comparison_suite_id", template)
+        self.assertIn("rolling 100-episode average", template)
+        self.assertIn("baseline_env_step_solves", template)
+        self.assertIn("baseline_total_env_steps", template)
+        self.assertIn("probe_env_step_solves_with_encoder", template)
+        self.assertIn("probe_total_env_steps_with_encoder", template)
+        self.assertIn("unsolved @", template)
+
     def test_summarize_solve_array_marks_skipped_variants_as_not_run(self):
         summary = summarize_solve_array(
             np.asarray([-1, -1], dtype=np.int64),
@@ -128,6 +157,36 @@ class DashboardPayloadTests(unittest.TestCase):
             self.assertEqual(payload["support_validity"]["status"], "invalid")
             self.assertFalse(payload["support_validity"]["is_valid"])
             self.assertIn("undercovered", payload["support_validity"]["headline"].lower())
+
+    def test_latent_payload_pads_one_dimensional_projection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact_path = Path(tmpdir) / "toy_one_dim_projection_snapshot.npz"
+            np.savez(
+                artifact_path,
+                env_belief_mean=np.asarray([[0.1], [0.3]], dtype=np.float32),
+                projection_2d=np.asarray([[0.0], [0.2]], dtype=np.float32),
+                env_uncertainty=np.asarray([0.2, 0.3], dtype=np.float32),
+                env_params=np.asarray([[1.0], [3.0]], dtype=np.float32),
+                env_window_count=np.asarray([1, 1], dtype=np.int32),
+                env_support_count=np.asarray([1, 1], dtype=np.int32),
+                env_support_group_ratio=np.asarray([1.0, 1.0], dtype=np.float32),
+                env_instance_id=np.asarray([0, 1], dtype=np.int32),
+                env_view_spread=np.asarray([[0.0], [0.0]], dtype=np.float32),
+                window_env_instance_id=np.asarray([0, 1], dtype=np.int32),
+                window_reward_sum=np.asarray([1.0, 1.5], dtype=np.float32),
+                window_probe_mode=np.asarray(["impulse_left", "impulse_right"], dtype="U"),
+                window_terminated=np.asarray([0, 0], dtype=np.int8),
+                window_latent_mean=np.asarray([[0.1], [0.3]], dtype=np.float32),
+                env_param_names=np.asarray(["gravity"], dtype="U"),
+                pca_explained=np.asarray([1.0], dtype=np.float32),
+            )
+
+            payload = build_latent_payload(artifact_path)
+
+            self.assertEqual(payload["points"][0]["x"], 0.0)
+            self.assertEqual(payload["points"][0]["y"], 0.0)
+            self.assertAlmostEqual(payload["points"][1]["x"], 0.2)
+            self.assertEqual(payload["points"][1]["y"], 0.0)
 
     def test_latent_payload_includes_system_id_block_without_dropping_latent_fields(self):
         with tempfile.TemporaryDirectory() as tmpdir:

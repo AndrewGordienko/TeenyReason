@@ -80,7 +80,7 @@ class CrawlerRecipeTests(unittest.TestCase):
     def test_small_public_files_stay_small(self):
         line_budgets = {
             "main.py": 80,
-            "teenyreason/__init__.py": 160,
+            "teenyreason/__init__.py": 180,
             "teenyreason/crawler/core.py": 400,
             "teenyreason/crawler/types.py": 280,
             "teenyreason/app/benchmark.py": 2125,

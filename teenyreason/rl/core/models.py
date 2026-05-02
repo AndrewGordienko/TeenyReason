@@ -22,6 +22,7 @@ class MatchedBeliefActorCritic(nn.Module):
         action_dim: int,
         belief_dim: int,
         hidden_dim: int = 128,
+        initial_log_std: float = -1.5,
     ):
         super().__init__()
         self.belief_dim = int(belief_dim)
@@ -57,7 +58,7 @@ class MatchedBeliefActorCritic(nn.Module):
             nn.Tanh(),
         )
         self.value_residual_head = init_linear(nn.Linear(hidden_dim * 2, 1), gain=1.0)
-        self.log_std = nn.Parameter(torch.full((action_dim,), -1.5))
+        self.log_std = nn.Parameter(torch.full((action_dim,), float(initial_log_std)))
 
     def split_expression_input(
         self,
@@ -126,12 +127,14 @@ class PlainGaussianActorCritic(MatchedBeliefActorCritic):
         action_dim: int,
         belief_dim: int,
         hidden_dim: int = 128,
+        initial_log_std: float = -1.5,
     ):
         super().__init__(
             state_dim=state_dim,
             action_dim=action_dim,
             belief_dim=belief_dim,
             hidden_dim=hidden_dim,
+            initial_log_std=initial_log_std,
         )
 
     def forward(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -161,6 +164,7 @@ class BeliefNativeActorCritic(nn.Module):
         mechanics_dim: int,
         affordance_dim: int,
         hidden_dim: int = 128,
+        initial_log_std: float = -1.5,
     ):
         super().__init__()
         self.mechanics_dim = int(mechanics_dim)
@@ -224,7 +228,7 @@ class BeliefNativeActorCritic(nn.Module):
             nn.Tanh(),
             init_linear(nn.Linear(hidden_dim, 1), gain=0.5),
         )
-        self.log_std = nn.Parameter(torch.full((action_dim,), -1.5))
+        self.log_std = nn.Parameter(torch.full((action_dim,), float(initial_log_std)))
 
     def split_controller_context(
         self,

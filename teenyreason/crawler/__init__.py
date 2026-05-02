@@ -56,6 +56,15 @@ if TYPE_CHECKING:
         load_crawler_bundle_from_checkpoint,
         train_crawler_library,
     )
+    from .runtime import (
+        CrawlerExpressionResult,
+        CrawlerRuntimeConfig,
+        LatentCrawler,
+        best_crawler,
+        crawler_for,
+        latest_crawler_checkpoint,
+    )
+    from .setup import CrawlerSetup, crawler_setup
 
 __all__ = [
     "BeliefBackend",
@@ -64,8 +73,11 @@ __all__ = [
     "ControllerBeliefContext",
     "Crawler",
     "CrawlerMessage",
+    "CrawlerExpressionResult",
+    "CrawlerRuntimeConfig",
     "CrawlerModelBundle",
     "CrawlerRunResult",
+    "CrawlerSetup",
     "CrawlerStep",
     "CrawlerStepResult",
     "EvidenceBatch",
@@ -75,6 +87,7 @@ __all__ = [
     "LegacyCrawlerRunResult",
     "LegacyCrawlerStepResult",
     "LinearMessageProjector",
+    "LatentCrawler",
     "MessageProjector",
     "MetricBelief",
     "PredictiveBelief",
@@ -86,11 +99,15 @@ __all__ = [
     "UncertaintyEstimate",
     "VectorBeliefBackend",
     "WorldAdapter",
+    "best_crawler",
     "crawler_message_to_env_expression",
+    "crawler_for",
+    "crawler_setup",
     "env_expression_to_crawler_message",
     "group_window_targets_numpy",
     "group_window_targets_torch",
     "legacy_step_result_to_crawler_step",
+    "latest_crawler_checkpoint",
     "load_crawler_bundle_from_checkpoint",
     "masked_group_average_numpy",
     "masked_group_average_torch",
@@ -116,4 +133,37 @@ def __getattr__(name: str):
             "train_crawler_library": train_crawler_library,
         }
         return exports[name]
+    if name in {
+        "CrawlerSetup",
+        "crawler_setup",
+    }:
+        from .setup import CrawlerSetup, crawler_setup
+
+        return {"CrawlerSetup": CrawlerSetup, "crawler_setup": crawler_setup}[name]
+    if name in {
+        "CrawlerExpressionResult",
+        "CrawlerRuntimeConfig",
+        "LatentCrawler",
+        "best_crawler",
+        "crawler_for",
+        "latest_crawler_checkpoint",
+    }:
+        from .runtime import (
+            CrawlerExpressionResult,
+            CrawlerRuntimeConfig,
+            LatentCrawler,
+            best_crawler,
+            crawler_for,
+            latest_crawler_checkpoint,
+        )
+
+        runtime_exports = {
+            "CrawlerExpressionResult": CrawlerExpressionResult,
+            "CrawlerRuntimeConfig": CrawlerRuntimeConfig,
+            "LatentCrawler": LatentCrawler,
+            "best_crawler": best_crawler,
+            "crawler_for": crawler_for,
+            "latest_crawler_checkpoint": latest_crawler_checkpoint,
+        }
+        return runtime_exports[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

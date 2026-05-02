@@ -13,6 +13,7 @@ from teenyreason.rl.core import (
 )
 from teenyreason.rl.probe_policy.audit import build_solver_expression_audit
 from teenyreason.rl.probe_policy.messages import (
+    DEFAULT_DIAGNOSTIC_SCALE_CAP,
     DEFAULT_DIAGNOSTIC_SCALE_FLOOR,
     DEFAULT_FORCED_EVAL_EXPRESSION_SCALE,
     apply_solver_message_keep_scale,
@@ -62,6 +63,20 @@ class ProbeControllerTests(unittest.TestCase):
         mean_b, _value_b = model(state, expression_b)
 
         self.assertFalse(torch.allclose(mean_a, mean_b))
+
+    def test_probe_actor_accepts_custom_initial_action_noise(self):
+        model = ProbeConditionedGaussianActorCritic(
+            state_dim=8,
+            action_dim=2,
+            belief_dim=6,
+            hidden_dim=32,
+            initial_log_std=-0.5,
+        )
+
+        np.testing.assert_allclose(
+            model.log_std.detach().cpu().numpy(),
+            np.asarray([-0.5, -0.5], dtype=np.float32),
+        )
 
     def test_low_confidence_expression_stays_close_to_state_only_path(self):
         torch.manual_seed(0)
@@ -375,6 +390,26 @@ class ProbeControllerTests(unittest.TestCase):
 
         self.assertFalse(ready)
 
+    def test_env_expression_ready_accepts_strong_two_support_case(self):
+        ready = env_expression_is_ready(
+            confidence=0.55,
+            uncertainty_scalar=0.08,
+            future_probe_error=0.62,
+            heldout_family_future_error=0.60,
+            support_size_matched_future_error=0.58,
+            support_count=2,
+            support_diversity_ratio=0.92,
+            posterior_entropy=4.2,
+            gap_ratio=0.12,
+            split_retrieval_margin_deficit=0.02,
+            split_latent_disagreement=0.01,
+            leaveout_shift=0.03,
+            leaveout_param_std_mean=0.02,
+            uncertainty_probe_threshold=0.10,
+        )
+
+        self.assertTrue(ready)
+
     def test_near_ready_thresholds_do_not_override_weak_geometry(self):
         not_ready = env_expression_is_ready(
             confidence=0.34,
@@ -459,7 +494,7 @@ class ProbeControllerTests(unittest.TestCase):
         )
         self.assertGreater(strong_predictive["future_probe_quality"], 0.0)
 
-    def test_message_mode_uses_support_budget_to_progress_from_off_to_diag_to_on(self):
+    def test_message_mode_allows_strong_two_support_fair_handoff(self):
         components = compute_env_expression_readiness_components(
             future_probe_error=0.62,
             heldout_family_future_error=0.60,
@@ -496,8 +531,8 @@ class ProbeControllerTests(unittest.TestCase):
         self.assertGreaterEqual(components["future_probe_quality"], 0.62)
         self.assertEqual(off_mode, "off")
         self.assertEqual(off_blocker, "support_count")
-        self.assertEqual(diag_mode, "diag")
-        self.assertEqual(diag_blocker, "support_count")
+        self.assertEqual(diag_mode, "on")
+        self.assertEqual(diag_blocker, "enabled")
         self.assertEqual(on_mode, "on")
         self.assertEqual(on_blocker, "enabled")
 
@@ -573,6 +608,42 @@ class ProbeControllerTests(unittest.TestCase):
 
         self.assertEqual(diag_mode, "diag")
         self.assertEqual(diag_blocker, "future_probe_quality")
+
+    def test_marginal_subset_stability_enters_diag_instead_of_turning_off(self):
+        readiness_components = {
+            "future_probe_quality": 0.65,
+            "subset_stability": 0.32,
+            "leaveout_stability": 0.70,
+            "support_diversity": 0.85,
+        }
+
+        diag_mode, diag_blocker = compute_message_mode(
+            support_count=2,
+            confidence=0.55,
+            readiness_components=readiness_components,
+            readiness_score=0.32,
+        )
+
+        self.assertEqual(diag_mode, "diag")
+        self.assertEqual(diag_blocker, "subset_stability")
+
+    def test_very_weak_subset_stability_stays_off(self):
+        readiness_components = {
+            "future_probe_quality": 0.65,
+            "subset_stability": 0.12,
+            "leaveout_stability": 0.70,
+            "support_diversity": 0.85,
+        }
+
+        off_mode, off_blocker = compute_message_mode(
+            support_count=2,
+            confidence=0.55,
+            readiness_components=readiness_components,
+            readiness_score=0.12,
+        )
+
+        self.assertEqual(off_mode, "off")
+        self.assertEqual(off_blocker, "subset_stability")
 
     def test_solver_message_keep_scale_preserves_scalar_slots(self):
         belief = apply_solver_message_keep_scale(
@@ -1087,7 +1158,7 @@ class ProbeControllerTests(unittest.TestCase):
         self.assertAlmostEqual(float(muted_solver_expression[-2]), 0.0, places=6)
         self.assertAlmostEqual(float(muted_solver_expression[-1]), 0.1, places=6)
 
-    def test_solver_episode_expression_mutes_diag_message_in_strict_fair_mode(self):
+    def test_solver_episode_expression_softens_diag_message_in_strict_fair_mode(self):
         diag_expression = EnvExpression(
             vector=torch.tensor([0.25, -0.5], dtype=torch.float32).numpy(),
             confidence=0.8,
@@ -1114,8 +1185,9 @@ class ProbeControllerTests(unittest.TestCase):
             strict_fair_mode=True,
         )
 
-        self.assertEqual(expression_scale, 0.0)
-        self.assertAlmostEqual(float(solver_expression[-2]), 0.0, places=6)
+        self.assertGreater(expression_scale, 0.0)
+        self.assertLessEqual(expression_scale, DEFAULT_DIAGNOSTIC_SCALE_CAP)
+        self.assertAlmostEqual(float(solver_expression[-2]), expression_scale, places=6)
 
     def test_non_strict_diag_scale_softens_weaker_messages(self):
         strong_diag_expression = EnvExpression(

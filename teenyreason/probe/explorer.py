@@ -113,8 +113,13 @@ def _infer_box_family_labels(
 
         signs = []
         for axis in changed.tolist():
-            direction = "max" if abs(float(value[axis]) - float(high[axis])) <= abs(float(value[axis]) - float(low[axis])) else "min"
-            signs.append(f"a{axis}{direction[0]}")
+            direction = (
+                "max"
+                if abs(float(value[axis]) - float(high[axis]))
+                <= abs(float(value[axis]) - float(low[axis]))
+                else "min"
+            )
+            signs.append(f"a{axis}{direction}")
         labels.append(f"mix_{'_'.join(signs) or idx}")
     return _dedupe_labels(labels)
 

@@ -17,6 +17,10 @@ from ..core import (
 from .simulator_fanout import candidate_score
 
 
+MIN_CONTROLLER_ACTION_MARGIN = 0.03
+FULL_CONTROLLER_ACTION_MARGIN = 0.10
+
+
 @dataclass(frozen=True)
 class AffordanceSelection:
     """One explicit action-selection result for the cheap controller."""
@@ -395,16 +399,19 @@ def choose_affordance_action(
         best_idx = int(np.argmax(scores))
         best_candidate = candidate_actions[best_idx].reshape(-1)
         trust = float(aux["trust"].squeeze(0).item())
+        actor_score = float(scores[0]) if scores.size else 0.0
+        best_score = float(scores[best_idx]) if scores.size else actor_score
+        best_margin = float(best_score - actor_score)
         if force_state_only:
             state_best_idx = int(np.argmax(state_scores))
             chosen_action = candidate_actions[state_best_idx].reshape(-1).copy()
             controller_used = 0.0
             best_idx = state_best_idx
             scores = state_scores.copy()
-        elif trust < 0.15:
+        elif trust < 0.15 or best_idx == 0 or best_margin < MIN_CONTROLLER_ACTION_MARGIN:
             chosen_action = actor_action.copy()
             controller_used = 0.0
-        elif trust < 0.35:
+        elif trust < 0.35 or best_margin < FULL_CONTROLLER_ACTION_MARGIN:
             chosen_action = sanitize_numpy(0.5 * actor_action + 0.5 * best_candidate).reshape(-1)
             controller_used = 0.5
         else:

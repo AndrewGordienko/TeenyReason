@@ -147,6 +147,88 @@ def mix_controller_contexts(
     )
 
 
+def rolling_solve_average(returns: list[float], window: int) -> float | None:
+    """Return the current solve average once the requested window is full."""
+    active_window = max(1, int(window))
+    if len(returns) < active_window:
+        return None
+    return float(np.mean(np.asarray(returns[-active_window:], dtype=np.float32)))
+
+
+def maybe_extend_solve_episode_limit(
+    *,
+    episode_return: float,
+    episode: int,
+    episode_limit: int,
+    max_episode_limit: int,
+    solved_return: float,
+    solve_avg_window: int,
+) -> int:
+    """Give a late threshold hit enough room to become a rolling-average solve."""
+    if int(solve_avg_window) <= 1:
+        return int(episode_limit)
+    if float(episode_return) < float(solved_return):
+        return int(episode_limit)
+
+    needed_limit = int(episode) + max(1, int(solve_avg_window)) - 1
+    return min(max(int(episode_limit), needed_limit), int(max_episode_limit))
+
+
+def late_exploitation_entropy_coef(
+    *,
+    base_entropy_coef: float,
+    returns: list[float],
+    best_return_so_far: float,
+    solved_return: float,
+) -> float:
+    """Back off exploration once a continuous-control policy is near solved."""
+    base_entropy_coef = float(base_entropy_coef)
+    if not returns or solved_return <= 0.0:
+        return base_entropy_coef
+
+    recent_window = returns[-20:]
+    recent_return = float(np.mean(np.asarray(recent_window, dtype=np.float32)))
+    best_ratio = float(best_return_so_far) / max(float(solved_return), 1e-6)
+    recent_ratio = recent_return / max(float(solved_return), 1e-6)
+    progress_ratio = max(best_ratio, recent_ratio)
+    if progress_ratio >= 0.95 and recent_ratio >= 0.60:
+        return max(1e-5, 0.15 * base_entropy_coef)
+    if progress_ratio >= 0.90 and recent_ratio >= 0.50:
+        return max(1e-5, 0.30 * base_entropy_coef)
+    if progress_ratio >= 0.80 and recent_ratio >= 0.30:
+        return max(1e-5, 0.60 * base_entropy_coef)
+    return base_entropy_coef
+
+
+def cap_late_exploitation_action_std(
+    *,
+    policy: nn.Module,
+    returns: list[float],
+    best_return_so_far: float,
+    solved_return: float,
+) -> None:
+    """Trim sampling noise after the policy has shown a near-solve gait."""
+    if not returns or solved_return <= 0.0 or not hasattr(policy, "log_std"):
+        return
+
+    recent_window = returns[-20:]
+    recent_return = float(np.mean(np.asarray(recent_window, dtype=np.float32)))
+    best_ratio = float(best_return_so_far) / max(float(solved_return), 1e-6)
+    recent_ratio = recent_return / max(float(solved_return), 1e-6)
+    max_log_std = None
+    if best_ratio >= 0.95 and recent_ratio >= 0.60:
+        max_log_std = -1.25
+    elif best_ratio >= 0.90 and recent_ratio >= 0.50:
+        max_log_std = -1.00
+    elif best_ratio >= 0.80 and recent_ratio >= 0.30:
+        max_log_std = -0.75
+    if max_log_std is None:
+        return
+
+    with torch.no_grad():
+        policy.log_std.clamp_(min=-5.0, max=float(max_log_std))
+
+
 def compute_sil_loss(
     model: ProbeConditionedGaussianActorCritic,
     elite_buffer: EliteTrajectoryBuffer,
@@ -197,6 +279,7 @@ def train_plain_ppo(
     min_rollout_steps: int = 256,
     lr_anneal: bool = True,
     hidden_dim: int = 128,
+    initial_log_std: float = -1.5,
     normalize_rewards: bool = False,
     elite_capacity: int = 20000,
     sil_batch_size: int = 64,
@@ -208,7 +291,10 @@ def train_plain_ppo(
     seed: int = 0,
     randomize_physics: bool = False,
     solved_return: float = 500.0,
+    solve_avg_window: int = 1,
+    solve_grace_episodes: int = 0,
     solve_eval_episodes: int = 3,
+    late_exploitation_enabled: bool = True,
     run_index: int = 1,
     total_runs: int = 1,
     variant_label: str = "baseline",
@@ -230,16 +316,18 @@ def train_plain_ppo(
         action_dim,
         belief_dim=belief_dim,
         hidden_dim=hidden_dim,
+        initial_log_std=initial_log_std,
     ).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=lr)
     state_normalizer = RunningNormalizer(state_dim)
     reward_normalizer = RunningNormalizer(1, clip=10.0) if normalize_rewards else None
     elite_buffer = EliteTrajectoryBuffer(elite_capacity)
     returns = []
-    best_return_so_far = 0.0
+    best_return_so_far = float("-inf")
     best_policy_state_dict = snapshot_policy_state_dict(policy)
     best_state_normalizer_state = snapshot_normalizer_state(state_normalizer)
     best_episode = None
+    best_env_steps = None
     solved_episode = None
     solved_env_steps = None
     solve_policy_state_dict = None
@@ -247,8 +335,12 @@ def train_plain_ppo(
     solve_eval_returns = None
     total_env_steps = 0
     rollout_chunk = init_rollout_chunk(track_beliefs=False)
+    episode_limit = max(1, int(num_episodes))
+    max_episode_limit = episode_limit + max(0, int(solve_grace_episodes))
+    anneal_episode_count = max_episode_limit if solve_grace_episodes > 0 else episode_limit
 
-    for episode in range(1, num_episodes + 1):
+    episode = 1
+    while episode <= episode_limit:
         if trace_writer is not None and episode == 1:
             trace_writer.set_stage(
                 "baseline_training",
@@ -260,8 +352,22 @@ def train_plain_ppo(
                 variant=variant_label,
             )
         if lr_anneal:
-            progress_left = max(0.0, 1.0 - float(episode - 1) / max(float(num_episodes), 1.0))
+            progress_left = max(0.0, 1.0 - float(episode - 1) / max(float(anneal_episode_count), 1.0))
             set_optimizer_lr(optimizer, lr * progress_left)
+        episode_entropy_coef = float(entropy_coef)
+        if late_exploitation_enabled:
+            episode_entropy_coef = late_exploitation_entropy_coef(
+                base_entropy_coef=episode_entropy_coef,
+                returns=returns,
+                best_return_so_far=best_return_so_far,
+                solved_return=solved_return,
+            )
+            cap_late_exploitation_action_std(
+                policy=policy,
+                returns=returns,
+                best_return_so_far=best_return_so_far,
+                solved_return=solved_return,
+            )
         episode_physics = select_episode_physics(rng, randomize_physics, base_physics)
         apply_env_params(env, episode_physics)
         raw_state, _info = env.reset()
@@ -337,7 +443,9 @@ def train_plain_ppo(
             last_terminated = bool(terminated)
             done = bool(terminated or truncated)
 
-            if rollout_chunk_step_count(rollout_chunk) >= min_rollout_steps or done:
+            if rollout_chunk_step_count(rollout_chunk) >= min_rollout_steps or (
+                done and episode == episode_limit
+            ):
                 chunk_bootstrap_value = 0.0
                 if not terminated:
                     next_state_t = torch.tensor(
@@ -388,7 +496,7 @@ def train_plain_ppo(
                     action_high=action_high,
                     clip_ratio=clip_ratio,
                     value_loss_weight=value_loss_weight,
-                    entropy_coef=entropy_coef,
+                    entropy_coef=episode_entropy_coef,
                     ppo_epochs=ppo_epochs,
                     minibatch_size=minibatch_size,
                     max_grad_norm=max_grad_norm,
@@ -444,6 +552,7 @@ def train_plain_ppo(
             best_policy_state_dict = snapshot_policy_state_dict(policy)
             best_state_normalizer_state = snapshot_normalizer_state(state_normalizer)
             best_episode = episode
+            best_env_steps = total_env_steps
         best_return_so_far = max(best_return_so_far, episode_return)
         avg_10 = np.mean(returns[-10:])
         current_solved_episode = solved_episode
@@ -473,7 +582,16 @@ def train_plain_ppo(
                 total_env_steps=total_env_steps,
             )
 
-        if episode_return >= solved_return:
+        episode_limit = maybe_extend_solve_episode_limit(
+            episode_return=episode_return,
+            episode=episode,
+            episode_limit=episode_limit,
+            max_episode_limit=max_episode_limit,
+            solved_return=solved_return,
+            solve_avg_window=solve_avg_window,
+        )
+        solve_average = rolling_solve_average(returns, solve_avg_window)
+        if solve_average is not None and solve_average >= float(solved_return):
             solved_episode = episode
             solved_env_steps = total_env_steps
             solve_policy_state_dict = snapshot_policy_state_dict(policy)
@@ -485,9 +603,48 @@ def train_plain_ppo(
                 variant_label=variant_label,
                 episode=episode,
                 total_env_steps=total_env_steps,
-                episode_return=episode_return,
+                episode_return=float(solve_average),
             )
             break
+        episode += 1
+
+    if solve_avg_window <= 1 and solve_eval_episodes > 0 and best_episode is not None:
+        eval_policy = PlainGaussianActorCritic(
+            state_dim,
+            action_dim,
+            belief_dim=belief_dim,
+            hidden_dim=hidden_dim,
+            initial_log_std=initial_log_std,
+        ).to(device)
+        eval_policy.load_state_dict(best_policy_state_dict)
+        eval_policy.eval()
+        eval_normalizer = restore_normalizer_state(state_dim, best_state_normalizer_state)
+        solve_eval_returns, _eval_steps = evaluate_plain_policy(
+            policy=eval_policy,
+            state_normalizer=eval_normalizer,
+            env_name=env_name,
+            action_low=action_low,
+            action_high=action_high,
+            randomize_physics=randomize_physics,
+            base_physics=base_physics,
+            eval_episodes=solve_eval_episodes,
+            seed=seed,
+        )
+        solve_eval_best_return = float(np.max(np.asarray(solve_eval_returns, dtype=np.float32)))
+        if solve_eval_best_return >= float(solved_return):
+            solved_episode = int(best_episode)
+            solved_env_steps = int(best_env_steps or total_env_steps)
+            solve_policy_state_dict = best_policy_state_dict
+            solve_state_normalizer_state = best_state_normalizer_state
+            print_solve_event(
+                run_index=run_index,
+                total_runs=total_runs,
+                seed=seed,
+                variant_label=variant_label,
+                episode=int(best_episode),
+                total_env_steps=int(solved_env_steps),
+                episode_return=solve_eval_best_return,
+            )
 
     env.close()
     return TrainingRunResult(
@@ -552,6 +709,7 @@ def train_probe_conditioned_ppo(
     min_rollout_steps: int = 256,
     lr_anneal: bool = True,
     hidden_dim: int = 128,
+    initial_log_std: float = -1.5,
     normalize_rewards: bool = False,
     seed: int = 0,
     randomize_physics: bool = False,
@@ -581,6 +739,8 @@ def train_probe_conditioned_ppo(
     elite_warmup_episodes: int = 25,
     elite_threshold_std_scale: float = 1.5,
     solved_return: float = 500.0,
+    solve_avg_window: int = 1,
+    solve_grace_episodes: int = 0,
     solve_eval_episodes: int = 3,
     run_index: int = 1,
     total_runs: int = 1,
@@ -640,6 +800,7 @@ def train_probe_conditioned_ppo(
             mechanics_dim=int(encoder.z_dim),
             affordance_dim=int(encoder.z_dim),
             hidden_dim=hidden_dim,
+            initial_log_std=initial_log_std,
         ).to(device)
     else:
         policy = ProbeConditionedGaussianActorCritic(
@@ -647,6 +808,7 @@ def train_probe_conditioned_ppo(
             action_dim=train_env.action_space.shape[0],
             belief_dim=belief_dim,
             hidden_dim=hidden_dim,
+            initial_log_std=initial_log_std,
         ).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=lr)
     state_normalizer = RunningNormalizer(state_dim)
@@ -695,10 +857,14 @@ def train_probe_conditioned_ppo(
     )
 
     returns = []
-    best_return_so_far = 0.0
+    best_return_so_far = float("-inf")
     best_policy_state_dict = snapshot_policy_state_dict(policy)
     best_state_normalizer_state = snapshot_normalizer_state(state_normalizer)
     best_episode = None
+    best_env_steps = None
+    best_probe_count = None
+    best_probe_stop_reason = None
+    best_fair_handoff_probe_families = None
     solved_episode = None
     solved_env_steps = None
     solve_policy_state_dict = None
@@ -790,8 +956,12 @@ def train_probe_conditioned_ppo(
         track_beliefs=True,
         track_recurrent_hidden=belief_native_controller,
     )
+    episode_limit = max(1, int(num_episodes))
+    max_episode_limit = episode_limit + max(0, int(solve_grace_episodes))
+    anneal_episode_count = max_episode_limit if solve_grace_episodes > 0 else episode_limit
 
-    for episode in range(1, num_episodes + 1):
+    episode = 1
+    while episode <= episode_limit:
         if trace_writer is not None and episode == 1:
             trace_writer.set_stage(
                 "probe_training",
@@ -811,7 +981,7 @@ def train_probe_conditioned_ppo(
                 variant=variant_label,
             )
         if lr_anneal:
-            progress_left = max(0.0, 1.0 - float(episode - 1) / max(float(num_episodes), 1.0))
+            progress_left = max(0.0, 1.0 - float(episode - 1) / max(float(anneal_episode_count), 1.0))
             set_optimizer_lr(optimizer, lr * progress_left)
         episode_probe_steps = 0
         episode_physics = select_episode_physics(rng, randomize_physics, base_physics)
@@ -820,6 +990,7 @@ def train_probe_conditioned_ppo(
             action_space=probe_env.action_space,
             action_values=action_values,
             rng=rng,
+            env_name=env_name,
         )
         if probe_planner is not None:
             probe_planner.begin_env_instance()
@@ -1579,7 +1750,12 @@ def train_probe_conditioned_ppo(
                 )
         else:
             expression_force_muted_by_policy = (
-                fair_mode and (not disable_env_expression) and (not fair_expression_allowed)
+                fair_mode
+                and (not disable_env_expression)
+                and (
+                    message_mode == "off"
+                    or (message_mode == "on" and (not fair_expression_allowed))
+                )
             )
             expression_mute_reason = (
                 "fair_not_ready" if expression_force_muted_by_policy else None
@@ -1643,7 +1819,7 @@ def train_probe_conditioned_ppo(
             raw_controller_input_scale = float(controller_input_scale)
             episode_expression_keep_scale = 1.0
             if controller_input_scale > 0.0:
-                if message_mode != "diag":
+                if message_mode not in {"diag", "on"}:
                     episode_expression_keep_scale = sample_solver_training_message_keep_scale(
                         rng=rng,
                         current_episode=episode,
@@ -1701,6 +1877,18 @@ def train_probe_conditioned_ppo(
         else:
             episode_entropy_coef = float(entropy_coef)
             episode_ppo_epochs = int(ppo_epochs)
+        episode_entropy_coef = late_exploitation_entropy_coef(
+            base_entropy_coef=episode_entropy_coef,
+            returns=returns,
+            best_return_so_far=best_return_so_far,
+            solved_return=solved_return,
+        )
+        cap_late_exploitation_action_std(
+            policy=policy,
+            returns=returns,
+            best_return_so_far=best_return_so_far,
+            solved_return=solved_return,
+        )
 
         apply_env_params(train_env, episode_physics)
         raw_state, _info = train_env.reset()
@@ -1944,7 +2132,9 @@ def train_probe_conditioned_ppo(
             last_terminated = bool(terminated)
             done = bool(terminated or truncated)
 
-            if rollout_chunk_step_count(rollout_chunk) >= min_rollout_steps or done:
+            if rollout_chunk_step_count(rollout_chunk) >= min_rollout_steps or (
+                done and episode == episode_limit
+            ):
                 chunk_bootstrap_value = 0.0
                 if not terminated:
                     next_state_t = torch.tensor(
@@ -2086,6 +2276,14 @@ def train_probe_conditioned_ppo(
             best_policy_state_dict = snapshot_policy_state_dict(policy)
             best_state_normalizer_state = snapshot_normalizer_state(state_normalizer)
             best_episode = episode
+            best_env_steps = total_env_steps
+            best_probe_count = int(probe_count)
+            best_probe_stop_reason = probe_stop_reason
+            best_fair_handoff_probe_families = (
+                None
+                if last_fair_handoff_probe_families is None
+                else list(last_fair_handoff_probe_families)
+            )
         best_return_so_far = max(best_return_so_far, episode_return)
         performance_memory.push(mean_z, episode_return)
         avg_10 = np.mean(returns[-10:])
@@ -2151,7 +2349,16 @@ def train_probe_conditioned_ppo(
                 expression_mute_reason=expression_mute_reason,
             )
 
-        if episode_return >= solved_return:
+        episode_limit = maybe_extend_solve_episode_limit(
+            episode_return=episode_return,
+            episode=episode,
+            episode_limit=episode_limit,
+            max_episode_limit=max_episode_limit,
+            solved_return=solved_return,
+            solve_avg_window=solve_avg_window,
+        )
+        solve_average = rolling_solve_average(returns, solve_avg_window)
+        if solve_average is not None and solve_average >= float(solved_return):
             solved_episode = episode
             solved_env_steps = total_env_steps
             solve_policy_state_dict = snapshot_policy_state_dict(policy)
@@ -2170,12 +2377,13 @@ def train_probe_conditioned_ppo(
                 variant_label=variant_label,
                 episode=episode,
                 total_env_steps=total_env_steps,
-                episode_return=episode_return,
+                episode_return=float(solve_average),
                 probe_count=int(probe_count),
             )
             break
+        episode += 1
 
-    if solve_eval_episodes > 0 and best_episode is not None:
+    if solve_avg_window <= 1 and solve_eval_episodes > 0 and best_episode is not None:
         eval_full_system_context_source = (
             "learned"
             if full_system_context_source == "curriculum"
@@ -2188,6 +2396,7 @@ def train_probe_conditioned_ppo(
                 mechanics_dim=int(encoder.z_dim),
                 affordance_dim=int(encoder.z_dim),
                 hidden_dim=hidden_dim,
+                initial_log_std=initial_log_std,
             ).to(device)
         else:
             eval_policy = ProbeConditionedGaussianActorCritic(
@@ -2195,6 +2404,7 @@ def train_probe_conditioned_ppo(
                 action_dim=train_env.action_space.shape[0],
                 belief_dim=belief_dim,
                 hidden_dim=hidden_dim,
+                initial_log_std=initial_log_std,
             ).to(device)
         eval_policy.load_state_dict(best_policy_state_dict)
         eval_policy.eval()
@@ -2233,6 +2443,29 @@ def train_probe_conditioned_ppo(
             disable_online_refinement=(belief_native_controller and (not full_system_online_refinement)),
             full_system_context_source=eval_full_system_context_source,
         )
+        solve_eval_best_return = float(np.max(np.asarray(solve_eval_returns, dtype=np.float32)))
+        if solve_eval_best_return >= float(solved_return):
+            solved_episode = int(best_episode)
+            solved_env_steps = int(best_env_steps or total_env_steps)
+            solve_policy_state_dict = best_policy_state_dict
+            solve_state_normalizer_state = best_state_normalizer_state
+            solve_probe_count = None if best_probe_count is None else int(best_probe_count)
+            solve_probe_stop_reason = best_probe_stop_reason
+            solve_fair_handoff_probe_families = (
+                None
+                if best_fair_handoff_probe_families is None
+                else list(best_fair_handoff_probe_families)
+            )
+            print_solve_event(
+                run_index=run_index,
+                total_runs=total_runs,
+                seed=seed,
+                variant_label=variant_label,
+                episode=int(best_episode),
+                total_env_steps=int(solved_env_steps),
+                episode_return=solve_eval_best_return,
+                probe_count=solve_probe_count,
+            )
         if belief_native_controller:
             zero_context_eval_returns, _zero_steps, _zero_probe_windows = evaluate_probe_policy(
                 policy=eval_policy,

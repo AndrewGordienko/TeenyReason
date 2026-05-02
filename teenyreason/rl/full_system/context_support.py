@@ -84,6 +84,8 @@ def collect_support_context(
     trace_writer,
     episode: int,
     variant_label: str,
+    belief_bits_per_dim: int = 0,
+    belief_use_residual_sketch: bool = False,
 ) -> dict | None:
     """Collect one compact support set and return the latest crawler step result."""
     probe_target_count = max(1, int(base_probe_episodes))
@@ -100,6 +102,7 @@ def collect_support_context(
         action_space=probe_env.action_space,
         action_values=action_values,
         rng=rng,
+        env_name=env_name,
     )
     if probe_planner is not None:
         probe_planner.begin_env_instance()
@@ -194,7 +197,11 @@ def collect_support_context(
             family_names=crawler_bundle.family_names,
         )
         if str(getattr(crawler_bundle, "belief_mode", "latent_pool")) == "particle_sysid":
-            belief, payload = crawler_bundle.build_particle_env_belief(probe_windows)
+            belief, payload = crawler_bundle.build_particle_env_belief(
+                probe_windows,
+                bits_per_dim=int(belief_bits_per_dim),
+                use_residual_sketch=bool(belief_use_residual_sketch),
+            )
         else:
             belief, payload = aggregate_env_belief(
                 belief_aggregator=belief_aggregator,
@@ -219,8 +226,8 @@ def collect_support_context(
             expected_family_gain=expected_family_gain,
             realized_family_gain={},
             stop_reason=None,
-            bits_per_dim=0,
-            use_residual_sketch=False,
+            bits_per_dim=int(belief_bits_per_dim),
+            use_residual_sketch=bool(belief_use_residual_sketch),
         )
         total_probe_windows += 1
         probe_count += 1

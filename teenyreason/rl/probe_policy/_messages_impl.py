@@ -47,7 +47,7 @@ DEFAULT_SHADOW_SCALE_CAP = 0.20
 DEFAULT_FAIR_POLICY_FUTURE_QUALITY_FLOOR = 0.50
 DEFAULT_FAIR_POLICY_SUBSET_STABILITY_FLOOR = 0.45
 DEFAULT_FAIR_POLICY_LEAVEOUT_STABILITY_FLOOR = 0.55
-DEFAULT_FAIR_POLICY_CONFIDENCE_FLOOR = 0.35
+DEFAULT_FAIR_POLICY_CONFIDENCE_FLOOR = 0.30
 DEFAULT_FAIR_POLICY_ONLINE_OFFLINE_GAP_CEILING = 0.05
 DEFAULT_FAIR_POLICY_STRONG_READINESS_FLOOR = 0.62
 DEFAULT_FAIR_POLICY_STRONG_SUBSET_STABILITY_FLOOR = 0.60
@@ -57,6 +57,7 @@ DEFAULT_READY_SUPPORT_COUNT = 4
 DEFAULT_DIAGNOSTIC_CONFIDENCE_FLOOR = 0.25
 DEFAULT_DIAGNOSTIC_FUTURE_QUALITY_FLOOR = 0.35
 DEFAULT_DIAGNOSTIC_SUBSET_STABILITY_FLOOR = 0.45
+DEFAULT_DIAGNOSTIC_SUBSET_STABILITY_HARD_FLOOR = 0.25
 DEFAULT_DIAGNOSTIC_SCALE_FLOOR = 0.12
 DEFAULT_DIAGNOSTIC_SCALE_CAP = 0.20
 DEFAULT_FORCED_EVAL_EXPRESSION_SCALE = 0.15
@@ -304,8 +305,18 @@ def compute_message_mode(
     if future_quality < DEFAULT_DIAGNOSTIC_FUTURE_QUALITY_FLOOR:
         return "diag", "future_probe_quality"
     if subset_stability < DEFAULT_DIAGNOSTIC_SUBSET_STABILITY_FLOOR:
+        if subset_stability >= DEFAULT_DIAGNOSTIC_SUBSET_STABILITY_HARD_FLOOR:
+            return "diag", "subset_stability"
         return "off", "subset_stability"
     if support_count < DEFAULT_READY_SUPPORT_COUNT:
+        if (
+            support_count >= DEFAULT_DIAGNOSTIC_SUPPORT_COUNT
+            and float(confidence) >= DEFAULT_FAIR_POLICY_CONFIDENCE_FLOOR
+            and float(readiness_score) >= DEFAULT_FAIR_POLICY_STRONG_READINESS_FLOOR
+            and future_quality >= DEFAULT_FAIR_POLICY_FUTURE_QUALITY_FLOOR
+            and subset_stability >= DEFAULT_FAIR_POLICY_STRONG_SUBSET_STABILITY_FLOOR
+        ):
+            return "on", "enabled"
         return "diag", "support_count"
     if float(confidence) < DEFAULT_READY_CONFIDENCE_FLOOR:
         return "diag", "confidence"
@@ -599,6 +610,11 @@ def env_expression_is_ready(
             leaveout_param_std_mean=leaveout_param_std_mean,
         )
     enough_support = support_count is None or int(support_count) >= DEFAULT_READY_SUPPORT_COUNT
+    if not enough_support and support_count is not None:
+        enough_support = (
+            int(support_count) >= DEFAULT_DIAGNOSTIC_SUPPORT_COUNT
+            and float(readiness_score) >= DEFAULT_FAIR_POLICY_STRONG_READINESS_FLOOR
+        )
     return bool(
         enough_support
         and float(confidence) >= float(confidence_floor)
@@ -1346,11 +1362,12 @@ def build_solver_episode_expression(
         )
         or (
             strict_fair_mode
-            and effective_message_mode != "on"
+            and effective_message_mode == "off"
             and forced_expression_scale is None
         )
         or (
             strict_fair_mode
+            and effective_message_mode == "on"
             and not fair_expression_allowed
             and forced_expression_scale is None
         )

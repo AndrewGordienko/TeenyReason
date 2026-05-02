@@ -17,6 +17,7 @@ from .envs import (
     BIPEDAL_WALKER_NAME,
     CONTINUOUS_CARTPOLE_NAME,
     CONTINUOUS_LUNAR_LANDER_NAME,
+    make_env as make,
 )
 from .envs.continuous_cartpole import ContinuousCartPoleEnv
 from .recipes import (
@@ -30,11 +31,9 @@ from .recipes import (
 )
 
 
-Evidence = EvidenceSlice
-Belief = BeliefState
-Message = CrawlerMessage
-Step = CrawlerStep
-Run = CrawlerRunResult
+SeedInput = int | list[int] | tuple[int, ...] | None
+Evidence, Belief, Message = EvidenceSlice, BeliefState, CrawlerMessage
+Step, Run = CrawlerStep, CrawlerRunResult
 
 
 def _normalize_profile_kwargs(values: dict[str, Any]) -> dict[str, Any]:
@@ -45,7 +44,7 @@ def _normalize_profile_kwargs(values: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _normalize_seed_input(seeds: int | list[int] | tuple[int, ...] | None) -> list[int] | None:
+def _normalize_seed_input(seeds: SeedInput) -> list[int] | None:
     if seeds is None:
         return None
     if isinstance(seeds, int):
@@ -73,9 +72,71 @@ def recipe(name: str, **kwargs: Any) -> CrawlerRecipe:
 
 def ppo(**kwargs: Any) -> PPOBenchmarkConsumer:
     """Build the small PPO benchmark consumer."""
-    return PPOBenchmarkConsumer(
-        default_config_override=_normalize_profile_kwargs(kwargs)
+    return PPOBenchmarkConsumer(default_config_override=_normalize_profile_kwargs(kwargs))
+
+
+def crawler(env=CONTINUOUS_CARTPOLE_NAME, **kwargs: Any):
+    """Build a reusable crawler setup without loading or training PPO."""
+    from .crawler.setup import crawler_setup
+
+    return crawler_setup(env, **kwargs)
+
+
+def probe_ppo(
+    env=None,
+    *,
+    seeds: SeedInput = 1,
+    profile: str | None = "fast",
+    overrides: dict[str, Any] | None = None,
+):
+    """Build a probe-conditioned PPO component, or run it when env is supplied."""
+    from .algos import ProbeConditionedPPO
+
+    algo = ProbeConditionedPPO(
+        profile=profile,
+        seeds=seeds,
+        config_override=_normalize_profile_kwargs(overrides or {}),
     )
+    if env is None:
+        return algo
+    return algo.train(env)
+
+
+def compare_ppo(
+    envs=None,
+    *,
+    seeds: SeedInput = 1,
+    profile: str | None = "fast",
+    overrides: dict[str, Any] | None = None,
+    env_overrides: dict[str, dict[str, Any]] | None = None,
+):
+    """Run the live standard-PPO vs probe-PPO comparison suite."""
+    from .app.ppo_comparison import DEFAULT_COMPARISON_ENVS, run_ppo_comparison
+
+    if envs is None:
+        env_names = DEFAULT_COMPARISON_ENVS
+    elif isinstance(envs, str):
+        env_names = (envs,)
+    else:
+        env_names = tuple(str(env) for env in envs)
+    return run_ppo_comparison(
+        env_names,
+        seeds=_normalize_seed_input(seeds),
+        profile=profile,
+        common_overrides=_normalize_profile_kwargs(overrides or {}),
+        env_overrides=env_overrides,
+    )
+
+
+def load_crawler(*args: Any, **kwargs: Any):
+    """Load the best available crawler for a Gym-like environment."""
+    from .crawler.runtime import best_crawler as _best_crawler
+
+    return _best_crawler(*args, **kwargs)
+
+
+best_crawler = load_crawler
+crawler_for = load_crawler
 
 
 def _default_algo(recipe_obj: CrawlerRecipe):
@@ -99,14 +160,17 @@ def _coerce_recipe(source: str | CrawlerRecipe | type | object, **kwargs: Any) -
     env_name = getattr(source, "gym_id", None) or getattr(source, "env_name", None)
     if isinstance(env_name, str) and env_name:
         return recipe(env_name, **kwargs)
-    raise ValueError("run(...) expects a gym id string, a crawler recipe, or a custom env class with env_name/gym_id.")
+    raise ValueError(
+        "run(...) expects a gym id string, a crawler recipe, "
+        "or a custom env class with env_name/gym_id."
+    )
 
 
 def run(
     env,
     algo=None,
     *,
-    seeds: int | list[int] | tuple[int, ...] | None = 2,
+    seeds: SeedInput = 2,
     profile: str | None = "fast",
     overrides: dict[str, Any] | None = None,
 ):
@@ -129,23 +193,11 @@ def bench(
     recipe_obj: CrawlerRecipe,
     *,
     algo=None,
-    seeds: list[int] | None = None,
+    seeds: SeedInput = None,
     profile: str | None = None,
     overrides: dict[str, Any] | None = None,
 ):
     """Compatibility wrapper around the smaller public run(...) entrypoint."""
     return run(recipe_obj, algo=algo, seeds=seeds, profile=profile, overrides=overrides)
 
-
-__all__ = [
-    "Belief",
-    "Crawler",
-    "Evidence",
-    "Message",
-    "Run",
-    "Step",
-    "bench",
-    "ppo",
-    "recipe",
-    "run",
-]
+__all__ = ["Belief", "Crawler", "Evidence", "Message", "Run", "Step", "bench", "best_crawler", "compare_ppo", "crawler", "crawler_for", "load_crawler", "make", "ppo", "probe_ppo", "recipe", "run"]

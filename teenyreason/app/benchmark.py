@@ -324,6 +324,7 @@ def run_single_seed(
         min_rollout_steps=config.min_rollout_steps,
         lr_anneal=config.lr_anneal,
         hidden_dim=config.hidden_dim,
+        initial_log_std=config.initial_log_std,
         normalize_rewards=config.normalize_rewards,
         seed=seed,
         randomize_physics=config.randomize_physics,
@@ -362,6 +363,7 @@ def run_single_seed(
         min_rollout_steps=config.min_rollout_steps,
         lr_anneal=config.lr_anneal,
         hidden_dim=config.hidden_dim,
+        initial_log_std=config.initial_log_std,
         normalize_rewards=config.normalize_rewards,
         seed=seed,
         randomize_physics=config.randomize_physics,
@@ -424,6 +426,7 @@ def run_single_seed(
             min_rollout_steps=config.min_rollout_steps,
             lr_anneal=config.lr_anneal,
             hidden_dim=config.hidden_dim,
+            initial_log_std=config.initial_log_std,
             normalize_rewards=config.normalize_rewards,
             seed=seed,
             randomize_physics=config.randomize_physics,
@@ -486,6 +489,7 @@ def run_single_seed(
             min_rollout_steps=config.min_rollout_steps,
             lr_anneal=config.lr_anneal,
             hidden_dim=config.hidden_dim,
+            initial_log_std=config.initial_log_std,
             normalize_rewards=config.normalize_rewards,
             seed=seed,
             randomize_physics=config.randomize_physics,
@@ -775,6 +779,7 @@ def run_single_seed(
         z_dim=config.z_dim,
         action_bins=config.action_bins,
         hidden_dim=config.hidden_dim,
+        initial_log_std=config.initial_log_std,
         belief_bits_per_dim=config.belief_bits_per_dim,
         belief_use_residual_sketch=config.belief_use_residual_sketch,
         online_z_update_alpha=config.online_z_update_alpha,
@@ -1447,7 +1452,7 @@ def run_training_pipeline(
     )
     live_trace = LiveTrainingTraceWriter(
         artifact_dir=artifact_dir,
-        enabled=(config.env_name == CONTINUOUS_CARTPOLE_NAME),
+        enabled=True,
     )
     live_trace.reset_session(
         env_name=config.env_name,

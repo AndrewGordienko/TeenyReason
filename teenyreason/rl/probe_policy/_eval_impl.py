@@ -271,6 +271,7 @@ def evaluate_probe_policy(
             action_space=env.action_space,
             action_values=action_values,
             rng=rng,
+            env_name=env_name,
         )
         if probe_planner is not None:
             probe_planner.begin_env_instance()

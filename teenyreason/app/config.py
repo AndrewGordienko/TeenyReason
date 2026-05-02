@@ -99,6 +99,7 @@ class ExperimentConfig:
     min_rollout_steps: int
     lr_anneal: bool
     hidden_dim: int
+    initial_log_std: float
     normalize_rewards: bool
     num_episodes: int
 
@@ -193,6 +194,7 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             min_rollout_steps=1024,
             lr_anneal=True,
             hidden_dim=256,
+            initial_log_std=-1.5,
             normalize_rewards=True,
             num_episodes=2000,
         )
@@ -285,6 +287,7 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             min_rollout_steps=1024,
             lr_anneal=True,
             hidden_dim=256,
+            initial_log_std=-0.5,
             normalize_rewards=True,
             num_episodes=1500,
         )
@@ -377,6 +380,7 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             min_rollout_steps=512,
             lr_anneal=True,
             hidden_dim=128,
+            initial_log_std=-1.5,
             normalize_rewards=False,
             num_episodes=1000,
         )

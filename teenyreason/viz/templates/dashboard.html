@@ -617,6 +617,115 @@
       text-transform: uppercase;
     }
 
+    .comparison-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+      margin-top: 22px;
+    }
+
+    .comparison-card {
+      display: grid;
+      gap: 12px;
+      padding-top: 16px;
+      border-top: 1px solid var(--line);
+      min-width: 0;
+    }
+
+    .comparison-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .comparison-title {
+      font-size: 18px;
+      line-height: 1.1;
+      letter-spacing: 0;
+      font-weight: 680;
+    }
+
+    .comparison-status {
+      color: var(--muted);
+      font-size: 11px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .comparison-chart {
+      border: 1px solid var(--line);
+      background: #fff;
+      width: 100%;
+      min-height: 180px;
+    }
+
+    .comparison-stats {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .comparison-stat {
+      border-top: 1px solid var(--line);
+      padding-top: 10px;
+    }
+
+    .comparison-k {
+      color: var(--muted);
+      font-size: 10px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+
+    .comparison-v {
+      font-size: 20px;
+      line-height: 1;
+      letter-spacing: 0;
+      font-weight: 650;
+    }
+
+    .paper-figure-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 24px;
+      margin-top: 24px;
+    }
+
+    .paper-figure-card {
+      border-top: 2px solid var(--ink);
+      padding-top: 14px;
+      min-width: 0;
+    }
+
+    .paper-figure-wide {
+      grid-column: 1 / -1;
+    }
+
+    .paper-figure-title {
+      font-size: 16px;
+      line-height: 1.2;
+      letter-spacing: 0;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+
+    .paper-figure-caption {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+      margin-bottom: 12px;
+    }
+
+    .paper-figure-svg {
+      border: 1px solid var(--line);
+      background: #fff;
+      width: 100%;
+      min-height: 250px;
+    }
+
     .diagnostic-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -879,8 +988,14 @@
       .hero,
       .overview-band,
       .diagnostic-grid,
+      .comparison-grid,
+      .paper-figure-grid,
       .live-grid {
         grid-template-columns: 1fr;
+      }
+
+      .paper-figure-wide {
+        grid-column: auto;
       }
 
       .metric-board {
@@ -901,6 +1016,7 @@
       .metric-board,
       .matrix,
       .summary-strip,
+      .comparison-stats,
       .live-summary-grid {
         grid-template-columns: 1fr;
       }
@@ -950,6 +1066,7 @@
       <button class="deck-button is-active" data-deck-target="live">Live Deck</button>
       <button class="deck-button" data-deck-target="latent">Representation</button>
       <button class="deck-button" data-deck-target="benchmark">Benchmark</button>
+      <button class="deck-button" data-deck-target="comparison">PPO Comparison</button>
     </nav>
 
     <section class="section deck-section is-active" id="deck-live">
@@ -1188,6 +1305,23 @@
         <div id="benchmarkCards" class="summary-list"></div>
         <div class="footer-note" id="dashboardNote"></div>
       </div>
+    </section>
+
+    <section class="section deck-section" id="deck-comparison">
+      <div class="section-head">
+        <div class="section-title-block">
+          <div class="section-label">Direct Comparison</div>
+          <h2 class="section-title">PPO vs Probe-Conditioned PPO</h2>
+          <div class="section-copy">
+            Paper-style figures for sample efficiency, performance ceiling, and learning dynamics across
+            Continuous CartPole, LunarLanderContinuous, and BipedalWalker. Solid green is standard PPO;
+            solid blue is the probe-conditioned run.
+          </div>
+        </div>
+      </div>
+
+      <div id="paperFigureBoard" class="paper-figure-grid"></div>
+      <div id="comparisonBoard" class="comparison-grid"></div>
     </section>
   </div>
 
@@ -1646,6 +1780,481 @@
           <div class="live-mini-note">${numericValues.length} observations tracked in the current live run.</div>
         </div>
       `;
+    }
+
+    function comparisonSolveLabel(values) {
+      if (!Array.isArray(values) || !values.length) {
+        return "pending";
+      }
+      const solved = values
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value) && value >= 0);
+      return solved.length ? formatInteger(Math.min(...solved)) : "unsolved";
+    }
+
+    function comparisonLatestAvg10(rows) {
+      const values = (rows || [])
+        .map((row) => Number(row.avg10))
+        .filter((value) => Number.isFinite(value));
+      return values.length ? values[values.length - 1].toFixed(1) : "pending";
+    }
+
+    function comparisonSolvedValue(values) {
+      if (!Array.isArray(values) || !values.length) {
+        return null;
+      }
+      const solved = values
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value) && value >= 0);
+      return solved.length ? Math.min(...solved) : null;
+    }
+
+    function comparisonNumericList(summary, key, seedField) {
+      const directValues = summary?.[key];
+      if (Array.isArray(directValues) && directValues.length) {
+        return directValues
+          .map((value) => Number(value))
+          .filter((value) => Number.isFinite(value));
+      }
+      const rows = summary?.seed_results;
+      if (Array.isArray(rows) && rows.length) {
+        return rows
+          .map((row) => Number(row?.[seedField]))
+          .filter((value) => Number.isFinite(value));
+      }
+      return [];
+    }
+
+    function comparisonSolveOrCap(summary, solveKey, totalKey, seedSolveField, seedTotalField) {
+      const solvedValue = comparisonSolvedValue(comparisonNumericList(summary, solveKey, seedSolveField));
+      if (solvedValue != null) {
+        return {value: solvedValue, label: solvedValue >= 1000 ? formatCompactNumber(solvedValue) : solvedValue.toFixed(0)};
+      }
+      const totalValues = comparisonNumericList(summary, totalKey, seedTotalField)
+        .filter((value) => value > 0);
+      if (totalValues.length) {
+        const cappedValue = Math.max(...totalValues);
+        return {
+          value: cappedValue,
+          label: `unsolved @ ${formatCompactNumber(cappedValue)}`,
+          capped: true,
+        };
+      }
+      return {value: null, label: "pending"};
+    }
+
+    function comparisonMaxValue(rows, field) {
+      const values = (rows || [])
+        .map((row) => Number(row[field]))
+        .filter((value) => Number.isFinite(value));
+      return values.length ? Math.max(...values) : null;
+    }
+
+    function comparisonEnvShortName(run) {
+      const label = run?.env_display_name || run?.env_name || "Env";
+      if (label.includes("CartPole")) {
+        return "CartPole";
+      }
+      if (label.includes("Lunar")) {
+        return "Lunar";
+      }
+      if (label.includes("Bipedal")) {
+        return "Biped";
+      }
+      return label.replace("Continuous ", "");
+    }
+
+    function comparisonLineChartSvg(baselineRows, probeRows) {
+      const baseline = (baselineRows || [])
+        .map((row, idx) => ({x: Number(row.episode ?? idx + 1), y: Number(row.avg10)}))
+        .filter((row) => Number.isFinite(row.x) && Number.isFinite(row.y));
+      const probe = (probeRows || [])
+        .map((row, idx) => ({x: Number(row.episode ?? idx + 1), y: Number(row.avg10)}))
+        .filter((row) => Number.isFinite(row.x) && Number.isFinite(row.y));
+      const all = [...baseline, ...probe];
+      if (all.length < 2) {
+        return `<div class="empty">Waiting for baseline and probe episode summaries.</div>`;
+      }
+      const width = 520;
+      const height = 210;
+      const pad = 32;
+      const minX = Math.min(...all.map((row) => row.x));
+      const maxX = Math.max(...all.map((row) => row.x));
+      const minY = Math.min(...all.map((row) => row.y));
+      const maxY = Math.max(...all.map((row) => row.y));
+      const xSpan = Math.max(maxX - minX, 1e-6);
+      const ySpan = Math.max(maxY - minY, 1e-6);
+      const xScale = (value) => pad + ((value - minX) / xSpan) * (width - 2 * pad);
+      const yScale = (value) => height - pad - ((value - minY) / ySpan) * (height - 2 * pad);
+      const pathFor = (rows) => rows
+        .map((row, idx) => `${idx === 0 ? "M" : "L"} ${xScale(row.x).toFixed(2)} ${yScale(row.y).toFixed(2)}`)
+        .join(" ");
+      const baselinePath = pathFor(baseline);
+      const probePath = pathFor(probe);
+      const baselineLast = baseline[baseline.length - 1];
+      const probeLast = probe[probe.length - 1];
+      return `
+        <svg class="comparison-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="Standard PPO versus probe-conditioned PPO">
+          <rect x="0" y="0" width="${width}" height="${height}" fill="#ffffff"></rect>
+          <line x1="${pad}" y1="${height - pad}" x2="${width - pad}" y2="${height - pad}" stroke="#d7dee8" stroke-width="1.2"></line>
+          <line x1="${pad}" y1="${pad}" x2="${pad}" y2="${height - pad}" stroke="#d7dee8" stroke-width="1.2"></line>
+          <text x="${pad}" y="${pad - 10}" fill="#6e7685" font-size="12">avg10 return · episode ${formatInteger(minX)}-${formatInteger(maxX)}</text>
+          <text x="${pad}" y="${height - 8}" fill="#3d8d5e" font-size="12">standard PPO</text>
+          <text x="${pad + 104}" y="${height - 8}" fill="#2854d8" font-size="12">probe-conditioned</text>
+          ${baselinePath ? `<path d="${baselinePath}" fill="none" stroke="#3d8d5e" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"></path>` : ""}
+          ${probePath ? `<path d="${probePath}" fill="none" stroke="#2854d8" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"></path>` : ""}
+          ${baselineLast ? `<circle cx="${xScale(baselineLast.x).toFixed(2)}" cy="${yScale(baselineLast.y).toFixed(2)}" r="4.2" fill="#3d8d5e" stroke="#ffffff" stroke-width="1.5"></circle>` : ""}
+          ${probeLast ? `<circle cx="${xScale(probeLast.x).toFixed(2)}" cy="${yScale(probeLast.y).toFixed(2)}" r="4.2" fill="#2854d8" stroke="#ffffff" stroke-width="1.5"></circle>` : ""}
+        </svg>
+      `;
+    }
+
+    function comparisonBarsSvg(runs, config) {
+      const width = 760;
+      const height = 330;
+      const padLeft = 66;
+      const padRight = 28;
+      const padTop = 34;
+      const padBottom = 64;
+      const plotWidth = width - padLeft - padRight;
+      const plotHeight = height - padTop - padBottom;
+      const groups = runs.map((run) => {
+        const values = config.values(run);
+        const normalizeValue = (item) => {
+          if (item && typeof item === "object" && !Array.isArray(item)) {
+            return {
+              value: Number.isFinite(Number(item.value)) ? Number(item.value) : null,
+              label: item.label || null,
+              capped: Boolean(item.capped),
+            };
+          }
+          return {
+            value: Number.isFinite(Number(item)) ? Number(item) : null,
+            label: null,
+            capped: false,
+          };
+        };
+        return {
+          run,
+          label: comparisonEnvShortName(run),
+          baseline: normalizeValue(values.baseline),
+          probe: normalizeValue(values.probe),
+        };
+      });
+      const numericValues = groups
+        .flatMap((group) => [group.baseline.value, group.probe.value])
+        .filter((value) => Number.isFinite(value) && (config.allowNegative || value >= 0));
+      if (!numericValues.length) {
+        return `<div class="empty">Waiting for finished comparison runs.</div>`;
+      }
+      const transformValue = (value) => {
+        if (!Number.isFinite(value) || (config.logScale && value < 0) || (!config.allowNegative && value < 0)) {
+          return null;
+        }
+        return config.logScale ? Math.log10(value + 1) : value;
+      };
+      const transformed = numericValues.map(transformValue).filter((value) => value != null);
+      const maxY = config.includeZero === false ? Math.max(...transformed) : Math.max(0, ...transformed);
+      const minY = config.includeZero === false ? Math.min(...transformed) : Math.min(0, ...transformed);
+      const ySpan = Math.max(maxY - minY, 1e-6);
+      const yScale = (value) => {
+        const transformedValue = transformValue(value);
+        if (transformedValue == null) {
+          return null;
+        }
+        return padTop + (1 - ((transformedValue - minY) / ySpan)) * plotHeight;
+      };
+      const xStep = plotWidth / Math.max(groups.length, 1);
+      const groupWidth = Math.min(118, xStep * 0.62);
+      const barWidth = groupWidth * 0.36;
+      const barGap = groupWidth * 0.10;
+      const yTicks = [0, 0.25, 0.5, 0.75, 1].map((t) => minY + t * ySpan);
+      const tickLabel = (tick) => {
+        const raw = config.logScale ? Math.pow(10, tick) - 1 : tick;
+        return raw >= 1000 ? formatCompactNumber(raw) : raw.toFixed(config.valueDecimals ?? 0);
+      };
+      const barFor = (item, x, color, label) => {
+        const value = item.value;
+        const y = yScale(value);
+        if (y == null) {
+          return `
+            <text x="${x}" y="${padTop + plotHeight * 0.46}" text-anchor="middle" fill="#9aa3af" font-size="11">${item.label || "pending"}</text>
+          `;
+        }
+        const zeroY = yScale(0) ?? (padTop + plotHeight);
+        const barTop = Math.min(y, zeroY);
+        const barHeight = Math.max(Math.abs(zeroY - y), 1);
+        const labelY = value >= 0 ? barTop - 7 : y + 13;
+        const valueLabel = item.label || (value >= 1000 ? formatCompactNumber(value) : value.toFixed(config.valueDecimals ?? 0));
+        const opacity = item.capped ? "0.34" : "1";
+        const stroke = item.capped ? `stroke="${color}" stroke-width="1.8" stroke-dasharray="4 3"` : "";
+        return `
+          <rect x="${(x - barWidth / 2).toFixed(2)}" y="${barTop.toFixed(2)}" width="${barWidth.toFixed(2)}" height="${barHeight.toFixed(2)}" fill="${color}" fill-opacity="${opacity}" ${stroke}></rect>
+          <text x="${x.toFixed(2)}" y="${labelY.toFixed(2)}" text-anchor="middle" fill="#394150" font-size="11">${valueLabel}</text>
+          <title>${label}: ${valueLabel}</title>
+        `;
+      };
+      const bars = groups.map((group, idx) => {
+        const center = padLeft + xStep * idx + xStep / 2;
+        const baselineX = center - barWidth / 2 - barGap / 2;
+        const probeX = center + barWidth / 2 + barGap / 2;
+        return `
+          ${barFor(group.baseline, baselineX, "#3d8d5e", `${group.label} standard PPO`)}
+          ${barFor(group.probe, probeX, "#2854d8", `${group.label} probe-conditioned`)}
+          <text x="${center.toFixed(2)}" y="${height - 31}" text-anchor="middle" fill="#394150" font-size="12">${group.label}</text>
+        `;
+      }).join("");
+      const grid = yTicks.map((tick) => {
+        const raw = config.logScale ? Math.pow(10, tick) - 1 : tick;
+        const y = yScale(raw) ?? padTop + plotHeight;
+        return `
+          <line x1="${padLeft}" y1="${y.toFixed(2)}" x2="${width - padRight}" y2="${y.toFixed(2)}" stroke="#edf1f6" stroke-width="1"></line>
+          <text x="${padLeft - 10}" y="${(y + 4).toFixed(2)}" text-anchor="end" fill="#6e7685" font-size="11">${tickLabel(tick)}</text>
+        `;
+      }).join("");
+      return `
+        <svg class="paper-figure-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="${config.title}">
+          <rect x="0" y="0" width="${width}" height="${height}" fill="#ffffff"></rect>
+          ${grid}
+          <line x1="${padLeft}" y1="${padTop + plotHeight}" x2="${width - padRight}" y2="${padTop + plotHeight}" stroke="#171b22" stroke-width="1.4"></line>
+          <line x1="${padLeft}" y1="${padTop}" x2="${padLeft}" y2="${padTop + plotHeight}" stroke="#171b22" stroke-width="1.4"></line>
+          <text x="${padLeft}" y="18" fill="#171b22" font-size="13" font-weight="700">${config.title}</text>
+          <text x="${padLeft}" y="${height - 9}" fill="#3d8d5e" font-size="12">standard PPO</text>
+          <text x="${padLeft + 104}" y="${height - 9}" fill="#2854d8" font-size="12">probe-conditioned</text>
+          <text transform="translate(17 ${padTop + plotHeight / 2}) rotate(-90)" text-anchor="middle" fill="#6e7685" font-size="12">${config.yLabel}</text>
+          ${bars}
+        </svg>
+      `;
+    }
+
+    function comparisonLearningCurvesSvg(runs) {
+      const width = 960;
+      const height = 420;
+      const panelGap = 22;
+      const padLeft = 42;
+      const padRight = 16;
+      const padTop = 38;
+      const padBottom = 52;
+      const panelWidth = (width - padLeft - padRight - panelGap * 2) / 3;
+      const panelHeight = height - padTop - padBottom;
+      const panels = runs.map((run, idx) => {
+        const histories = run.histories || {};
+        const baseline = (histories.baseline_returns || [])
+          .map((row, rowIdx) => ({x: Number(row.episode ?? rowIdx + 1), y: Number(row.avg10)}))
+          .filter((row) => Number.isFinite(row.x) && Number.isFinite(row.y));
+        const probe = (histories.probe_returns || [])
+          .map((row, rowIdx) => ({x: Number(row.episode ?? rowIdx + 1), y: Number(row.avg10)}))
+          .filter((row) => Number.isFinite(row.x) && Number.isFinite(row.y));
+        const all = [...baseline, ...probe];
+        const x0 = padLeft + idx * (panelWidth + panelGap);
+        const y0 = padTop;
+        if (all.length < 2) {
+          return `
+            <g>
+              <rect x="${x0}" y="${y0}" width="${panelWidth}" height="${panelHeight}" fill="#ffffff" stroke="#edf1f6"></rect>
+              <text x="${x0 + panelWidth / 2}" y="${y0 + panelHeight / 2}" text-anchor="middle" fill="#9aa3af" font-size="12">pending</text>
+              <text x="${x0 + panelWidth / 2}" y="${height - 21}" text-anchor="middle" fill="#394150" font-size="12">${comparisonEnvShortName(run)}</text>
+            </g>
+          `;
+        }
+        const minX = Math.min(...all.map((row) => row.x));
+        const maxX = Math.max(...all.map((row) => row.x));
+        const minY = Math.min(...all.map((row) => row.y));
+        const maxY = Math.max(...all.map((row) => row.y));
+        const xScale = (value) => x0 + ((value - minX) / Math.max(maxX - minX, 1e-6)) * panelWidth;
+        const yScale = (value) => y0 + (1 - ((value - minY) / Math.max(maxY - minY, 1e-6))) * panelHeight;
+        const pathFor = (rows) => rows
+          .map((row, rowIdx) => `${rowIdx === 0 ? "M" : "L"} ${xScale(row.x).toFixed(2)} ${yScale(row.y).toFixed(2)}`)
+          .join(" ");
+        return `
+          <g>
+            <rect x="${x0}" y="${y0}" width="${panelWidth}" height="${panelHeight}" fill="#ffffff" stroke="#edf1f6"></rect>
+            <line x1="${x0}" y1="${y0 + panelHeight}" x2="${x0 + panelWidth}" y2="${y0 + panelHeight}" stroke="#171b22" stroke-width="1.2"></line>
+            <line x1="${x0}" y1="${y0}" x2="${x0}" y2="${y0 + panelHeight}" stroke="#171b22" stroke-width="1.2"></line>
+            <text x="${x0}" y="${y0 - 10}" fill="#6e7685" font-size="11">${minY.toFixed(0)} to ${maxY.toFixed(0)} avg10</text>
+            ${baseline.length ? `<path d="${pathFor(baseline)}" fill="none" stroke="#3d8d5e" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></path>` : ""}
+            ${probe.length ? `<path d="${pathFor(probe)}" fill="none" stroke="#2854d8" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></path>` : ""}
+            <text x="${x0 + panelWidth / 2}" y="${height - 21}" text-anchor="middle" fill="#394150" font-size="12">${comparisonEnvShortName(run)}</text>
+          </g>
+        `;
+      }).join("");
+      return `
+        <svg class="paper-figure-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Learning curves across environments">
+          <rect x="0" y="0" width="${width}" height="${height}" fill="#ffffff"></rect>
+          <text x="${padLeft}" y="19" fill="#171b22" font-size="13" font-weight="700">Avg10 learning curves by environment</text>
+          <text x="${padLeft}" y="${height - 7}" fill="#3d8d5e" font-size="12">standard PPO</text>
+          <text x="${padLeft + 104}" y="${height - 7}" fill="#2854d8" font-size="12">probe-conditioned</text>
+          <text x="${width - 122}" y="${height - 7}" fill="#6e7685" font-size="12">episode</text>
+          <text transform="translate(17 ${padTop + panelHeight / 2}) rotate(-90)" text-anchor="middle" fill="#6e7685" font-size="12">avg10 return</text>
+          ${panels}
+        </svg>
+      `;
+    }
+
+    function latestComparisonRuns(rawPayload) {
+      const rows = [];
+      const activeSuiteId = rawPayload?.comparison_suite_id || null;
+      if (activeSuiteId && rawPayload?.available && String(rawPayload.benchmark_tag || "").includes("_comparison")) {
+        rows.push(rawPayload);
+      }
+      for (const row of rawPayload?.history_runs || []) {
+        const sameFreshSuite = activeSuiteId && row.comparison_suite_id === activeSuiteId;
+        if (sameFreshSuite && String(row.benchmark_tag || "").includes("_comparison")) {
+          rows.push(row);
+        }
+      }
+      const latestByEnv = new Map();
+      for (const row of rows) {
+        const envKey = row.env_name || row.env_display_name || row.benchmark_tag || row.session_id;
+        const previous = latestByEnv.get(envKey);
+        const rowTime = Number(row.updated_at || row.finished_at || row.started_at || 0);
+        const previousTime = Number(previous?.updated_at || previous?.finished_at || previous?.started_at || 0);
+        if (!previous || rowTime >= previousTime) {
+          latestByEnv.set(envKey, row);
+        }
+      }
+      const preferredOrder = ["ContinuousCartPole-v0", "LunarLanderContinuous-v3", "BipedalWalker-v3"];
+      return [...latestByEnv.values()].sort((a, b) => {
+        const ai = preferredOrder.indexOf(a.env_name);
+        const bi = preferredOrder.indexOf(b.env_name);
+        if (ai !== -1 || bi !== -1) {
+          return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+        }
+        return String(a.env_display_name || a.env_name).localeCompare(String(b.env_display_name || b.env_name));
+      });
+    }
+
+    function paperFigureRuns(rawPayload) {
+      const latestByEnvName = new Map();
+      for (const run of latestComparisonRuns(rawPayload)) {
+        if (run.env_name) {
+          latestByEnvName.set(run.env_name, run);
+        }
+      }
+      return [
+        ["ContinuousCartPole-v0", "Continuous CartPole"],
+        ["LunarLanderContinuous-v3", "Continuous LunarLander"],
+        ["BipedalWalker-v3", "Bipedal Walker"],
+      ].map(([envName, displayName]) => latestByEnvName.get(envName) || {
+        env_name: envName,
+        env_display_name: displayName,
+        benchmark_tag: `${envName}_comparison`,
+        histories: {},
+        summary: {},
+      });
+    }
+
+    function renderPaperFigureBoard(rawPayload) {
+      const board = el("paperFigureBoard");
+      if (!board) {
+        return;
+      }
+      const runs = paperFigureRuns(rawPayload);
+      const hasAnyRun = runs.some((run) => Object.keys(run.histories || {}).length || Object.keys(run.summary || {}).length);
+      if (!hasAnyRun) {
+        board.innerHTML = `<div class="empty">Run main.py to populate paper-style PPO comparison figures.</div>`;
+        return;
+      }
+      board.innerHTML = `
+        <div class="paper-figure-card">
+          <div class="paper-figure-title">A. Sample Efficiency</div>
+          <div class="paper-figure-caption">Environment steps until the rolling 100-episode average reaches the Gym-style solved threshold. The probe bar includes encoder probe collection when available; lower is better.</div>
+          ${comparisonBarsSvg(runs, {
+            title: "Steps to solve",
+            yLabel: "env steps, log scale",
+            logScale: true,
+            values: (run) => {
+              const summary = run.summary || {};
+              return {
+                baseline: comparisonSolveOrCap(
+                  summary,
+                  "baseline_env_step_solves",
+                  "baseline_total_env_steps",
+                  "baseline_solved_env_steps",
+                  "baseline_total_env_steps",
+                ),
+                probe: comparisonSolveOrCap(
+                  summary,
+                  "probe_env_step_solves_with_encoder",
+                  "probe_total_env_steps_with_encoder",
+                  "probe_solved_env_steps_with_encoder",
+                  "probe_total_env_steps_with_encoder",
+                ),
+              };
+            },
+          })}
+        </div>
+        <div class="paper-figure-card">
+          <div class="paper-figure-title">B. Performance Ceiling</div>
+          <div class="paper-figure-caption">Best single-episode return observed during the comparison run. Higher is better.</div>
+          ${comparisonBarsSvg(runs, {
+            title: "Peak episode return",
+            yLabel: "return",
+            valueDecimals: 0,
+            allowNegative: true,
+            values: (run) => {
+              const histories = run.histories || {};
+              return {
+                baseline: comparisonMaxValue(histories.baseline_returns || [], "return"),
+                probe: comparisonMaxValue(histories.probe_returns || [], "return"),
+              };
+            },
+          })}
+        </div>
+        <div class="paper-figure-card paper-figure-wide">
+          <div class="paper-figure-title">C. Learning Dynamics</div>
+          <div class="paper-figure-caption">Smoothed avg10 return curves shown as small multiples so CartPole, LunarLander, and BipedalWalker can keep their own scales.</div>
+          ${comparisonLearningCurvesSvg(runs)}
+        </div>
+      `;
+    }
+
+    function comparisonStat(label, value) {
+      return `
+        <div class="comparison-stat">
+          <div class="comparison-k">${label}</div>
+          <div class="comparison-v">${value}</div>
+        </div>
+      `;
+    }
+
+    function renderComparisonBoard(rawPayload) {
+      const board = el("comparisonBoard");
+      if (!board) {
+        return;
+      }
+      const runs = latestComparisonRuns(rawPayload);
+      if (!runs.length) {
+        board.innerHTML = `<div class="empty">Run main.py to start the CartPole, LunarLander, and Biped PPO comparison suite.</div>`;
+        return;
+      }
+      board.innerHTML = runs.map((run) => {
+        const histories = run.histories || {};
+        const summary = run.summary || {};
+        const baselineRows = histories.baseline_returns || [];
+        const probeRows = histories.probe_returns || [];
+        const active = Boolean(run.active || (rawPayload?.active && run.session_id === rawPayload.session_id));
+        return `
+          <div class="comparison-card">
+            <div class="comparison-head">
+              <div class="comparison-title">${run.env_display_name || run.env_name || "Environment"}</div>
+              <div class="comparison-status">${active ? "live" : "archived"}</div>
+            </div>
+            ${comparisonLineChartSvg(baselineRows, probeRows)}
+            <div class="comparison-stats">
+              ${comparisonStat("PPO Solve Ep", comparisonSolveLabel(summary.baseline_episode_solves))}
+              ${comparisonStat("Probe Solve Ep", comparisonSolveLabel(summary.probe_episode_solves))}
+              ${comparisonStat("PPO Solve Steps", comparisonSolveLabel(summary.baseline_env_step_solves || summary.baseline_step_solves))}
+              ${comparisonStat("Probe Solve Steps", comparisonSolveLabel(summary.probe_env_step_solves_with_encoder || summary.probe_step_solves))}
+              ${comparisonStat("PPO Avg10", comparisonLatestAvg10(baselineRows))}
+              ${comparisonStat("Probe Avg10", comparisonLatestAvg10(probeRows))}
+            </div>
+            <div class="live-mini-note">
+              ${run.benchmark_tag || "comparison"} · updated ${formatDateTime(run.updated_at || run.finished_at || run.started_at)}
+            </div>
+          </div>
+        `;
+      }).join("");
     }
 
     function snapshotFromPayload(payload) {
@@ -2143,7 +2752,7 @@
 
     function restoreActiveDeck() {
       const saved = window.localStorage.getItem("teenyreason.activeDeck");
-      if (saved === "live" || saved === "latent" || saved === "benchmark") {
+      if (saved === "live" || saved === "latent" || saved === "benchmark" || saved === "comparison") {
         setActiveDeck(saved, false);
       } else {
         setActiveDeck("live", false);
@@ -2193,6 +2802,8 @@
         dashboardState.livePayload = payload;
       }
       const rawPayload = dashboardState.livePayload;
+      renderPaperFigureBoard(rawPayload);
+      renderComparisonBoard(rawPayload);
       if (
         dashboardState.liveArchiveSelection !== "live" &&
         !(rawPayload?.history_runs || []).some((row) => row.session_id === dashboardState.liveArchiveSelection)
@@ -2204,11 +2815,8 @@
 
       const hasLivePayload = Boolean(rawPayload?.available);
       const isCartPole = inspectedPayload?.env_name === "ContinuousCartPole-v0";
-      if (!hasLivePayload || !isCartPole) {
-        const emptyMessage = hasLivePayload
-          ? "Live theater currently follows Continuous CartPole only."
-          : "Start a CartPole training run to stream the crawler into this theater.";
-        el("liveFocusWrap").innerHTML = `<div class="empty">${emptyMessage}</div>`;
+      if (!hasLivePayload) {
+        el("liveFocusWrap").innerHTML = `<div class="empty">Start a training run to stream live PPO curves into this deck.</div>`;
         el("liveFamilyWrap").innerHTML = `<div class="empty">No live probe family scores are available yet.</div>`;
         el("liveArchiveWrap").innerHTML = `<div class="empty">Archived traces will appear here after completed runs.</div>`;
         el("liveWindowsWrap").innerHTML = `<div class="empty">No support windows have been traced yet.</div>`;
@@ -2248,14 +2856,22 @@
             `phase ${friendlyPhaseName(focus.phase || cartpole.phase || stage.id)}`
           )}
           ${liveSummaryCell(
-            "Cart Motion",
-            `x ${liveScalar(cartpole.x, 3)} · dx ${liveScalar(cartpole.x_dot, 3)}`,
-            "Horizontal position and velocity from the current world interaction."
+            isCartPole ? "Cart Motion" : "Live Theater",
+            isCartPole
+              ? `x ${liveScalar(cartpole.x, 3)} · dx ${liveScalar(cartpole.x_dot, 3)}`
+              : `${payload.env_display_name || currentEnvLabel()} curves active`,
+            isCartPole
+              ? "Horizontal position and velocity from the current world interaction."
+              : "The animated canvas is CartPole-only, but the live training curves and run summary below still update for this environment."
           )}
           ${liveSummaryCell(
-            "Pole Motion",
-            `theta ${thetaDegrees == null ? "n/a" : `${thetaDegrees.toFixed(1)}°`}`,
-            `dtheta ${liveScalar(cartpole.theta_dot, 3)} · raw ${liveScalar(cartpole.theta, 3)}`
+            isCartPole ? "Pole Motion" : "Episode",
+            isCartPole
+              ? `theta ${thetaDegrees == null ? "n/a" : `${thetaDegrees.toFixed(1)}°`}`
+              : `episode ${liveInteger(focus.episode)}`,
+            isCartPole
+              ? `dtheta ${liveScalar(cartpole.theta_dot, 3)} · raw ${liveScalar(cartpole.theta, 3)}`
+              : `variant ${focus.variant || run.variant || "training"} · phase ${friendlyPhaseName(focus.phase || stage.id)}`
           )}
           ${liveSummaryCell(
             "Control",

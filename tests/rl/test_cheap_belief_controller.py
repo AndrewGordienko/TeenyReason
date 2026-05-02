@@ -17,7 +17,7 @@ from teenyreason.app.benchmark import (
     solve_eval_episodes_for_profile,
 )
 from teenyreason.app.config import build_experiment_config
-from teenyreason.envs import CONTINUOUS_CARTPOLE_NAME, make_env
+from teenyreason.envs import CONTINUOUS_CARTPOLE_NAME, CONTINUOUS_LUNAR_LANDER_NAME, make_env
 from teenyreason.probe.probe_data import default_env_params
 from teenyreason.rl.full_system.affordance import choose_affordance_action, generate_candidate_actions
 from teenyreason.rl.full_system.affordance_eval import (
@@ -170,6 +170,39 @@ class CheapBeliefActionTests(unittest.TestCase):
         self.assertAlmostEqual(float(actor_only.action[0]), 0.0, places=6)
         self.assertAlmostEqual(float(blended.action[0]), 0.5, places=6)
         self.assertAlmostEqual(float(best.action[0]), 1.0, places=6)
+
+    def test_tiny_candidate_margin_keeps_actor_action(self):
+        class LowMarginController:
+            def forward_with_hidden(self, state_t, context_t, hidden_state=None):
+                del state_t, context_t, hidden_state
+                return (
+                    torch.tensor([[0.0]], dtype=torch.float32),
+                    torch.tensor([0.0], dtype=torch.float32),
+                    torch.zeros((1, 1), dtype=torch.float32),
+                    {
+                        "trust": torch.tensor([0.90], dtype=torch.float32),
+                        "trunk": torch.zeros((1, 2), dtype=torch.float32),
+                    },
+                )
+
+            def evaluate_candidates(self, trunk, candidate_actions):
+                del trunk, candidate_actions
+                returns = torch.tensor([[0.0, 0.0, 0.0, 0.02, 0.0]], dtype=torch.float32)
+                risks = torch.zeros_like(returns)
+                recoverability = torch.zeros_like(returns)
+                return returns, risks, recoverability
+
+        selection = choose_affordance_action(
+            controller=LowMarginController(),
+            state_t=torch.zeros((1, 4), dtype=torch.float32),
+            context_t=torch.zeros((1, 6), dtype=torch.float32),
+            action_low=np.asarray([-1.0], dtype=np.float32),
+            action_high=np.asarray([1.0], dtype=np.float32),
+            hidden_state=None,
+        )
+
+        self.assertAlmostEqual(float(selection.action[0]), 0.0, places=6)
+        self.assertEqual(selection.controller_used, 0.0)
 
     def test_force_state_only_uses_state_scores_instead_of_belief_residual(self):
         class ResidualStubController:
@@ -406,6 +439,7 @@ class BenchmarkProfileTests(unittest.TestCase):
         self.assertEqual(config.encoder_belief_subset_count, 1)
         self.assertEqual(config.encoder_belief_subset_size, 4)
         self.assertEqual(config.probe_max_steps, 320)
+        self.assertEqual(config.initial_log_std, -1.5)
 
         fast_flags = benchmark_profile_flags("fast")
         self.assertFalse(fast_flags["run_probe_shadow"])
@@ -418,6 +452,12 @@ class BenchmarkProfileTests(unittest.TestCase):
         full_config = replace(config, benchmark_profile="full")
         self.assertEqual(solve_eval_episodes_for_profile(full_config), full_config.solve_eval_episodes)
         self.assertTrue(benchmark_profile_flags("archived_planner")["run_archived_planner"])
+
+    def test_lunar_lander_uses_wider_initial_exploration(self):
+        config = build_experiment_config(CONTINUOUS_LUNAR_LANDER_NAME)
+
+        self.assertGreater(config.initial_log_std, -1.5)
+        self.assertTrue(config.normalize_rewards)
 
     def test_not_run_solve_summary_prints_not_run(self):
         buffer = StringIO()

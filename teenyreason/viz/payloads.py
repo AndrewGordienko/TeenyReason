@@ -50,6 +50,19 @@ def load_optional_json_rows(values: np.ndarray | None) -> list[dict]:
     return rows
 
 
+def normalize_projection_2d(values: np.ndarray) -> np.ndarray:
+    """Return a two-column projection array for dashboard scatter plots."""
+    projection = np.asarray(values, dtype=np.float32)
+    if projection.ndim == 1:
+        projection = projection.reshape(-1, 1)
+    if projection.ndim != 2:
+        projection = np.zeros((0, 2), dtype=np.float32)
+    if projection.shape[1] < 2:
+        padding = np.zeros((projection.shape[0], 2 - projection.shape[1]), dtype=np.float32)
+        projection = np.concatenate([projection, padding], axis=1)
+    return projection[:, :2]
+
+
 def normalize_matched_eval_summary(row: dict | None) -> dict:
     """Normalize one stored matched-eval summary row into a stable shape."""
     row = row if isinstance(row, dict) else {}
@@ -412,7 +425,7 @@ def build_latent_payload(path: Path) -> dict:
     env_name = load_optional_string(snapshot, "env_name")
     benchmark_tag = load_optional_string(snapshot, "benchmark_tag")
     indices = downsample_indices(int(snapshot["env_belief_mean"].shape[0]))
-    projection = snapshot["projection_2d"][indices]
+    projection = normalize_projection_2d(snapshot["projection_2d"])[indices]
     uncertainty = snapshot["env_uncertainty"][indices]
     env_params = snapshot["env_params"][indices]
     env_window_count = snapshot["env_window_count"][indices]

@@ -128,6 +128,7 @@ def save_training_artifacts(
     z_dim: int,
     action_bins: int,
     hidden_dim: int,
+    initial_log_std: float,
     belief_bits_per_dim: int,
     belief_use_residual_sketch: bool,
     online_z_update_alpha: float,
@@ -178,6 +179,7 @@ def save_training_artifacts(
         {
             "env_name": env_name,
             "hidden_dim": hidden_dim,
+            "initial_log_std": initial_log_std,
             "belief_dim": int(crawler_bundle.env_expression_dim) + 2,
             "policy_style": "matched_zero_belief",
             "action_bins": action_bins,
@@ -221,6 +223,7 @@ def save_training_artifacts(
             "belief_style": "env_expression_plus_confidence_and_uncertainty",
             "action_bins": action_bins,
             "hidden_dim": hidden_dim,
+            "initial_log_std": initial_log_std,
             "benchmark_mode": benchmark_mode,
             "benchmark_profile": str(benchmark_profile),
             "probe_budget_mode": probe_budget_mode,

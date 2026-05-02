@@ -274,7 +274,9 @@ def collect_adaptive_probe_window(
             action_space=env.action_space,
             action_values=action_values,
             rng=rng,
+            env_name=env_name,
         )
+    rollout_goal = None if local_planner is None else getattr(local_planner, "rollout_goal", None)
 
     for _ in range(max_probe_retries):
         apply_env_params(env, episode_physics)
@@ -287,7 +289,7 @@ def collect_adaptive_probe_window(
         if current_hidden is None:
             current_hidden = init_recurrent_belief_hidden(encoder=encoder, device=device)
         if local_planner is not None:
-            local_planner.begin_rollout()
+            local_planner.begin_rollout(primary_goal=rollout_goal)
         done = False
 
         for step_idx in range(window_size):

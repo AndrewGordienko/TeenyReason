@@ -823,32 +823,34 @@ def _update_affordance_controller(
                 )
             elif training_stage == "belief_residual":
                 loss = (
-                    0.24 * residual_loss
-                    + 0.28 * final_score_loss
-                    + 0.18 * final_rank_loss
+                    0.22 * residual_loss
+                    + 0.24 * final_score_loss
+                    + 0.22 * final_rank_loss
                     + 0.10 * final_margin_loss
-                    + 0.12 * ranking_hinge_loss
-                    + 0.12 * trust_loss
-                    + 0.08 * residual_shrink_loss
-                    + 0.05 * trust_shrink_loss
-                    + 0.10 * counterfactual_residual_loss
-                    + 0.08 * counterfactual_trust_loss
-                    + 0.08 * counterfactual_state_alignment_loss
+                    + 0.16 * ranking_hinge_loss
+                    + 0.14 * trust_loss
+                    + 0.06 * residual_shrink_loss
+                    + 0.04 * trust_shrink_loss
+                    + 0.16 * counterfactual_residual_loss
+                    + 0.12 * counterfactual_trust_loss
+                    + 0.12 * counterfactual_state_alignment_loss
+                    + 0.08 * actor_bc_loss
                     + 0.05 * value_loss
                 )
             else:
                 loss = (
-                    0.18 * residual_loss
-                    + 0.22 * final_score_loss
-                    + 0.14 * final_rank_loss
+                    0.16 * residual_loss
+                    + 0.20 * final_score_loss
+                    + 0.16 * final_rank_loss
                     + 0.10 * final_margin_loss
-                    + 0.10 * ranking_hinge_loss
-                    + 0.14 * trust_loss
+                    + 0.13 * ranking_hinge_loss
+                    + 0.16 * trust_loss
                     + 0.08 * residual_shrink_loss
                     + 0.05 * trust_shrink_loss
-                    + 0.10 * counterfactual_residual_loss
-                    + 0.08 * counterfactual_trust_loss
-                    + 0.08 * counterfactual_state_alignment_loss
+                    + 0.14 * counterfactual_residual_loss
+                    + 0.10 * counterfactual_trust_loss
+                    + 0.10 * counterfactual_state_alignment_loss
+                    + 0.06 * actor_bc_loss
                     + 0.04 * return_loss
                     + 0.03 * risk_loss
                     + 0.03 * recoverability_loss

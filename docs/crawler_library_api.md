@@ -54,10 +54,18 @@ The stable runtime types live in `teenyreason/crawler/types.py`.
 The intended top-level user API is deliberately small:
 
 - `run(env, algo=ppo(), seeds=2, profile="fast")`
+- `probe_ppo(profile="fast")`
 - `ppo(**kwargs)`
+- `crawler(env)`
+- `make(env)`
+- `load_crawler(env, checkpoint_path=None)`
 - `Crawler`, `Evidence`, `Belief`, `Message`, `Step`, `Run`
 
-Use a Gym id string for standard environments, for example
+Use `crawler(...)` and `probe_ppo(...)` separately when you want one
+crawler-backed PPO training run by itself, without the baseline,
+no-expression, controller, and sim-fanout comparison tracks. Pass `seeds=2` or
+a seed list only when you intentionally want repeated runs. Use a Gym id string
+for standard environments, for example
 `run("BipedalWalker-v3", ppo(), seeds=2, profile="fast")`. Special local envs
 may still pass a custom factory/class.
 
@@ -88,6 +96,25 @@ Examples still exist internally, but the public path should usually go through
 The consumer decides how to use the crawler message. The crawler does not own
 PPO handoff rules, fair benchmark policy, or dashboard packaging.
 
+## Runtime Crawler
+
+Use `load_crawler(...)` when you want the crawler to be a separate entity:
+
+```python
+import teenyreason as tr
+
+env_id = "ContinuousCartPole-v0"
+crawler = tr.load_crawler(env_id)
+result = crawler(seed=0)
+algo_context = result.as_algo_context()
+```
+
+The returned context includes the `EnvExpression`, optional
+`ControllerBeliefContext`, flat expression vector, confidence, readiness,
+uncertainty, and probe-cost metadata. Downstream algorithms can consume that
+payload directly or expose a `set_crawler_context(...)` /
+`with_crawler_context(...)` hook for `crawler.run_into(env, algo)`.
+
 ## Compatibility Layer
 
 The current RL benchmark still uses legacy compatibility objects:
@@ -105,10 +132,13 @@ API anymore.
 
 `main.py` should stay one screen and read like:
 
-1. `run("ContinuousCartPole-v0", ppo(), seeds=2, profile="fast")`
+1. `env = make("ContinuousCartPole-v0")`
+2. `crawler = crawler(env)`
+3. `ppo = probe_ppo(profile="fast")`
+4. `ppo.train(crawler)`
 
 That keeps the library boundary explicit even when the current benchmark still
 uses compatibility adapters under the hood.
 
-Use `2` seeds as the default local debugging budget. Move to `5` seeds only
-when you want a confirmation run.
+Use the default single probe PPO run for local iteration. Move to repeated
+seeds only when you want a confirmation run.

@@ -164,6 +164,7 @@ class LiveTrainingTraceWriter:
         benchmark_tag: str,
         seeds: list[int],
         total_runs: int,
+        comparison_suite_id: str | None = None,
     ) -> None:
         if not self.enabled:
             return
@@ -179,6 +180,7 @@ class LiveTrainingTraceWriter:
             "env_name": env_name,
             "env_display_name": get_env_display_name(env_name),
             "benchmark_tag": benchmark_tag,
+            "comparison_suite_id": comparison_suite_id,
             "seeds": list(seeds),
             "total_runs": int(total_runs),
             "stage": {
@@ -757,6 +759,7 @@ class LiveTrainingTraceWriter:
             "env_name": self._payload.get("env_name"),
             "env_display_name": self._payload.get("env_display_name"),
             "benchmark_tag": self._payload.get("benchmark_tag"),
+            "comparison_suite_id": self._payload.get("comparison_suite_id"),
             "stage": self._payload.get("stage", {}),
             "run": self._payload.get("run", {}),
             "focus": self._payload.get("focus", {}),
