@@ -88,7 +88,7 @@ They are not allowed to make the crawler core branch on a specific world.
 
 ## Downstream Consumers
 
-Downstream consumers live in `teenyreason/algos/`.
+Downstream consumers live in `teenyreason/consumers.py`.
 
 Examples still exist internally, but the public path should usually go through
 `run(...)` and `ppo()` instead of teaching the concrete consumer class names first.

@@ -24,10 +24,10 @@ The benchmark harness does not define the crawler core.
 - `main.py`
   Composes `run(...)` and `ppo()`. The local default is `seeds=2`; use `5`
   seeds only for confirmation runs.
-- `teenyreason/app/benchmark.py`
+- `teenyreason/app/benchmark/runner.py`
   Runs the current RL benchmark harness.
-- `teenyreason/app/multidomain_suite.py`
-  Runs the current RL, image, and language sample-efficiency suite.
+- `teenyreason/multidomain/suite/runner.py`
+  Runs the current RL, image, language, and board-game sample-efficiency suite.
 
 ## Current Compatibility Boundary
 

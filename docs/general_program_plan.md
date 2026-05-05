@@ -38,6 +38,34 @@ means.
 The repo should not jump straight from physical control into a full universal
 agent. The transition should be staged.
 
+## Active Algorithm After The Solver-Handoff Audit
+
+The current default continuous-control path is intentionally narrow:
+
+`scenario memory -> world model -> imagined local futures -> conservative actor-critic practice -> real rollout`
+
+Older branches such as raw MPC, dream actor, affordance RL, and option archives
+are still useful comparison arms, but they are no longer the main place to add
+new ideas. New performance work should first ask whether it improves the active
+scenario actor-critic loop.
+
+The active loop has these implementation commitments:
+
+- scenario memory is queried around current failure/frontier states, not only
+  global high-return windows
+- imagined rows train the critic and value surface; the actor is not asked to
+  blindly clone every imagined action
+- the actor keeps a real-behavior anchor while improving through the critic
+- real rollouts are appended with an explicit source mask so imagined and real
+  data do not silently mix
+- runtime memory use is a continuous blend based on familiarity, uncertainty,
+  and predicted terminal risk, not a hard accept/reject gate
+- worldmap edges remain diagnostic until they improve real rollout utility
+
+This is the repo's current answer to the "child-like imagination" direction:
+use memory and imagined futures as a practice substrate, then require real
+rollouts to prove whether the practiced policy actually got better.
+
 ### Stage 1. Stabilize the physical belief stack
 
 Goal:
@@ -316,6 +344,38 @@ Future code should therefore preserve two levels of abstraction:
 
 Do not hard-code the belief semantics to "physics only" if the real thesis is
 broader than that.
+
+## Video And 3D World Understanding
+
+The next non-RL adapter should treat video as passive evidence over a hidden
+world, not as a special dashboard artifact. The crawler should ask for beliefs
+that would be useful across many downstream tasks:
+
+- depth and layout consistency
+- object persistence through occlusion
+- camera and object motion separation
+- contact and support dynamics
+- goals or task intent implied by repeated actions
+
+The initial code surface is `teenyreason.crawler.video`. It maps video metadata
+and target belief questions into the same `EvidenceSlice` contract used by the
+current crawler. A future model can then fill the payload with frame features,
+tracks, depth hypotheses, or goal traces without changing the downstream
+crawler API.
+
+For evaluation, video should get the same honesty treatment as CartPole:
+
+- samples or frames needed to identify the hidden structure
+- frames needed to reach peak downstream task score
+- held-out future-frame or future-state prediction
+- object permanence under held-out occlusion windows
+- depth/order consistency across camera motion
+- goal inference accuracy on held-out clips
+- ablations where structure, motion, or goal belief is muted or shuffled
+
+The current benchmark contract names these first four measurements as
+`frames_to_structure`, `frames_to_peak_task_score`,
+`future_state_prediction`, and `goal_inference_accuracy`.
 
 ## Anti-Goals
 

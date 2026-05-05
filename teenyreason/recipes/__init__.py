@@ -2,10 +2,15 @@
 
 from .base import BenchmarkSpec, CrawlerRecipe
 from .benchmark import build_benchmark_recipe, build_generic_rl_recipe
-from .bipedal import build_bipedal_recipe, register_bipedal_recipe_targets
-from .cartpole import build_cartpole_recipe, register_cartpole_recipe_targets
-from .language import build_language_recipe
-from .mnist import build_mnist_recipe
+from .domains import (
+    build_bipedal_recipe,
+    build_board_recipe,
+    build_cartpole_recipe,
+    build_language_recipe,
+    build_mnist_recipe,
+    register_bipedal_recipe_targets,
+    register_cartpole_recipe_targets,
+)
 
 _DEFAULT_TARGETS_REGISTERED = False
 
@@ -25,6 +30,7 @@ __all__ = [
     "CrawlerRecipe",
     "build_benchmark_recipe",
     "build_bipedal_recipe",
+    "build_board_recipe",
     "build_cartpole_recipe",
     "build_generic_rl_recipe",
     "build_language_recipe",

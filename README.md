@@ -51,6 +51,27 @@ More generally, the repo is trying to study a reusable
 constraints of a new environment quickly and the solver then focuses on the
 task instead of first having to infer the world from scratch.
 
+## Mental Model
+
+The base object is the crawler. A recipe tells the crawler what world to probe,
+which evidence windows to collect, and how to summarize those windows into a
+compact belief with uncertainty. The env expression is the explicit handoff
+from crawler to solver: it carries the belief vector, confidence, readiness,
+mute reason, source, and scale used by the downstream model.
+
+PPO, the language Transformer, and the image classifier are consumers of that
+handoff. They are not the crawler core. A small public run should read like:
+
+```python
+import teenyreason as tr
+
+cartpole = tr.experiment("cartpole")
+tr.run(cartpole, tr.ppo(), seeds=2, profile="fast")
+```
+
+`tr.experiment(...)` and the shorter recipe builder are the same composition
+entrypoint; use whichever reads better in local research scripts.
+
 ## Progress Metrics
 
 There are now two explicit progress targets instead of a vague “this run feels
@@ -80,15 +101,15 @@ win if the latent-sensitive ablations agree.
 - `teenyreason/recipes/`
   Concrete recipe compositions such as CartPole, MNIST, and language. These
   choose capabilities without making them part of the crawler core.
-- `teenyreason/algos/`
-  Downstream consumers such as the current PPO benchmark and the sample-
-  efficiency benchmark wrappers.
+- `teenyreason/consumers.py`
+  Small downstream benchmark consumers used by the public `run(...)` and
+  `ppo(...)` helpers.
 - `teenyreason/representation/`
   Stable entrypoint for the current latent-belief system and latent snapshot
   analysis helpers.
-- `teenyreason/probe/`
+- `teenyreason/crawler/probes/`
   Probe data collection, active probing, belief aggregation, and online belief
-  updates. See [teenyreason/probe/README.md](teenyreason/probe/README.md).
+  updates. See [teenyreason/crawler/probes/README.md](teenyreason/crawler/probes/README.md).
 - `teenyreason/rl/`
   Downstream control code. The first reorg pass now splits this into:
   `rl/core/`, `rl/probe_policy/`, and `rl/full_system/`. See
@@ -167,7 +188,20 @@ From the repo root:
 python3 main.py
 ```
 
-`main.py` now reads like a tiny library example:
+`main.py` is the local live-dashboard comparison entrypoint. For the current
+representation-repair pass, use the matched CartPole benchmark runner instead:
+
+```bash
+python3 scripts/run_cartpole_repr_repair.py
+```
+
+That run writes a fresh `cartpole_repr_repair_v2` snapshot and benchmark from
+the same code revision, with three CartPole seeds, fair two-probe handoff,
+particle sysid enabled, and the representation-repair gate active. By default
+it stops after the latent snapshot if paired/cross split retrieval and local
+geometry are still too weak for a fair PPO handoff.
+
+The tiny public API example is still:
 
 ```python
 from teenyreason import ppo, run
@@ -224,6 +258,41 @@ The dashboard currently shows:
 - reward / uncertainty coloring
 - probe-mode counts
 - benchmark summary tables
+- tri-domain CartPole, Shakespeare, and MNIST latent-expression diagnostics
+- readiness blockers, muting, bitrate, ablation gaps, and claim gates
+
+## Cleanup Ledger
+
+Files split or added in the current cleanup pass:
+
+- `pyproject.toml`
+  Local editable-install metadata, dashboard package data, and console scripts.
+- `teenyreason/public_suite.py`
+  Small public `run_suite(...)` wrapper for the tri-domain suite.
+- `teenyreason/viz/suite_payloads.py`
+  Dashboard payload helpers for tri-domain suite artifacts.
+- `teenyreason/multidomain/suite_cartpole.py`
+  CartPole domain normalization for suite payloads.
+- `teenyreason/multidomain/suite_acceptance.py`
+  Shared conservative claim gates for CartPole, language, and image domains.
+- `teenyreason/multidomain/image_models.py`
+  Image solver model helpers separated from benchmark orchestration.
+- `teenyreason/multidomain/language_models.py`
+  Language solver model helpers separated from benchmark orchestration.
+- `teenyreason/recipes/evidence.py`
+  Shared evidence-window recipe helpers.
+
+Deleted files:
+
+- None. Deletion remains gated by `python3 scripts/audit_python_files.py` plus
+  a follow-up reference check.
+
+Compatibility paths intentionally retained:
+
+- `teenyreason.models.belief_world_model`
+- `teenyreason.models.env_belief`
+- `teenyreason.crawler.probes.data`
+- `teenyreason.crawler.probes.latent`
 
 ## Notes
 

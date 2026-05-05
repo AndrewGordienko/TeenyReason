@@ -4,38 +4,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from .algos import ImageProbeBenchmarkConsumer, LanguageProbeBenchmarkConsumer, PPOBenchmarkConsumer
+from .consumers import BoardProbeBenchmarkConsumer, ImageProbeBenchmarkConsumer, LanguageProbeBenchmarkConsumer, PPOBenchmarkConsumer
 from .crawler import Crawler
-from .crawler.types import (
-    BeliefState,
-    CrawlerMessage,
-    CrawlerRunResult,
-    CrawlerStep,
-    EvidenceSlice,
-)
-from .envs import (
-    BIPEDAL_WALKER_NAME,
-    CONTINUOUS_CARTPOLE_NAME,
-    CONTINUOUS_LUNAR_LANDER_NAME,
-    make_env as make,
-)
+from .crawler.types import BeliefState, CrawlerMessage, CrawlerRunResult, CrawlerStep, EvidenceSlice
+from .envs import BIPEDAL_WALKER_NAME, CONTINUOUS_CARTPOLE_NAME, CONTINUOUS_LUNAR_LANDER_NAME, make_env as make
 from .envs.continuous_cartpole import ContinuousCartPoleEnv
-from .recipes import (
-    CrawlerRecipe,
-    build_benchmark_recipe,
-    build_bipedal_recipe,
-    build_cartpole_recipe,
-    build_language_recipe,
-    build_mnist_recipe,
-    register_default_recipe_targets,
-)
-
+from .public_suite import run_suite
+from .recipes import CrawlerRecipe, build_benchmark_recipe, build_bipedal_recipe, build_board_recipe, build_cartpole_recipe, build_language_recipe, build_mnist_recipe, register_default_recipe_targets
 
 SeedInput = int | list[int] | tuple[int, ...] | None
 Evidence, Belief, Message = EvidenceSlice, BeliefState, CrawlerMessage
 Step, Run = CrawlerStep, CrawlerRunResult
-
-
 def _normalize_profile_kwargs(values: dict[str, Any]) -> dict[str, Any]:
     """Map the short public `profile` name onto the internal config field."""
     normalized = dict(values)
@@ -50,8 +29,6 @@ def _normalize_seed_input(seeds: SeedInput) -> list[int] | None:
     if isinstance(seeds, int):
         return list(range(max(1, int(seeds))))
     return [int(seed) for seed in seeds]
-
-
 def recipe(name: str, **kwargs: Any) -> CrawlerRecipe:
     """Build one small user-facing recipe by name."""
     register_default_recipe_targets()
@@ -65,11 +42,14 @@ def recipe(name: str, **kwargs: Any) -> CrawlerRecipe:
         return build_mnist_recipe(**kwargs)
     if lowered in {"language", "tinyshakespeare", "tiny_shakespeare", "shakespeare"}:
         return build_language_recipe(**kwargs)
+    if lowered in {"board", "board_game", "tictactoe", "tic_tac_toe"}:
+        return build_board_recipe(**kwargs)
     if lowered in {"lunar", "lunarlander", "continuous_lunar_lander", CONTINUOUS_LUNAR_LANDER_NAME.lower()}:
         return build_benchmark_recipe(CONTINUOUS_LUNAR_LANDER_NAME)
     return build_benchmark_recipe(key)
 
 
+experiment = recipe
 def ppo(**kwargs: Any) -> PPOBenchmarkConsumer:
     """Build the small PPO benchmark consumer."""
     return PPOBenchmarkConsumer(default_config_override=_normalize_profile_kwargs(kwargs))
@@ -90,7 +70,7 @@ def probe_ppo(
     overrides: dict[str, Any] | None = None,
 ):
     """Build a probe-conditioned PPO component, or run it when env is supplied."""
-    from .algos import ProbeConditionedPPO
+    from .consumers import ProbeConditionedPPO
 
     algo = ProbeConditionedPPO(
         profile=profile,
@@ -109,9 +89,10 @@ def compare_ppo(
     profile: str | None = "fast",
     overrides: dict[str, Any] | None = None,
     env_overrides: dict[str, dict[str, Any]] | None = None,
+    reset_live_history: bool = False,
 ):
     """Run the live standard-PPO vs probe-PPO comparison suite."""
-    from .app.ppo_comparison import DEFAULT_COMPARISON_ENVS, run_ppo_comparison
+    from .app.ppo import DEFAULT_COMPARISON_ENVS, run_ppo_comparison
 
     if envs is None:
         env_names = DEFAULT_COMPARISON_ENVS
@@ -125,6 +106,7 @@ def compare_ppo(
         profile=profile,
         common_overrides=_normalize_profile_kwargs(overrides or {}),
         env_overrides=env_overrides,
+        reset_live_history=reset_live_history,
     )
 
 
@@ -137,8 +119,6 @@ def load_crawler(*args: Any, **kwargs: Any):
 
 best_crawler = load_crawler
 crawler_for = load_crawler
-
-
 def _default_algo(recipe_obj: CrawlerRecipe):
     """Pick the obvious benchmark consumer for a recipe."""
     spec = recipe_obj.benchmark
@@ -147,6 +127,8 @@ def _default_algo(recipe_obj: CrawlerRecipe):
         return ImageProbeBenchmarkConsumer()
     if kind == "language_probe":
         return LanguageProbeBenchmarkConsumer()
+    if kind == "board_probe":
+        return BoardProbeBenchmarkConsumer()
     return PPOBenchmarkConsumer()
 
 
@@ -189,15 +171,8 @@ def run(
     return consumer.run(recipe_obj, **run_kwargs)
 
 
-def bench(
-    recipe_obj: CrawlerRecipe,
-    *,
-    algo=None,
-    seeds: SeedInput = None,
-    profile: str | None = None,
-    overrides: dict[str, Any] | None = None,
-):
+def bench(recipe_obj: CrawlerRecipe, *, algo=None, seeds: SeedInput = None, profile: str | None = None, overrides: dict[str, Any] | None = None):
     """Compatibility wrapper around the smaller public run(...) entrypoint."""
     return run(recipe_obj, algo=algo, seeds=seeds, profile=profile, overrides=overrides)
 
-__all__ = ["Belief", "Crawler", "Evidence", "Message", "Run", "Step", "bench", "best_crawler", "compare_ppo", "crawler", "crawler_for", "load_crawler", "make", "ppo", "probe_ppo", "recipe", "run"]
+__all__ = ["Belief", "Crawler", "Evidence", "Message", "Run", "Step", "bench", "best_crawler", "build_board_recipe", "compare_ppo", "crawler", "crawler_for", "experiment", "load_crawler", "make", "ppo", "probe_ppo", "recipe", "run", "run_suite"]

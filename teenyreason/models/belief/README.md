@@ -17,30 +17,21 @@
 - `training/`
   Training loops, environment-specific schedules, and shared training helpers.
 
-## Compatibility Shims
-
-The older flat modules still work during the first pass:
-
-- `belief_components.py`
-- `belief_losses.py`
-- `belief_targets.py`
-- `belief_training.py`
-- `belief_training_env.py`
-- `belief_training_env_config.py`
-- `belief_training_window.py`
-- `belief_training_common.py`
-
-Use the subpackages for new imports, but do not delete the old modules yet.
-
 ## Where To Add New Code
 
 - Add new encoder/projector modules under `core/`.
 - Add new training losses under `objectives/losses.py` or a sibling objective module.
 - Add training schedule or loop code under `training/`.
 
+## Public Imports
+
+- Prefer direct imports from `core/`, `objectives/`, and `training/`.
+- `teenyreason.models.belief` is the public package for belief world-model code.
+- `teenyreason.models.envbelief` is the public package for env-belief aggregation code.
+
 ## Where Not To Add New Code
 
-- Do not keep extending the old flat modules when the new subpackage has an obvious home.
+- Do not reintroduce flat compatibility modules beside this README.
 - Do not put dashboard or benchmark-only logic here.
 
 ## Metrics And Tests That Matter
@@ -53,6 +44,5 @@ Use the subpackages for new imports, but do not delete the old modules yet.
 - uncertainty-error correlation
 - Tests:
   - `tests/rl/test_benchmark_metrics.py`
-  - `tests/probe/test_probe_logic.py`
+  - `tests/crawler_probes/test_probe_logic.py`
   - `tests/rl/test_belief_targets.py`
-

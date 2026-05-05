@@ -184,6 +184,12 @@ class Crawler:
             stop_reason=str(stop_reason),
             metadata={
                 "query_count": len(history),
+                "source_ids": tuple(str(item.source_id) for item in history),
+                "query_families": tuple(
+                    str(item.payload.get("query_family", item.query_name))
+                    for item in history
+                ),
+                "belief_source": str(final_message.metadata.get("belief_source", "learned")),
             },
         )
 
@@ -222,12 +228,19 @@ class ScriptedWorldAdapter:
         del history
         self._query_counter += 1
         payload = dict(self.query_payloads[str(query_name)])
+        payload.setdefault("query_family", str(query_name))
+        payload.setdefault("source_id", f"{self.source_prefix}:{self._query_counter}")
+        payload.setdefault("intervention_cost", 1.0)
+        payload.setdefault("belief_source", "learned")
         return EvidenceSlice(
             query_name=str(query_name),
-            source_id=f"{self.source_prefix}:{self._query_counter}",
+            source_id=str(payload["source_id"]),
             payload=payload,
             metadata={
                 "query_index": self._query_counter,
+                "query_family": str(payload["query_family"]),
+                "intervention_cost": float(payload["intervention_cost"]),
+                "belief_source": str(payload["belief_source"]),
             },
         )
 
@@ -264,6 +277,28 @@ class VectorBeliefBackend:
         stacked = np.stack(vectors, axis=0).astype(np.float32)
         latent = np.mean(stacked, axis=0).astype(np.float32)
         uncertainty = float(np.mean(np.linalg.norm(stacked - latent[None, :], axis=1)))
+        sources = tuple(str(item.source_id) for item in history)
+        query_families = tuple(
+            str(item.payload.get("query_family", item.query_name))
+            for item in history
+        )
+        modalities = tuple(
+            sorted(
+                {
+                    str(item.payload.get("modality", "unknown"))
+                    for item in history
+                }
+            )
+        )
+        belief_sources = tuple(
+            sorted(
+                {
+                    str(item.payload.get("belief_source", "learned"))
+                    for item in history
+                }
+            )
+        )
+        belief_source = belief_sources[0] if len(belief_sources) == 1 else "mixed"
         return BeliefState(
             latent=latent,
             uncertainty=uncertainty,
@@ -271,6 +306,10 @@ class VectorBeliefBackend:
             metadata={
                 "vector_key": self.vector_key,
                 "query_names": tuple(item.query_name for item in history),
+                "query_families": query_families,
+                "source_ids": sources,
+                "modalities": modalities,
+                "belief_source": belief_source,
             },
         )
 
@@ -345,5 +384,13 @@ class LinearMessageProjector:
                 "support_size": int(belief_state.support_size),
                 "stop_reason": stop_reason,
                 "query_names": tuple(item.query_name for item in history),
+                "query_families": tuple(
+                    str(item.payload.get("query_family", item.query_name))
+                    for item in history
+                ),
+                "source_ids": tuple(str(item.source_id) for item in history),
+                "belief_source": str(
+                    belief_state.metadata.get("belief_source", "learned")
+                ),
             },
         )

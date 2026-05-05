@@ -160,7 +160,7 @@ class CrawlerRuntimeTests(unittest.TestCase):
         env = make_env(CONTINUOUS_CARTPOLE_NAME)
         try:
             with patch(
-                "teenyreason.rl.full_system.context_support.collect_support_context",
+                "teenyreason.crawler.runtime.support_context.collect_support_context",
                 side_effect=fake_collect_support_context,
             ):
                 result = crawler.run(env, seed=7)

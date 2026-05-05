@@ -3,7 +3,7 @@
 Edit the constants below if you want a shorter or longer run.
 """
 
-from teenyreason.app.multidomain_suite import (
+from teenyreason.multidomain.suite import (
     MultidomainSuiteConfig,
     run_multidomain_suite,
 )

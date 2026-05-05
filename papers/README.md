@@ -34,6 +34,8 @@ These are the papers that most directly shape the library architecture.
   TD-MPC2 / latent geometry for control
 - `2401.12497v1.pdf`
   causal state abstraction
+- `2506.09985v1.pdf`
+  V-JEPA 2 / representation-space video world model and latent MPC
 
 ### Communication And Rate-Distortion
 

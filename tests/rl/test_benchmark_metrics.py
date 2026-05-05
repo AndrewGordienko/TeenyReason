@@ -1,13 +1,29 @@
 import unittest
 
-from teenyreason.app.benchmark_support import (
+from teenyreason.app.benchmark.support import (
+    apply_system_id_representation_override,
+    belief_source_from_mode,
     compute_belief_progress_index,
     evaluate_latent_win_gate,
+    evaluate_representation_gate,
     probe_strict_usage_status,
 )
+from teenyreason.crawler.runtime import cheap_mechanics_controller_context
 
 
 class BenchmarkMetricTests(unittest.TestCase):
+    def test_cheap_mechanics_context_matches_controller_contract(self):
+        context = cheap_mechanics_controller_context(
+            [0.82, 1.18, 0.82, 1.18],
+            confidence=0.7,
+            uncertainty=0.2,
+        )
+
+        self.assertEqual(context.vector.shape[0], 10)
+        self.assertAlmostEqual(context.confidence, 0.7)
+        self.assertAlmostEqual(context.uncertainty_scalar, 0.2)
+        self.assertEqual(context.metadata["handoff"], "cheap_mechanics_controller_context")
+
     def test_belief_progress_index_matches_weighted_formula(self):
         score = compute_belief_progress_index(
             mechanics_fit=0.50,
@@ -93,6 +109,7 @@ class BenchmarkMetricTests(unittest.TestCase):
             probe_env_expression_delta=[25.0, 31.0, 28.0, 30.0, 29.0],
             probe_no_expression_available=True,
             probe_ready_fraction=[0.60] * 5,
+            probe_expression_enabled_fraction=[0.25] * 5,
             probe_muted_fraction=[0.20] * 5,
             latent_mechanics_fit=[0.65] * 5,
             latent_neighbor_alignment=[0.30] * 5,
@@ -114,6 +131,87 @@ class BenchmarkMetricTests(unittest.TestCase):
         self.assertEqual(probe_strict_usage_status(0.0), "unused")
         self.assertEqual(probe_strict_usage_status(0.25), "intermittent")
         self.assertEqual(probe_strict_usage_status(0.50), "active")
+
+    def test_representation_gate_blocks_current_collapsed_shape(self):
+        gate = evaluate_representation_gate(
+            paired_split_top1=0.0,
+            cross_split_top1=0.0,
+            neighbor_alignment=0.19,
+            paired_gap_ratio=2.56,
+            belief_norm_std=0.0002,
+            nearest_between_median=0.00003,
+        )
+
+        self.assertFalse(gate["pass"])
+        self.assertIn("paired_split_retrieval_too_low", gate["failure_reasons"])
+        self.assertIn("cross_split_retrieval_too_low", gate["failure_reasons"])
+        self.assertIn("belief_norm_std_too_low", gate["failure_reasons"])
+
+    def test_representation_gate_passes_healthy_synthetic_metrics(self):
+        gate = evaluate_representation_gate(
+            paired_split_top1=0.24,
+            cross_split_top1=0.04,
+            neighbor_alignment=0.23,
+            paired_gap_ratio=0.82,
+            belief_norm_std=0.004,
+            nearest_between_median=0.002,
+        )
+
+        self.assertTrue(gate["pass"])
+        self.assertEqual(gate["failure_reasons"], [])
+
+    def test_trusted_particle_sysid_can_override_collapsed_latent_gate(self):
+        gate = evaluate_representation_gate(
+            paired_split_top1=0.0,
+            cross_split_top1=0.0,
+            neighbor_alignment=0.19,
+            paired_gap_ratio=2.56,
+            belief_norm_std=0.0002,
+            nearest_between_median=0.00003,
+        )
+
+        gate = apply_system_id_representation_override(
+            gate,
+            belief_mode="particle_sysid",
+            sysid_trusted=True,
+            sysid_validation_top1=0.86,
+            sysid_validation_margin=5.0,
+        )
+
+        self.assertTrue(gate["pass"])
+        self.assertEqual(gate["failure_reasons"], [])
+        self.assertEqual(gate["override_reason"], "trusted_particle_sysid")
+        self.assertFalse(gate["latent_pass"])
+        self.assertIn("paired_split_retrieval_too_low", gate["latent_failure_reasons"])
+
+    def test_sysid_override_does_not_apply_to_untrusted_model(self):
+        gate = evaluate_representation_gate(
+            paired_split_top1=0.0,
+            cross_split_top1=0.0,
+            neighbor_alignment=0.19,
+            paired_gap_ratio=2.56,
+            belief_norm_std=0.0002,
+            nearest_between_median=0.00003,
+        )
+
+        gate = apply_system_id_representation_override(
+            gate,
+            belief_mode="particle_sysid",
+            sysid_trusted=False,
+            sysid_validation_top1=0.86,
+            sysid_validation_margin=5.0,
+        )
+
+        self.assertFalse(gate["pass"])
+        self.assertEqual(gate["override_reason"], "")
+
+    def test_belief_source_labels_are_dashboard_safe(self):
+        self.assertEqual(belief_source_from_mode("particle_sysid"), "sysid")
+        self.assertEqual(belief_source_from_mode("latent_pool"), "learned")
+        self.assertEqual(
+            belief_source_from_mode("latent_pool", context_source="oracle"),
+            "oracle",
+        )
 
 
 if __name__ == "__main__":

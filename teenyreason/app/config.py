@@ -62,19 +62,6 @@ class ExperimentConfig:
     surprise_probe_threshold: float
     online_z_update_alpha: float
     online_z_update_freq: int
-    full_system_enabled: bool
-    full_system_online_refinement: bool
-    full_system_surprise_refresh_threshold: float
-    full_system_context_source: str
-    full_system_context_chunk_len: int
-    full_system_context_zero_prob: float
-    full_system_context_shuffle_prob: float
-    full_system_context_stale_prob: float
-    full_system_curriculum_schedule: tuple[tuple[int, float], ...]
-    full_system_plateau_warmup_episodes: int
-    full_system_plateau_patience: int
-    full_system_plateau_best_return_delta: float
-    full_system_plateau_avg50_delta: float
     sil_batch_size: int
     sil_policy_weight: float
     sil_value_weight: float
@@ -83,8 +70,6 @@ class ExperimentConfig:
     elite_threshold_std_scale: float
     solved_return: float
     solve_eval_episodes: int
-    full_system_ablation_eval_episodes: int
-    belief_controller_eval_interval: int
     gamma: float
     gae_lambda: float
     lr: float
@@ -102,6 +87,15 @@ class ExperimentConfig:
     initial_log_std: float
     normalize_rewards: bool
     num_episodes: int
+    representation_repair_mode: bool = False
+    representation_gate_enabled: bool = False
+    representation_gate_min_paired_top1: float = 0.20
+    representation_gate_min_cross_top1: float = 0.01
+    representation_gate_min_neighbor_alignment: float = 0.20
+    representation_gate_max_paired_gap_ratio: float = 1.0
+    representation_gate_min_belief_norm_std: float = 1e-3
+    representation_gate_min_nearest_between: float = 1e-4
+    representation_only_until_gate_pass: bool = True
 
 
 def build_experiment_config(env_name: str) -> ExperimentConfig:
@@ -157,19 +151,6 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             surprise_probe_threshold=0.75,
             online_z_update_alpha=0.30,
             online_z_update_freq=4,
-            full_system_enabled=True,
-            full_system_online_refinement=True,
-            full_system_surprise_refresh_threshold=0.35,
-            full_system_context_source="curriculum",
-            full_system_context_chunk_len=32,
-            full_system_context_zero_prob=0.20,
-            full_system_context_shuffle_prob=0.10,
-            full_system_context_stale_prob=0.10,
-            full_system_curriculum_schedule=((250, 1.0), (500, 0.75), (750, 0.50), (900, 0.25), (10**9, 0.0)),
-            full_system_plateau_warmup_episodes=400,
-            full_system_plateau_patience=250,
-            full_system_plateau_best_return_delta=10.0,
-            full_system_plateau_avg50_delta=5.0,
             sil_batch_size=64,
             sil_policy_weight=0.10,
             sil_value_weight=0.10,
@@ -178,8 +159,6 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             elite_threshold_std_scale=1.5,
             solved_return=300.0,
             solve_eval_episodes=3,
-            full_system_ablation_eval_episodes=5,
-            belief_controller_eval_interval=50,
             gamma=0.99,
             gae_lambda=0.95,
             lr=2.5e-4,
@@ -250,19 +229,6 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             surprise_probe_threshold=0.75,
             online_z_update_alpha=0.25,
             online_z_update_freq=4,
-            full_system_enabled=True,
-            full_system_online_refinement=True,
-            full_system_surprise_refresh_threshold=0.35,
-            full_system_context_source="curriculum",
-            full_system_context_chunk_len=32,
-            full_system_context_zero_prob=0.20,
-            full_system_context_shuffle_prob=0.10,
-            full_system_context_stale_prob=0.10,
-            full_system_curriculum_schedule=((250, 1.0), (500, 0.75), (750, 0.50), (900, 0.25), (10**9, 0.0)),
-            full_system_plateau_warmup_episodes=300,
-            full_system_plateau_patience=175,
-            full_system_plateau_best_return_delta=8.0,
-            full_system_plateau_avg50_delta=4.0,
             sil_batch_size=64,
             sil_policy_weight=0.10,
             sil_value_weight=0.10,
@@ -271,8 +237,6 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             elite_threshold_std_scale=1.5,
             solved_return=200.0,
             solve_eval_episodes=3,
-            full_system_ablation_eval_episodes=5,
-            belief_controller_eval_interval=50,
             gamma=0.99,
             gae_lambda=0.95,
             lr=3e-4,
@@ -343,19 +307,6 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             surprise_probe_threshold=0.75,
             online_z_update_alpha=0.25,
             online_z_update_freq=3,
-            full_system_enabled=True,
-            full_system_online_refinement=True,
-            full_system_surprise_refresh_threshold=0.30,
-            full_system_context_source="curriculum",
-            full_system_context_chunk_len=32,
-            full_system_context_zero_prob=0.20,
-            full_system_context_shuffle_prob=0.10,
-            full_system_context_stale_prob=0.10,
-            full_system_curriculum_schedule=((250, 1.0), (500, 0.75), (750, 0.50), (900, 0.25), (10**9, 0.0)),
-            full_system_plateau_warmup_episodes=200,
-            full_system_plateau_patience=125,
-            full_system_plateau_best_return_delta=10.0,
-            full_system_plateau_avg50_delta=5.0,
             sil_batch_size=64,
             sil_policy_weight=0.10,
             sil_value_weight=0.10,
@@ -364,8 +315,6 @@ def build_experiment_config(env_name: str) -> ExperimentConfig:
             elite_threshold_std_scale=1.5,
             solved_return=500.0,
             solve_eval_episodes=3,
-            full_system_ablation_eval_episodes=3,
-            belief_controller_eval_interval=25,
             gamma=0.99,
             gae_lambda=0.95,
             lr=3e-4,

@@ -25,6 +25,15 @@ from .core import (
     VectorBeliefBackend,
     WorldAdapter,
 )
+from .causal import (
+    CausalWorldAdapter,
+    CausalWorldSpec,
+    CounterfactualPrediction,
+    Intervention,
+    ObservedOutcome,
+    WorldBelief,
+    run_causal_crawler,
+)
 from .predictive import (
     group_window_targets_numpy,
     group_window_targets_torch,
@@ -49,6 +58,14 @@ from .types import (
     PredictiveBelief,
     UncertaintyEstimate,
 )
+from .video import (
+    VideoBeliefTargets,
+    VideoBenchmarkSpec,
+    VideoEvidenceSpec,
+    default_video_benchmarks,
+    default_video_belief_targets,
+    video_evidence_slice,
+)
 
 if TYPE_CHECKING:
     from .library import (
@@ -65,12 +82,25 @@ if TYPE_CHECKING:
         latest_crawler_checkpoint,
     )
     from .setup import CrawlerSetup, crawler_setup
+    from .experience import (
+        ControlCrawlerExperience,
+        CrawlerMindMap,
+        DriveWeights,
+        IntrinsicDrive,
+        PracticeSignal,
+        PracticeTarget,
+        build_control_crawler_experience,
+    )
 
 __all__ = [
     "BeliefBackend",
     "BeliefMessage",
     "BeliefState",
     "ControllerBeliefContext",
+    "CausalWorldAdapter",
+    "CausalWorldSpec",
+    "ControlCrawlerExperience",
+    "CrawlerMindMap",
     "Crawler",
     "CrawlerMessage",
     "CrawlerExpressionResult",
@@ -80,16 +110,23 @@ __all__ = [
     "CrawlerSetup",
     "CrawlerStep",
     "CrawlerStepResult",
+    "CounterfactualPrediction",
     "EvidenceBatch",
     "EvidenceSlice",
     "EvidenceWindow",
     "EnvExpression",
+    "DriveWeights",
+    "Intervention",
+    "IntrinsicDrive",
     "LegacyCrawlerRunResult",
     "LegacyCrawlerStepResult",
     "LinearMessageProjector",
     "LatentCrawler",
     "MessageProjector",
     "MetricBelief",
+    "ObservedOutcome",
+    "PracticeSignal",
+    "PracticeTarget",
     "PredictiveBelief",
     "QueryPolicy",
     "RoundRobinQueryPolicy",
@@ -98,11 +135,18 @@ __all__ = [
     "SupportLimitStopPolicy",
     "UncertaintyEstimate",
     "VectorBeliefBackend",
+    "VideoBeliefTargets",
+    "VideoBenchmarkSpec",
+    "VideoEvidenceSpec",
     "WorldAdapter",
+    "WorldBelief",
     "best_crawler",
+    "build_control_crawler_experience",
     "crawler_message_to_env_expression",
     "crawler_for",
     "crawler_setup",
+    "default_video_benchmarks",
+    "default_video_belief_targets",
     "env_expression_to_crawler_message",
     "group_window_targets_numpy",
     "group_window_targets_torch",
@@ -111,7 +155,9 @@ __all__ = [
     "load_crawler_bundle_from_checkpoint",
     "masked_group_average_numpy",
     "masked_group_average_torch",
+    "run_causal_crawler",
     "train_crawler_library",
+    "video_evidence_slice",
 ]
 
 
@@ -140,6 +186,34 @@ def __getattr__(name: str):
         from .setup import CrawlerSetup, crawler_setup
 
         return {"CrawlerSetup": CrawlerSetup, "crawler_setup": crawler_setup}[name]
+    if name in {
+        "ControlCrawlerExperience",
+        "CrawlerMindMap",
+        "DriveWeights",
+        "IntrinsicDrive",
+        "PracticeSignal",
+        "PracticeTarget",
+        "build_control_crawler_experience",
+    }:
+        from .experience import (
+            ControlCrawlerExperience,
+            CrawlerMindMap,
+            DriveWeights,
+            IntrinsicDrive,
+            PracticeSignal,
+            PracticeTarget,
+            build_control_crawler_experience,
+        )
+
+        return {
+            "ControlCrawlerExperience": ControlCrawlerExperience,
+            "CrawlerMindMap": CrawlerMindMap,
+            "DriveWeights": DriveWeights,
+            "IntrinsicDrive": IntrinsicDrive,
+            "PracticeSignal": PracticeSignal,
+            "PracticeTarget": PracticeTarget,
+            "build_control_crawler_experience": build_control_crawler_experience,
+        }[name]
     if name in {
         "CrawlerExpressionResult",
         "CrawlerRuntimeConfig",

@@ -11,6 +11,12 @@
 - Group code by functionality.
 - Keep related functions near each other.
 - Prefer files that have one clear job.
+- Target 3-5 Python files per folder for new or actively touched code.
+- Treat 7 Python files in one folder as the practical maximum.
+- If a folder would grow past 7 Python files, split it into a cohesive
+  subfolder by behavior or ownership before adding more files there.
+- Existing crowded folders should be reduced opportunistically when touched,
+  but do not perform broad file moves unless they directly support the task.
 - Prefer mostly flat module structure.
 - Avoid deep module nesting unless there is a strong, concrete reason for it.
 - Small groups are fine where they clearly improve ownership or navigation.

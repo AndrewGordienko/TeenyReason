@@ -7,20 +7,22 @@ If you are new to the project, read in this order:
 1. [core_idea.md](./core_idea.md)
 2. [general_crawler_belief.md](./general_crawler_belief.md)
 3. [general_program_plan.md](./general_program_plan.md)
-4. [architecture_and_training.md](./architecture_and_training.md)
-5. [crawler_library_api.md](./crawler_library_api.md)
-6. [benchmark_harness.md](./benchmark_harness.md)
-7. [design_rules.md](./design_rules.md)
-8. [evaluation_and_diagnostics.md](./evaluation_and_diagnostics.md)
-9. [paper_synthesis.md](./paper_synthesis.md)
-10. [language_domain_synthesis.md](./language_domain_synthesis.md)
-11. [language_belief_design.md](./language_belief_design.md)
-12. [image_domain_synthesis.md](./image_domain_synthesis.md)
-13. [image_belief_design.md](./image_belief_design.md)
-14. [human_learning_synthesis.md](./human_learning_synthesis.md)
-15. [human_learning_design.md](./human_learning_design.md)
-16. [research_manifesto.md](./research_manifesto.md)
-17. [agent_guide.md](./agent_guide.md)
+4. [value_aware_crawler_strategy.md](./value_aware_crawler_strategy.md)
+5. [architecture_and_training.md](./architecture_and_training.md)
+6. [crawler_library_api.md](./crawler_library_api.md)
+7. [benchmark_harness.md](./benchmark_harness.md)
+8. [design_rules.md](./design_rules.md)
+9. [evaluation_and_diagnostics.md](./evaluation_and_diagnostics.md)
+10. [paper_synthesis.md](./paper_synthesis.md)
+11. [language_domain_synthesis.md](./language_domain_synthesis.md)
+12. [language_belief_design.md](./language_belief_design.md)
+13. [image_domain_synthesis.md](./image_domain_synthesis.md)
+14. [image_belief_design.md](./image_belief_design.md)
+15. [human_learning_synthesis.md](./human_learning_synthesis.md)
+16. [human_learning_design.md](./human_learning_design.md)
+17. [research_manifesto.md](./research_manifesto.md)
+18. [agent_guide.md](./agent_guide.md)
+19. [research/world_model_handoff_review.md](./research/world_model_handoff_review.md)
 
 Each file has one job.
 
@@ -32,6 +34,9 @@ Each file has one job.
 - `general_program_plan.md`
   The staged rollout and operating rules for turning the current code into a
   real crawler library.
+- `value_aware_crawler_strategy.md`
+  The current research bet: active causal experiments should create compact
+  beliefs whose solver value exceeds their sample cost.
 - `architecture_and_training.md`
   The intended library architecture, the current migration seams, and what
   still belongs to the RL benchmark compatibility path.
@@ -66,18 +71,23 @@ Each file has one job.
   become.
 - `agent_guide.md`
   The writing and coding guide for future agents.
+- `research/world_model_handoff_review.md`
+  Current world-model construction and solver-handoff review, including
+  V-JEPA 2 and the repo's latest sample-efficiency bottlenecks.
 
 ## The Four Reading Buckets
 
 - Thesis:
-  `core_idea.md`, `general_crawler_belief.md`, `general_program_plan.md`
+  `core_idea.md`, `general_crawler_belief.md`, `general_program_plan.md`,
+  `value_aware_crawler_strategy.md`
 - Public API:
   `architecture_and_training.md`, `crawler_library_api.md`, `design_rules.md`
 - Benchmark Harness:
   `benchmark_harness.md`, `evaluation_and_diagnostics.md`
 - Research Background:
   `paper_synthesis.md`, `language_domain_synthesis.md`,
-  `image_domain_synthesis.md`, `human_learning_synthesis.md`
+  `image_domain_synthesis.md`, `human_learning_synthesis.md`,
+  `research/world_model_handoff_review.md`
 
 ## Why This Exists
 

@@ -2,6 +2,7 @@
 
 from .likelihood import ProbeLikelihoodModel
 from .particle_belief import (
+    PARTICLE_READINESS_LEAVEOUT_SCALE,
     ParticleBeliefState,
     build_latin_hypercube_particles,
     particle_payload_from_windows,
@@ -16,6 +17,7 @@ from .training import SysIdTrainingResult, train_probe_likelihood_model
 
 __all__ = [
     "ParticleBeliefState",
+    "PARTICLE_READINESS_LEAVEOUT_SCALE",
     "ProbeLikelihoodModel",
     "SysIdFeatureBatch",
     "SysIdFeatureStats",

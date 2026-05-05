@@ -133,7 +133,7 @@ The repo is moving toward a "latent environment belief lab" with these pieces:
 - `teenyreason/crawler/`
   Library-facing bundle, public crawler data types, predictive-target helpers,
   env-expression construction, and family-level probe scoring.
-- `teenyreason/probe/`
+- `teenyreason/crawler/probes/`
   Probe collection and online belief update utilities.
 - `teenyreason/rl/`
   Downstream RL code that consumes the latent belief.

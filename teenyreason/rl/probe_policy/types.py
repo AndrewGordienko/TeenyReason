@@ -139,6 +139,7 @@ class TrainingRunResult:
     state_only_eval_summary: MatchedEvalSummary | None = None
     state_only_solved_episode: int | None = None
     state_only_solved_env_steps: int | None = None
+    best_env_steps: int | None = None
     state_only_total_env_steps: int | None = None
     state_only_completed_episodes: int | None = None
     planner_trust_usage_rate: float | None = None

@@ -2,15 +2,20 @@ import unittest
 
 import torch
 
-from teenyreason.models.belief.belief_losses import env_param_anchor_loss
-from teenyreason.models.belief.belief_training_env_config import (
+from teenyreason.models.belief.objectives.losses import env_param_anchor_loss
+from teenyreason.models.belief.training.env_config import (
     EnvBeliefPhaseConfig,
     build_env_belief_phase_config,
     build_primary_env_loss_terms,
+    cap_primary_env_loss_terms,
 )
 
 
-def _build_unit_primary_loss_terms(phase: EnvBeliefPhaseConfig) -> dict[str, torch.Tensor]:
+def _build_unit_primary_loss_terms(
+    phase: EnvBeliefPhaseConfig,
+    *,
+    representation_repair_mode: bool = False,
+) -> dict[str, torch.Tensor]:
     one = torch.tensor(1.0, dtype=torch.float32)
     return build_primary_env_loss_terms(
         phase=phase,
@@ -52,6 +57,7 @@ def _build_unit_primary_loss_terms(phase: EnvBeliefPhaseConfig) -> dict[str, tor
         controller_oracle_distill_loss=one,
         controller_trust_loss=one,
         env_gaussian_loss=one,
+        representation_repair_mode=representation_repair_mode,
     )
 
 
@@ -126,6 +132,59 @@ class EnvBeliefObjectiveTests(unittest.TestCase):
         ):
             self.assertIn(name, loss_terms)
             self.assertGreater(float(loss_terms[name].item()), 0.0)
+
+    def test_repair_mode_focuses_representation_terms(self):
+        phase = build_env_belief_phase_config(
+            epoch_index=5,
+            total_epochs=9,
+            split_retrieval_top1=0.0,
+            probe_leakage=0.02,
+        )
+        loss_terms = _build_unit_primary_loss_terms(
+            phase,
+            representation_repair_mode=True,
+        )
+
+        for name in (
+            "env_retrieval",
+            "raw_env_retrieval",
+            "env_retrieval_margin",
+            "env_gap_ratio",
+            "env_spread",
+            "env_vicreg",
+        ):
+            self.assertGreater(float(loss_terms[name].item()), 0.0)
+
+        for name in (
+            "env_expression",
+            "controller_mechanics",
+            "controller_affordance",
+            "controller_successor",
+            "oracle_mechanics",
+            "oracle_affordance",
+            "controller_oracle_distill",
+            "controller_trust",
+            "env_gaussian",
+            "env_leakage_control",
+        ):
+            self.assertEqual(float(loss_terms[name].item()), 0.0)
+
+    def test_repair_cap_exempts_retrieval_pressure(self):
+        loss_terms = {
+            "env_retrieval": torch.tensor(100.0),
+            "env_spread": torch.tensor(80.0),
+            "physics": torch.tensor(100.0),
+            "env_future": torch.tensor(1.0),
+        }
+        capped = cap_primary_env_loss_terms(
+            loss_terms,
+            max_term_fraction=0.35,
+            exempt_names={"env_retrieval", "env_spread"},
+        )
+
+        self.assertEqual(float(capped["env_retrieval"].item()), 100.0)
+        self.assertEqual(float(capped["env_spread"].item()), 80.0)
+        self.assertLess(float(capped["physics"].item()), 100.0)
 
     def test_env_param_anchor_loss_pushes_collapsed_embeddings(self):
         embeddings = torch.zeros((5, 8), dtype=torch.float32, requires_grad=True)

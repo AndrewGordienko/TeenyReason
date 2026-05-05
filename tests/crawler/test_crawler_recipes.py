@@ -9,6 +9,7 @@ from teenyreason.recipes import (
     build_language_recipe,
     build_mnist_recipe,
 )
+from teenyreason.recipes.evidence import STANDARD_EVIDENCE_FIELDS
 
 
 class CrawlerRecipeTests(unittest.TestCase):
@@ -24,6 +25,7 @@ class CrawlerRecipeTests(unittest.TestCase):
 
     def test_multidomain_recipes_share_same_crawler_api(self):
         recipes = [
+            build_cartpole_recipe(),
             build_mnist_recipe(),
             build_language_recipe(),
         ]
@@ -34,6 +36,42 @@ class CrawlerRecipeTests(unittest.TestCase):
             self.assertGreaterEqual(result.final_belief_state.support_size, 1)
             self.assertGreater(len(result.final_message.vector), 0)
             self.assertIn("modality", recipe.metadata)
+            self.assertIn(
+                result.final_message.metadata["belief_source"],
+                {"sysid", "learned"},
+            )
+
+    def test_domain_recipes_emit_standardized_real_evidence(self):
+        expected_modalities = {
+            "cartpole": "control",
+            "language": "language",
+            "mnist": "image",
+        }
+        for recipe_builder in (build_cartpole_recipe, build_language_recipe, build_mnist_recipe):
+            recipe = recipe_builder()
+            result = recipe.build_crawler(max_steps=2).run(seed=5)
+            first_step = result.steps[0]
+            payload = first_step.evidence.payload
+
+            for field in STANDARD_EVIDENCE_FIELDS:
+                self.assertIn(field, payload)
+            self.assertEqual(payload["modality"], expected_modalities[recipe.name])
+            self.assertEqual(payload["query_family"], first_step.query_name)
+            self.assertEqual(payload["source_id"], first_step.evidence.source_id)
+            self.assertGreaterEqual(float(payload["intervention_cost"]), 0.0)
+            self.assertGreater(len(payload["local_state"]), 0)
+            self.assertGreater(len(payload["outcome"]), 0)
+            self.assertGreater(len(payload["hidden_target"]), 0)
+            self.assertGreater(len(payload["vector"]), 1)
+
+            if recipe.name == "cartpole":
+                self.assertIn("states", payload)
+                self.assertIn("actions", payload)
+                self.assertIn("rewards", payload)
+            elif recipe.name == "language":
+                self.assertIn("grammar", payload["hidden_target"])
+            else:
+                self.assertIn("image", payload)
 
     def test_benchmark_recipe_keeps_env_selection_out_of_main_loop(self):
         lunar_recipe = build_benchmark_recipe("continuous_lunar_lander")
@@ -83,7 +121,7 @@ class CrawlerRecipeTests(unittest.TestCase):
             "teenyreason/__init__.py": 180,
             "teenyreason/crawler/core.py": 400,
             "teenyreason/crawler/types.py": 280,
-            "teenyreason/app/benchmark.py": 2125,
+            "teenyreason/app/benchmark/runner.py": 2125,
         }
         for path_str, limit in line_budgets.items():
             line_count = len(Path(path_str).read_text(encoding="utf-8").splitlines())

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..representation.metrics import compute_linear_env_fit
+from ..cognition.representation.metrics import compute_linear_env_fit
 
 
 def downsample_indices(count: int, max_points: int = 1500) -> np.ndarray:

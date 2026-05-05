@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 
 from teenyreason.envs import CONTINUOUS_CARTPOLE_NAME
-from teenyreason.models.belief_world_model import (
+from teenyreason.models.belief import (
     build_future_summary_targets,
     build_training_tensors,
 )

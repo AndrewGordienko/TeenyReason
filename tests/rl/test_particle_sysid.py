@@ -6,10 +6,12 @@ import torch
 
 from teenyreason.crawler.library import CrawlerModelBundle
 from teenyreason.models.sysid import (
+    PARTICLE_READINESS_LEAVEOUT_SCALE,
     ParticleBeliefState,
     ProbeLikelihoodModel,
     build_latin_hypercube_particles,
     build_probe_sysid_features,
+    particle_payload_from_windows,
     train_probe_likelihood_model,
 )
 
@@ -172,6 +174,47 @@ class ParticleSysIdTests(unittest.TestCase):
         self.assertGreater(before["particle_entropy"], after["particle_entropy"])
         self.assertGreater(before["particle_ess_ratio"], after["particle_ess_ratio"])
 
+    def test_particle_payload_uses_calibrated_leaveout_stability_for_readiness(self):
+        windows, result = _trained_synthetic()
+        particles = build_latin_hypercube_particles(result.stats, count=64, seed=29)
+        record_indices = np.where(windows["env_instance_id"] == 2)[0][:2]
+        records = [_window_record(windows, int(index)) for index in record_indices]
+
+        _belief, payload = particle_payload_from_windows(
+            records=records,
+            model=result.model,
+            stats=result.stats,
+            particles_raw=particles,
+            z_dim=16,
+            trusted=True,
+            validation_metrics=result.metrics,
+            likelihood_scale=2.0,
+        )
+
+        leaveout_shift = float(payload["particle_leaveout_shift"].reshape(-1)[0])
+        expected_stability = float(
+            np.clip(
+                1.0 - leaveout_shift / PARTICLE_READINESS_LEAVEOUT_SCALE,
+                0.0,
+                1.0,
+            )
+        )
+        self.assertAlmostEqual(
+            float(payload["particle_subset_stability"].reshape(-1)[0]),
+            expected_stability,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(payload["particle_leaveout_stability"].reshape(-1)[0]),
+            expected_stability,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(payload["online_leaveout_stability"].reshape(-1)[0]),
+            expected_stability,
+            places=6,
+        )
+
     def test_family_scoring_prefers_informative_family(self):
         stats = build_probe_sysid_features(_synthetic_windows(env_count=4, repeats=1), action_vocab_size=3).stats
         particles_raw = np.asarray(
@@ -228,6 +271,9 @@ class ParticleSysIdTests(unittest.TestCase):
             scores["family_b"]["predicted_entropy_reduction"],
         )
         self.assertGreater(scores["family_a"]["selection_score"], scores["family_b"]["selection_score"])
+        self.assertIn("control_utility_value", scores["family_a"])
+        self.assertIn("stability_adjusted_value", scores["family_a"])
+        self.assertIn("sample_efficiency_score", scores["family_a"])
 
 
 if __name__ == "__main__":

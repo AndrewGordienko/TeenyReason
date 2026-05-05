@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from teenyreason.app.benchmark_diagnostics import build_latent_support_diagnostics
+from teenyreason.app.benchmark.diagnostics import build_latent_support_diagnostics
 from teenyreason.viz.dashboard import (
     build_benchmark_payload,
     build_index_payload,
@@ -15,10 +15,26 @@ from teenyreason.viz.diagnostics import summarize_solve_array
 from teenyreason.viz.payloads import build_support_validity_payload
 
 
+VIZ_ROOT = Path(__file__).resolve().parents[2] / "teenyreason" / "viz"
+
+
+def read_dashboard_template() -> str:
+    return (VIZ_ROOT / "templates" / "dashboard.html").read_text(encoding="utf-8")
+
+
+def read_dashboard_source() -> str:
+    return "\n".join(
+        [
+            read_dashboard_template(),
+            (VIZ_ROOT / "static" / "dashboard.js").read_text(encoding="utf-8"),
+            (VIZ_ROOT / "static" / "dashboard.css").read_text(encoding="utf-8"),
+        ]
+    )
+
+
 class DashboardPayloadTests(unittest.TestCase):
     def test_dashboard_sim_fanout_delta_uses_same_sign_convention(self):
-        template_path = Path(__file__).resolve().parents[2] / "teenyreason" / "viz" / "templates" / "dashboard.html"
-        template = template_path.read_text(encoding="utf-8")
+        template = read_dashboard_source()
 
         self.assertIn(
             "summaries.sim_fanout_episode.median - summaries.full_system_episode.median",
@@ -30,8 +46,7 @@ class DashboardPayloadTests(unittest.TestCase):
         )
 
     def test_dashboard_does_not_call_protocol_delta_expression_when_strict_unused(self):
-        template_path = Path(__file__).resolve().parents[2] / "teenyreason" / "viz" / "templates" / "dashboard.html"
-        template = template_path.read_text(encoding="utf-8")
+        template = read_dashboard_source()
 
         self.assertIn("strictExpressionActive", template)
         self.assertIn("conditioned branch", template)
@@ -39,15 +54,13 @@ class DashboardPayloadTests(unittest.TestCase):
         self.assertIn("rather than proving learned message contribution", template)
 
     def test_live_dashboard_does_not_hide_curves_for_non_cartpole_envs(self):
-        template_path = Path(__file__).resolve().parents[2] / "teenyreason" / "viz" / "templates" / "dashboard.html"
-        template = template_path.read_text(encoding="utf-8")
+        template = read_dashboard_source()
 
         self.assertNotIn("if (!hasLivePayload || !isCartPole)", template)
         self.assertIn("The animated canvas is CartPole-only", template)
 
     def test_live_dashboard_has_direct_ppo_comparison_board(self):
-        template_path = Path(__file__).resolve().parents[2] / "teenyreason" / "viz" / "templates" / "dashboard.html"
-        template = template_path.read_text(encoding="utf-8")
+        template = read_dashboard_source()
 
         self.assertIn("PPO vs Probe-Conditioned PPO", template)
         self.assertIn('data-deck-target="comparison"', template)
@@ -56,16 +69,89 @@ class DashboardPayloadTests(unittest.TestCase):
         self.assertIn("paperFigureBoard", template)
         self.assertIn("Sample Efficiency", template)
         self.assertIn("Performance Ceiling", template)
+        self.assertIn("Steps To Peak", template)
+        self.assertIn("Steps to peak return", template)
         self.assertIn("Learning Dynamics", template)
         self.assertIn("renderPaperFigureBoard(rawPayload)", template)
         self.assertIn("renderComparisonBoard(rawPayload)", template)
         self.assertIn("comparison_suite_id", template)
-        self.assertIn("rolling 100-episode average", template)
+        self.assertIn("comparisonHasRegularVsCrawlerData", template)
+        self.assertIn("Research Metrics", template)
+        self.assertIn("payload.research_metrics", template)
+        self.assertIn("formatSampleSavings", template)
+        self.assertIn("sample-eff", template)
+        self.assertIn("stability-adjusted value", template)
+        self.assertIn("control_utility_value", template)
+        self.assertIn("sample_efficiency_score", template)
+        self.assertIn("rolling 10-episode average", template)
         self.assertIn("baseline_env_step_solves", template)
+        self.assertIn("baseline_step_solves", template)
+        self.assertIn("baseline_best_returns", template)
         self.assertIn("baseline_total_env_steps", template)
+        self.assertIn("baseline_peak_env_steps", template)
         self.assertIn("probe_env_step_solves_with_encoder", template)
+        self.assertIn("probe_step_solves", template)
+        self.assertIn("probe_best_returns", template)
         self.assertIn("probe_total_env_steps_with_encoder", template)
-        self.assertIn("unsolved @", template)
+        self.assertIn("probe_peak_env_steps_with_encoder", template)
+        self.assertNotIn("unsolved @", template)
+        self.assertIn("Keep Archive", template)
+        self.assertIn("Current Suite", template)
+        self.assertIn("Clear Archive", template)
+        self.assertIn("environment steps", template)
+        self.assertIn("Each thin bar is one solved seed", template)
+        self.assertIn("unsolved seeds are omitted", template)
+        self.assertIn("thin bars are seeds", template)
+        self.assertIn("comparisonSolveOrCapSeries", template)
+        self.assertIn("med ${formatInteger", template)
+        self.assertNotIn("log scale", template)
+
+    def test_dashboard_has_four_domain_suite_console(self):
+        template = read_dashboard_template()
+        script = (VIZ_ROOT / "static" / "suite.js").read_text(encoding="utf-8")
+
+        self.assertIn("Four-Domain Suite", template)
+        self.assertIn("CartPole, Shakespeare, MNIST, Tic-Tac-Toe", template)
+        self.assertIn("Causal Message Check", template)
+        self.assertIn("Controlled Hidden Target", template)
+        self.assertIn("Mechanism Transfer Gap", template)
+        self.assertIn("Latent Handoff Economics", template)
+        self.assertIn("Latent Utility Break-Even", template)
+        self.assertIn("Expensive Probe Wake-Up", template)
+        self.assertIn("World Understanding", template)
+        self.assertIn("Belief Handoff Contract", template)
+        self.assertIn("Rate-Distortion Targets", template)
+        self.assertIn("Sample Performance", template)
+        self.assertIn("suiteCausalityTable", template)
+        self.assertIn("suiteMechanismTable", template)
+        self.assertIn("suiteTransferTable", template)
+        self.assertIn("suiteHandoffTable", template)
+        self.assertIn("suiteUtilityTable", template)
+        self.assertIn("suiteWakeTable", template)
+        self.assertIn("suiteWorldTable", template)
+        self.assertIn("suiteBeliefHandoffTable", template)
+        self.assertIn("suiteRateTable", template)
+        self.assertIn("suiteHandoffRepairTable", template)
+        self.assertIn("suiteDecisionUtilityTable", template)
+        self.assertIn("suiteSamplePerformanceTable", template)
+        self.assertIn("suite.js", template)
+        self.assertIn("suite.css", template)
+        self.assertIn('"board"', script)
+        self.assertIn("Tic-Tac-Toe Rules", script)
+        self.assertIn("belief_move_accuracy", script)
+        self.assertIn("renderCausalTable", script)
+        self.assertIn("renderMechanismTable", script)
+        self.assertIn("renderTransferTable", script)
+        self.assertIn("renderHandoffTable", script)
+        self.assertIn("renderUtilityTable", script)
+        self.assertIn("renderWakeTable", script)
+        self.assertIn("renderWorldTable", script)
+        self.assertIn("renderBeliefHandoffTable", script)
+        self.assertIn("renderRateTable", script)
+        self.assertIn("renderHandoffRepairTable", script)
+        self.assertIn("renderDecisionUtilityTable", script)
+        self.assertIn("renderSamplePerformanceTable", script)
+        self.assertIn("content_lift", script)
 
     def test_summarize_solve_array_marks_skipped_variants_as_not_run(self):
         summary = summarize_solve_array(
@@ -257,6 +343,10 @@ class DashboardPayloadTests(unittest.TestCase):
                 probe_step_solves=np.asarray([12000], dtype=np.int64),
                 probe_shadow_step_solves=np.asarray([11800], dtype=np.int64),
                 probe_no_expression_step_solves=np.asarray([14000], dtype=np.int64),
+                baseline_best_returns=np.asarray([490.0], dtype=np.float32),
+                probe_best_returns=np.asarray([500.0], dtype=np.float32),
+                baseline_peak_env_steps=np.asarray([7600], dtype=np.int64),
+                probe_peak_env_steps_with_encoder=np.asarray([11600], dtype=np.int64),
                 baseline_total_env_steps=np.asarray([8000], dtype=np.int64),
                 probe_total_env_steps=np.asarray([17000], dtype=np.int64),
                 probe_shadow_total_env_steps=np.asarray([16500], dtype=np.int64),
@@ -330,6 +420,10 @@ class DashboardPayloadTests(unittest.TestCase):
                 particle_subset_stability_mean=np.asarray([0.49], dtype=np.float32),
                 latent_mechanics_fit=np.asarray([0.52], dtype=np.float32),
                 latent_split_top1=np.asarray([0.24], dtype=np.float32),
+                latent_cross_split_top1=np.asarray([0.24], dtype=np.float32),
+                latent_paired_split_top1=np.asarray([0.33], dtype=np.float32),
+                latent_cross_split_mrr=np.asarray([0.42], dtype=np.float32),
+                latent_paired_split_mrr=np.asarray([0.55], dtype=np.float32),
                 latent_neighbor_alignment=np.asarray([0.31], dtype=np.float32),
                 latent_gap_ratio=np.asarray([0.82], dtype=np.float32),
                 latent_heldout_probe_error=np.asarray([0.41], dtype=np.float32),
@@ -485,6 +579,8 @@ class DashboardPayloadTests(unittest.TestCase):
             self.assertAlmostEqual(row["belief_progress_index"], 0.61)
             self.assertAlmostEqual(row["latent_mechanics_fit"], 0.52)
             self.assertAlmostEqual(row["latent_split_top1"], 0.24)
+            self.assertAlmostEqual(row["latent_cross_split_top1"], 0.24)
+            self.assertAlmostEqual(row["latent_paired_split_top1"], 0.33)
             self.assertAlmostEqual(row["latent_neighbor_alignment"], 0.31)
             self.assertAlmostEqual(row["latent_gap_ratio"], 0.82)
             self.assertAlmostEqual(row["latent_probe_leakage"], 0.11)
@@ -500,6 +596,10 @@ class DashboardPayloadTests(unittest.TestCase):
             )
             self.assertTrue(payload["latent_win_gate"]["pass"])
             self.assertEqual(payload["latent_win_gate_failure_reasons"], [])
+            self.assertAlmostEqual(
+                payload["summaries"]["latent_paired_split_top1"]["median"],
+                0.33,
+            )
             self.assertEqual(
                 payload["summaries"]["probe_fair_handoff_pair_count"]["boundary_push / chirp"],
                 1.0,
@@ -509,6 +609,9 @@ class DashboardPayloadTests(unittest.TestCase):
             self.assertEqual(row["full_system_step_solve"], 10900)
             self.assertEqual(row["full_system_state_only_step_solve"], 12600)
             self.assertEqual(row["full_system_post_context_env_steps"], 8800)
+            self.assertEqual(row["probe_step_savings_vs_baseline"], -4000)
+            self.assertEqual(row["probe_step_savings_vs_no_expression"], 2000)
+            self.assertEqual(row["full_system_step_regret_vs_sim_fanout"], 1800)
             self.assertEqual(row["full_system_oracle_episode_solve"], 44)
             self.assertEqual(row["full_system_oracle_step_solve"], 9800)
             self.assertEqual(row["full_system_oracle_post_context_env_steps"], 7600)
@@ -568,6 +671,90 @@ class DashboardPayloadTests(unittest.TestCase):
             self.assertAlmostEqual(row["full_system_online_refinement_ablation_delta"], 11.0)
             self.assertAlmostEqual(row["full_system_frozen_context_ablation_delta"], 68.0)
             self.assertTrue(payload["full_system_available"])
+            research_metrics = payload["research_metrics"]
+            self.assertEqual(
+                research_metrics["arms"]["baseline"]["solve_steps_median"],
+                8000.0,
+            )
+            self.assertEqual(
+                research_metrics["arms"]["probe"]["solve_steps_median"],
+                12000.0,
+            )
+            self.assertEqual(
+                research_metrics["deltas"]["probe_step_savings_vs_baseline"],
+                -4000.0,
+            )
+            self.assertEqual(
+                research_metrics["deltas"]["probe_step_savings_vs_no_expression"],
+                2000.0,
+            )
+            self.assertEqual(
+                research_metrics["peak"]["probe_steps_to_peak_median"],
+                11600.0,
+            )
+            self.assertEqual(
+                research_metrics["peak"]["probe_steps_to_peak_savings_vs_baseline"],
+                -4000.0,
+            )
+            self.assertEqual(
+                research_metrics["peak"]["probe_best_return_median"],
+                500.0,
+            )
+            benchmark_status = {
+                item["name"]: item["available"]
+                for item in research_metrics["benchmarks"]
+            }
+            self.assertTrue(benchmark_status["samples_to_solve"])
+            self.assertTrue(benchmark_status["samples_to_peak_score"])
+            self.assertTrue(benchmark_status["peak_score"])
+            self.assertTrue(benchmark_status["belief_ablation_savings"])
+            self.assertFalse(benchmark_status["learning_curve_auc"])
+            loss_attribution = payload["loss_attribution"]
+            self.assertTrue(loss_attribution["available"])
+            self.assertEqual(loss_attribution["seed_count"], 1)
+            self.assertEqual(
+                loss_attribution["sample_economics"]["probe_step_savings_vs_baseline"],
+                -4000.0,
+            )
+            self.assertAlmostEqual(
+                loss_attribution["sample_economics"]["encoder_fraction_of_probe_total"],
+                0.32941176470588235,
+            )
+            self.assertEqual(
+                loss_attribution["expression_channel"]["readiness_reason_counts"]["future_probe_quality"],
+                2,
+            )
+            self.assertEqual(
+                loss_attribution["expression_channel"]["fair_stop_blocker_counts"]["online_subset_stability"],
+                2,
+            )
+            self.assertAlmostEqual(
+                loss_attribution["full_system_context_channel"]["state_channel_lift_mean"],
+                7.670013427734375,
+            )
+            self.assertAlmostEqual(
+                loss_attribution["full_system_context_channel"]["context_specific_lift_mean"],
+                18.0,
+            )
+            self.assertFalse(
+                loss_attribution["full_system_context_channel"]["context_content_causal"]
+            )
+            self.assertFalse(loss_attribution["representation_gate"]["available"])
+            self.assertTrue(
+                any(
+                    item["name"] == "probe_step_speed" and not item["passed"]
+                    for item in loss_attribution["latent_win_gate"]["metrics"]
+                )
+            )
+            self.assertEqual(
+                loss_attribution["probe_family_economics"]["best_family"],
+                "passive_decay",
+            )
+            self.assertEqual(
+                loss_attribution["probe_family_economics"]["families"][0]["second_probe_selected_count"],
+                0,
+            )
+            self.assertTrue(loss_attribution["decisions"])
 
     def test_benchmark_payload_flags_unused_strict_latent_honesty_warning(self):
         with tempfile.TemporaryDirectory() as tmpdir:

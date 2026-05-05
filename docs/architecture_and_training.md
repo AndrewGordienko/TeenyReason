@@ -127,7 +127,7 @@ Should not own:
 - dashboard rendering policy
 - environment-specific benchmark orchestration
 
-### `teenyreason/probe/data/`
+### `teenyreason/crawler/probes/data/`
 
 Owns:
 
@@ -138,7 +138,7 @@ Owns:
 
 Compatibility facade:
 
-- `teenyreason/probe/probe_data.py`
+- `teenyreason/crawler/probes/data/`
 
 Should not own:
 
@@ -190,7 +190,7 @@ Compatibility facade:
 
 - `teenyreason/models/env_belief.py`
 
-### `teenyreason/probe/latent/`
+### `teenyreason/crawler/probes/latent/`
 
 Owns:
 
@@ -206,7 +206,7 @@ Should not own:
 
 Compatibility facade:
 
-- `teenyreason/probe/probe_latent.py`
+- `teenyreason/crawler/probes/latent/`
 
 ### `teenyreason/rl/probe_policy/`
 
@@ -267,20 +267,21 @@ Owns:
 
 Owns:
 
-- benchmark orchestration and saved artifact format
-- dashboard payload construction and local serving
-- live trace writing
+- app-layer benchmark orchestration and saved artifact format
+- public experiment entrypoint packages, such as `app/benchmark` and `app/ppo`
 - summary diagnostics that compare representation, support, and downstream use
 
 Current cleanup rule:
 
 - keep new benchmark interpretation logic in small files such as
-  `benchmark_diagnostics.py`
+  `benchmark/diagnostics.py`
 - split large app files only by cohesive ownership, not as a broad style pass
 
 Should not own:
 
 - controller decision logic
+- cross-domain suite payload construction; that lives under `multidomain/suite`
+- dashboard live trace state; that lives under `viz/live`
 - representation semantics
 - crawler-side family scoring
 
@@ -367,9 +368,8 @@ Canonical composition layers:
 
 - `teenyreason/recipes/`
   user-facing recipes such as CartPole, MNIST, and language
-- `teenyreason/algos/`
-  downstream consumers such as the current PPO benchmark and sample-efficiency
-  wrappers
+- `teenyreason/consumers.py`
+  small downstream benchmark consumers used by public `run(...)` helpers
 
 The older RL-shaped objects still exist as compatibility adapters so the
 benchmark and dashboard stack can keep working during migration, but they are

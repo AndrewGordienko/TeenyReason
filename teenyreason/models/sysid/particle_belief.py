@@ -13,6 +13,9 @@ from .likelihood import ProbeLikelihoodModel
 from .probe_features import SysIdFeatureStats, probe_record_features
 
 
+PARTICLE_READINESS_LEAVEOUT_SCALE = 0.55
+
+
 def _safe(values, fill_value: float = 0.0) -> np.ndarray:
     return np.nan_to_num(np.asarray(values, dtype=np.float32), nan=fill_value, posinf=fill_value, neginf=fill_value)
 
@@ -250,7 +253,10 @@ def particle_payload_from_windows(
         particles_raw=particles_raw,
         likelihood_scale=likelihood_scale,
     )
-    subset_stability = float(np.clip(1.0 - leaveout_shift / 0.35, 0.0, 1.0))
+    leaveout_stability = float(
+        np.clip(1.0 - leaveout_shift / PARTICLE_READINESS_LEAVEOUT_SCALE, 0.0, 1.0)
+    )
+    subset_stability = leaveout_stability
     actual_support = int(len(records))
     effective_support = min(4, max(actual_support, actual_support * 2 if actual_support >= 2 else actual_support))
     observed_families = tuple(
@@ -330,6 +336,7 @@ def particle_payload_from_windows(
         "heldout_family_future_error": np.asarray([scaled_nll], dtype=np.float32),
         "support_size_matched_future_error": np.asarray([scaled_nll], dtype=np.float32),
         "online_subset_stability": np.asarray([subset_stability], dtype=np.float32),
+        "online_leaveout_stability": np.asarray([leaveout_stability], dtype=np.float32),
         "online_geometry_complete": np.asarray([1.0], dtype=np.float32),
         "online_leaveout_shift": np.asarray([leaveout_shift], dtype=np.float32),
         "online_observed_family_count": np.asarray([distinct_family_count], dtype=np.int32),
@@ -344,6 +351,7 @@ def particle_payload_from_windows(
         "particle_ess_ratio": np.asarray([float(summary["particle_ess_ratio"])], dtype=np.float32),
         "particle_top_weight": np.asarray([float(summary["particle_top_weight"])], dtype=np.float32),
         "particle_leaveout_shift": np.asarray([leaveout_shift], dtype=np.float32),
+        "particle_leaveout_stability": np.asarray([leaveout_stability], dtype=np.float32),
         "particle_subset_stability": np.asarray([subset_stability], dtype=np.float32),
         "particle_weights": np.asarray(summary["particle_weights"], dtype=np.float32),
         "particle_particles_norm": state.particles_norm.astype(np.float32),

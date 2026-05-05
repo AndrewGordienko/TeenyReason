@@ -34,6 +34,10 @@ For the developmental-science and neuroscience bridge, read:
 - [human_learning_synthesis.md](./human_learning_synthesis.md)
 - [human_learning_design.md](./human_learning_design.md)
 
+For the current world-model and solver-handoff review, including V-JEPA 2, read:
+
+- [research/world_model_handoff_review.md](./research/world_model_handoff_review.md)
+
 ## 1. PEARL
 
 Paper:

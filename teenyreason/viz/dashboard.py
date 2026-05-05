@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+import argparse
+import logging
 import math
 from pathlib import Path
 
 import numpy as np
 from flask import Flask, jsonify, render_template
 
-from ..app.live_trace import load_live_trace_payload
+from .live import clear_live_trace_history, load_live_trace_payload
 from .payloads import (
     build_benchmark_payload,
     build_index_payload,
     build_latent_payload,
+)
+from .suite_payloads import (
+    build_latest_suite_payload,
+    build_suite_index_payload,
+    build_suite_payload,
 )
 
 
@@ -58,7 +65,9 @@ def create_dashboard_app(artifact_dir: str | Path = "artifacts") -> Flask:
 
     @app.get("/api/index")
     def api_index():
-        return jsonify(sanitize_json_value(build_index_payload(artifact_root)))
+        payload = build_index_payload(artifact_root)
+        payload["suite_runs"] = build_suite_index_payload(artifact_root)
+        return jsonify(sanitize_json_value(payload))
 
     @app.get("/api/latent/<path:name>")
     def api_latent(name: str):
@@ -74,17 +83,60 @@ def create_dashboard_app(artifact_dir: str | Path = "artifacts") -> Flask:
             return jsonify({"error": f"Unknown benchmark summary: {name}"}), 404
         return jsonify(sanitize_json_value(build_benchmark_payload(path)))
 
+    @app.get("/api/suites")
+    def api_suites():
+        return jsonify(sanitize_json_value(build_suite_index_payload(artifact_root)))
+
+    @app.get("/api/suite/latest")
+    def api_suite_latest():
+        return jsonify(sanitize_json_value(build_latest_suite_payload(artifact_root)))
+
+    @app.get("/api/suite/<path:name>")
+    def api_suite(name: str):
+        path = artifact_root / name
+        if not path.exists() or path.suffix != ".json":
+            return jsonify({"error": f"Unknown suite artifact: {name}"}), 404
+        payload = build_suite_payload(path)
+        status = 200 if payload.get("available") else 404
+        return jsonify(sanitize_json_value(payload)), status
+
     @app.get("/api/live")
     def api_live():
         return jsonify(sanitize_json_value(load_live_trace_payload(artifact_root)))
 
+    @app.post("/api/live/history/clear")
+    def api_clear_live_history():
+        clear_live_trace_history(artifact_root)
+        return jsonify({"ok": True})
+
     return app
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Serve the TeenyReason latent dashboard locally.")
+    parser.add_argument(
+        "--artifact-dir",
+        default="artifacts",
+        help="Directory containing saved benchmark and latent snapshot artifacts.",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="Host interface to bind.")
+    parser.add_argument("--port", type=int, default=5050, help="Port to listen on.")
+    args = parser.parse_args()
+
+    app = create_dashboard_app(artifact_dir=args.artifact_dir)
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
+    print(f"Serving latent dashboard at http://{args.host}:{args.port}")
+    app.run(host=args.host, port=args.port, debug=False)
 
 
 __all__ = [
     "build_benchmark_payload",
     "build_index_payload",
     "build_latent_payload",
+    "build_latest_suite_payload",
+    "build_suite_index_payload",
+    "build_suite_payload",
     "create_dashboard_app",
+    "main",
     "sanitize_json_value",
 ]

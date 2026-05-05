@@ -20,11 +20,10 @@ PUBLIC_API_PATHS = {
     "run_multidomain_suite.py",
     "serve_latent_dashboard.py",
     "teenyreason/__init__.py",
-    "teenyreason/models/belief_world_model.py",
-    "teenyreason/models/env_belief.py",
-    "teenyreason/probe/probe_data.py",
-    "teenyreason/probe/probe_latent.py",
 }
+
+FOLDER_FILE_WARN = 5
+FOLDER_FILE_MAX = 7
 
 
 @dataclass(frozen=True)
@@ -128,7 +127,7 @@ def load_import_graph(files: list[str]) -> tuple[dict[str, set[str]], dict[str, 
 def file_notes(path: Path, inbound_non_test_refs: int, inbound_test_refs: int) -> tuple[str, ...]:
     notes: list[str] = []
     text = path.read_text(encoding="utf-8")
-    if "Compatibility facade" in text or "compatibility shim" in text.lower():
+    if has_explicit_compatibility_note(text):
         notes.append("explicit_compatibility_facade")
     if "if __name__ == \"__main__\":" in text:
         notes.append("has_main_guard")
@@ -159,6 +158,11 @@ def is_reexport_module(text: str) -> bool:
     return saw_import
 
 
+def has_explicit_compatibility_note(text: str) -> bool:
+    header = "\n".join(text.splitlines()[:20]).lower()
+    return "compatibility facade" in header or "compatibility shim" in header
+
+
 def classify_file(
     path_str: str,
     *,
@@ -170,7 +174,7 @@ def classify_file(
         return "test_only_module"
     if path_str in PUBLIC_API_PATHS or path_str.endswith("/__init__.py"):
         return "public_api_surface"
-    if "Compatibility facade" in text or "compatibility shim" in text.lower():
+    if has_explicit_compatibility_note(text):
         return "compatibility_shim"
     if is_reexport_module(text):
         return "compatibility_shim"
@@ -211,6 +215,14 @@ def build_audit(files: list[str]) -> list[FileAudit]:
     return audits
 
 
+def folder_python_counts(audits: list[FileAudit]) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for audit in audits:
+        folder = str(Path(audit.path).parent)
+        counts[folder] += 1
+    return dict(sorted(counts.items()))
+
+
 def print_report(audits: list[FileAudit]) -> None:
     counts: dict[str, int] = defaultdict(int)
     for audit in audits:
@@ -225,13 +237,55 @@ def print_report(audits: list[FileAudit]) -> None:
     print("Orphan Candidates")
     if not orphan_candidates:
         print("  none")
+    else:
+        for audit in orphan_candidates:
+            notes = ", ".join(audit.notes) if audit.notes else "no_notes"
+            print(
+                f"  {audit.path} | inbound_non_test={audit.inbound_non_test_refs} | "
+                f"inbound_test={audit.inbound_test_refs} | notes={notes}"
+            )
+    print()
+    print("Unreferenced Compatibility Shims")
+    shims = [
+        audit
+        for audit in audits
+        if audit.classification == "compatibility_shim"
+        and audit.inbound_non_test_refs == 0
+        and audit.inbound_test_refs == 0
+    ]
+    if not shims:
+        print("  none")
+    else:
+        for audit in shims:
+            print(f"  {audit.path}")
+    print()
+    print("Standalone Entrypoints")
+    entrypoints = [
+        audit
+        for audit in audits
+        if "has_main_guard" in audit.notes
+        and audit.inbound_non_test_refs == 0
+        and audit.inbound_test_refs == 0
+        and not audit.path.startswith("tests/")
+    ]
+    if not entrypoints:
+        print("  none")
+    else:
+        for audit in entrypoints:
+            print(f"  {audit.path} | classification={audit.classification}")
+    print()
+    print("Folder Crowding")
+    crowded = [
+        (folder, count)
+        for folder, count in folder_python_counts(audits).items()
+        if count > FOLDER_FILE_WARN
+    ]
+    if not crowded:
+        print("  none")
         return
-    for audit in orphan_candidates:
-        notes = ", ".join(audit.notes) if audit.notes else "no_notes"
-        print(
-            f"  {audit.path} | inbound_non_test={audit.inbound_non_test_refs} | "
-            f"inbound_test={audit.inbound_test_refs} | notes={notes}"
-        )
+    for folder, count in sorted(crowded, key=lambda item: (-item[1], item[0])):
+        status = "over_max" if count > FOLDER_FILE_MAX else "near_max"
+        print(f"  {folder} | files={count} | status={status}")
 
 
 def main() -> None:

@@ -19,8 +19,8 @@ from ..envs import (
     CONTINUOUS_LUNAR_LANDER_NAME,
 )
 from .base import BenchmarkSpec, CrawlerRecipe
-from .bipedal import build_bipedal_recipe, register_bipedal_recipe_targets
-from .cartpole import build_cartpole_recipe, register_cartpole_recipe_targets
+from .domains import build_bipedal_recipe, build_cartpole_recipe
+from .domains import register_bipedal_recipe_targets, register_cartpole_recipe_targets
 
 
 def build_generic_rl_recipe(env_name: str) -> CrawlerRecipe:

@@ -10,7 +10,7 @@ from teenyreason.models.sysid import (
     build_latin_hypercube_particles,
     build_probe_sysid_features,
 )
-from teenyreason.representation.analysis import compute_message_rate_distortion
+from teenyreason.cognition.representation.analysis import compute_message_rate_distortion
 
 
 class CrawlerLibraryTests(unittest.TestCase):
@@ -94,7 +94,7 @@ class CrawlerLibraryTests(unittest.TestCase):
         group_ids = np.asarray([0, 1], dtype=np.int64)
 
         with patch(
-            "teenyreason.crawler.library.aggregate_env_belief",
+            "teenyreason.crawler.library.bundle.aggregate_env_belief",
             side_effect=fake_aggregate_env_belief,
         ):
             _belief, _payload = bundle.build_env_belief(
@@ -191,6 +191,10 @@ class CrawlerLibraryTests(unittest.TestCase):
 
         self.assertTrue(np.isfinite(payload["env_expression"]).all())
         self.assertEqual(step.controller_context.metadata["source_kind"], "particle_sysid")
+        self.assertEqual(step.controller_context.metadata["belief_source"], "sysid")
+        self.assertEqual(step.env_expression.metadata["belief_source"], "sysid")
+        self.assertEqual(step.env_expression.metadata["solver_message_source"], "sysid")
+        self.assertIn("particle_param_mean", step.predictive_belief.metadata)
         self.assertGreater(step.predictive_belief.metadata["particle_entropy"], 0.0)
         self.assertEqual(step.predictive_belief.support_count, 4)
 

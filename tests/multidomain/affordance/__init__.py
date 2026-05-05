@@ -1,0 +1,1 @@
+"""Persistent affordance crawler tests."""

@@ -256,14 +256,14 @@ Desired properties:
 
 The repo should map onto that architecture cleanly.
 
-- `teenyreason/probe/probe_data.py`
+- `teenyreason/crawler/probes/data/`
   Probe crawler and environment perturbation data collection.
 - `teenyreason/models/belief_world_model.py`
   Window-level evidence encoder and training losses tied to prediction and
   supervised structure.
 - `teenyreason/models/env_belief.py`
   Env-level belief aggregation, subset pooling, and uncertainty construction.
-- `teenyreason/probe/probe_latent.py`
+- `teenyreason/crawler/probes/latent/`
   Online belief helpers and active probe action selection.
 - `teenyreason/rl/probe_policy/`
   Downstream control using the env-level belief.

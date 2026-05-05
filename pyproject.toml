@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "teenyreason"
+version = "0.1.0"
+description = "Small crawler-backed latent-belief research library."
+readme = "README.md"
+requires-python = ">=3.11"
+
+[project.scripts]
+teenyreason-dashboard = "teenyreason.viz.dashboard:main"
+teenyreason-suite = "teenyreason.multidomain.suite:main"
+
+[tool.setuptools.packages.find]
+include = ["teenyreason*"]
+
+[tool.setuptools.package-data]
+"teenyreason.viz" = ["templates/*.html", "static/*"]

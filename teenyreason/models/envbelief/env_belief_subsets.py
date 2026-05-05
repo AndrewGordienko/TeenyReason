@@ -394,13 +394,70 @@ def build_random_subset_masks(
 
     subset_masks = torch.zeros((mask.shape[0], subset_count, mask.shape[1]), dtype=torch.float32, device=mask.device)
     for subset_idx in range(subset_count):
-        subset_masks[:, subset_idx, :] = build_diverse_support_mask(
+        subset_masks[:, subset_idx, :] = _sample_random_subset_mask(
             mask=mask,
-            support_size=subset_size,
+            subset_size=subset_size,
             group_ids=group_ids,
             generator=generator,
         )
     return subset_masks
+
+
+def _sample_random_subset_mask(
+    mask: torch.Tensor,
+    subset_size: int,
+    group_ids: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Sample one diverse subset per row without reusing canonical support order."""
+    mask_bool = mask.bool()
+    subset_mask = torch.zeros_like(mask_bool, dtype=torch.float32)
+
+    for row_idx in range(mask_bool.shape[0]):
+        valid_idx = torch.nonzero(mask_bool[row_idx], as_tuple=False).squeeze(-1)
+        if valid_idx.numel() == 0:
+            continue
+        if valid_idx.numel() <= subset_size:
+            subset_mask[row_idx, valid_idx] = 1.0
+            continue
+
+        chosen: list[int] = []
+        if group_ids is not None:
+            row_groups = group_ids[row_idx, valid_idx]
+            valid_groups = torch.unique(row_groups[row_groups >= 0], sorted=False)
+            if valid_groups.numel() > 0:
+                shuffled_groups = valid_groups[
+                    torch.randperm(valid_groups.numel(), generator=generator, device=valid_groups.device)
+                ]
+                for group_value in shuffled_groups.tolist():
+                    group_candidates = valid_idx[row_groups == int(group_value)]
+                    if group_candidates.numel() == 0:
+                        continue
+                    group_candidates = group_candidates[
+                        torch.randperm(
+                            group_candidates.numel(),
+                            generator=generator,
+                            device=group_candidates.device,
+                        )
+                    ]
+                    chosen.append(int(group_candidates[0].item()))
+                    if len(chosen) >= subset_size:
+                        break
+
+        if len(chosen) < subset_size:
+            remaining = [int(idx) for idx in valid_idx.tolist() if int(idx) not in set(chosen)]
+            if remaining:
+                remaining_t = torch.tensor(remaining, dtype=torch.long, device=valid_idx.device)
+                remaining_t = remaining_t[
+                    torch.randperm(remaining_t.numel(), generator=generator, device=remaining_t.device)
+                ]
+                take = min(int(remaining_t.numel()), subset_size - len(chosen))
+                chosen.extend(int(item) for item in remaining_t[:take].tolist())
+
+        if chosen:
+            subset_mask[row_idx, torch.tensor(chosen, dtype=torch.long, device=mask.device)] = 1.0
+
+    return subset_mask
 
 
 def build_leave_one_group_out_masks(
